@@ -1,0 +1,2830 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stark8s editor</title>
+<style>
+/* ===================  colour role tokens  ===================
+ *
+ * The sixteen theme blocks, the un-themed default, and the
+ * prefers-color-scheme fallback are copied without modification from the
+ * foe viewer's tokens.css, which in turn copies zicato's console.css. This
+ * is the only place in the page where a raw hex colour appears, except the
+ * brand accent below it and the swatch previews in the theme picker. */
+
+/* Monokai. */
+:root[data-theme="monokai"] {
+  --v2-paper:      #1e1f1c;
+  --v2-panel:      #272822;
+  --v2-ink:        #f8f8f2;
+  --v2-ink-soft:   #c9cabf;
+  --v2-ink-faint:  #8f908a;
+  --v2-rule:       #3a3b34;
+  --v2-rule-soft:  #2f302a;
+
+  --v2-good:       #a6e22e;   /* monokai green: improved / promoted */
+  --v2-good-soft:  #2c361a;
+  --v2-bad:        #f92672;   /* monokai magenta-red: regressed / rejected */
+  --v2-bad-soft:   #3a1622;
+  --v2-caution:    #e6db74;   /* monokai yellow: caution / timeout */
+  --v2-accent:     #66d9ef;   /* monokai cyan: emphasis spine */
+  --v2-flat:       #75715e;   /* monokai comment grey: unchanged */
+  --v2-cell-empty: #23241f;
+}
+
+/* Solarized Dark. */
+:root[data-theme="solarized-dark"] {
+  --v2-paper:      #04222B;
+  --v2-panel:      #0A2D38;
+  --v2-ink:        #93A1A1;
+  --v2-ink-soft:   #839496;
+  --v2-ink-faint:  #5E7079;
+  --v2-rule:       #0E3540;
+  --v2-rule-soft:  #0B2E39;
+
+  --v2-good:       #8BB80E;
+  --v2-good-soft:  #1C3320;
+  --v2-bad:        #E0483C;
+  --v2-bad-soft:   #3A1F1D;
+  --v2-caution:    #C4920A;
+  --v2-accent:     #2AA198;
+  --v2-flat:       #46606B;
+  --v2-cell-empty: #0A2730;
+}
+
+/* Solarized Light. */
+:root[data-theme="solarized-light"] {
+  --v2-paper:      #FDF6E3;
+  --v2-panel:      #FBF1D6;
+  --v2-ink:        #586E75;
+  --v2-ink-soft:   #657B83;
+  --v2-ink-faint:  #93A1A1;
+  --v2-rule:       #E7DCBE;
+  --v2-rule-soft:  #F0E7CC;
+
+  --v2-good:       #6B9B0B;
+  --v2-good-soft:  #E3ECCB;
+  --v2-bad:        #DC322F;
+  --v2-bad-soft:   #F6DDD3;
+  --v2-caution:    #B58900;
+  --v2-accent:     #268BD2;
+  --v2-flat:       #93A1A1;
+  --v2-cell-empty: #F2E9CE;
+}
+
+/* Gogh: Google Light. */
+:root[data-theme="google-light"] {
+  --v2-paper:      #FFFFFF;
+  --v2-panel:      #F4F4F4;
+  --v2-ink:        #474A4E;
+  --v2-ink-soft:   #5F6368;
+  --v2-ink-faint:  #9FA1A4;
+  --v2-rule:       #E2E3E4;
+  --v2-rule-soft:  #F1F1F1;
+  --v2-good:       #34A853;
+  --v2-good-soft:  #D2ECD9;
+  --v2-bad:        #EA4335;
+  --v2-bad-soft:   #FAD6D3;
+  --v2-caution:    #C99700;
+  --v2-accent:     #1B9CB8;
+  --v2-flat:       #9AA0A6;
+  --v2-cell-empty: #F8F8F8;
+}
+
+/* Gogh: Google Dark. */
+:root[data-theme="google-dark"] {
+  --v2-paper:      #202124;
+  --v2-panel:      #2C2D30;
+  --v2-ink:        #FFFFFF;
+  --v2-ink-soft:   #E8EAED;
+  --v2-ink-faint:  #989A9D;
+  --v2-rule:       #444548;
+  --v2-rule-soft:  #323336;
+  --v2-good:       #34A853;
+  --v2-good-soft:  #243F2E;
+  --v2-bad:        #EA4335;
+  --v2-bad-soft:   #4C2828;
+  --v2-caution:    #FBBC05;
+  --v2-accent:     #24C1E0;
+  --v2-flat:       #5F6368;
+  --v2-cell-empty: #28292C;
+}
+
+/* Gogh: Lunaria Light. */
+:root[data-theme="lunaria-light"] {
+  --v2-paper:      #EBE4E1;
+  --v2-panel:      #E2DCD9;
+  --v2-ink:        #363434;
+  --v2-ink-soft:   #484646;
+  --v2-ink-faint:  #898584;
+  --v2-rule:       #CEC8C5;
+  --v2-rule-soft:  #DCD6D3;
+  --v2-good:       #497D46;
+  --v2-good-soft:  #C7CDBF;
+  --v2-bad:        #783C1F;
+  --v2-bad-soft:   #D2BFB6;
+  --v2-caution:    #8F750B;
+  --v2-accent:     #3778A9;
+  --v2-flat:       #898584;
+  --v2-cell-empty: #E6DFDC;
+}
+
+/* Gogh: Lunaria Eclipse. */
+:root[data-theme="lunaria-eclipse"] {
+  --v2-paper:      #323F46;
+  --v2-panel:      #3B484F;
+  --v2-ink:        #DFE2ED;
+  --v2-ink-soft:   #C9CDD7;
+  --v2-ink-faint:  #8D949D;
+  --v2-rule:       #4D5960;
+  --v2-rule-soft:  #404C53;
+  --v2-good:       #BEDBC1;
+  --v2-good-soft:  #516161;
+  --v2-bad:        #BA9088;
+  --v2-bad-soft:   #505155;
+  --v2-caution:    #F1DFB4;
+  --v2-accent:     #C8429F;
+  --v2-flat:       #6B767D;
+  --v2-cell-empty: #38454C;
+}
+
+/* Gogh: Belafonte Day (light). */
+:root[data-theme="belafonte-day"] {
+  --v2-paper:      #D5CCBA;
+  --v2-panel:      #CCC3B2;
+  --v2-ink:        #34292D;
+  --v2-ink-soft:   #45373C;
+  --v2-ink-faint:  #7F736E;
+  --v2-rule:       #BBB1A3;
+  --v2-rule-soft:  #C8BFAF;
+  --v2-good:       #6E6A4E;
+  --v2-good-soft:  #C3BCA7;
+  --v2-bad:        #BE100E;
+  --v2-bad-soft:   #D0A394;
+  --v2-caution:    #B57A1E;
+  --v2-accent:     #426A79;
+  --v2-flat:       #5E5252;
+  --v2-cell-empty: #D0C6B5;
+}
+
+/* Gogh: Belafonte Night (dark). */
+:root[data-theme="belafonte-night"] {
+  --v2-paper:      #20111B;
+  --v2-panel:      #271821;
+  --v2-ink:        #D5CCBA;
+  --v2-ink-soft:   #968C83;
+  --v2-ink-faint:  #675B59;
+  --v2-rule:       #35272E;
+  --v2-rule-soft:  #2B1C24;
+  --v2-good:       #A6A07A;
+  --v2-good-soft:  #362A2B;
+  --v2-bad:        #D6403E;
+  --v2-bad-soft:   #431118;
+  --v2-caution:    #EAA549;
+  --v2-accent:     #6F8E97;
+  --v2-flat:       #5E5252;
+  --v2-cell-empty: #25161F;
+}
+
+/* Gogh: Paper (light). */
+:root[data-theme="paper"] {
+  --v2-paper:      #F2EEDE;
+  --v2-panel:      #E6E2D3;
+  --v2-ink:        #1A1A1A;
+  --v2-ink-soft:   #33312B;
+  --v2-ink-faint:  #85837A;
+  --v2-rule:       #C6C3B6;
+  --v2-rule-soft:  #DCD9CA;
+  --v2-good:       #216609;
+  --v2-good-soft:  #CCD6B8;
+  --v2-bad:        #CC3E28;
+  --v2-bad-soft:   #EBCEBD;
+  --v2-caution:    #B58900;
+  --v2-accent:     #1E6FCC;
+  --v2-flat:       #6E6A5E;
+  --v2-cell-empty: #E8E4D5;
+}
+
+/* Gogh: Zenburn (dark). */
+:root[data-theme="zenburn"] {
+  --v2-paper:      #3A3A3A;
+  --v2-panel:      #424241;
+  --v2-ink:        #DCDCCC;
+  --v2-ink-soft:   #C5C5B8;
+  --v2-ink-faint:  #83837C;
+  --v2-rule:       #575754;
+  --v2-rule-soft:  #494947;
+  --v2-good:       #8FB28F;
+  --v2-good-soft:  #2E3A2E;
+  --v2-bad:        #CC9393;
+  --v2-bad-soft:   #402F2F;
+  --v2-caution:    #FFD7A7;
+  --v2-accent:     #8CD0D3;
+  --v2-flat:       #757575;
+  --v2-cell-empty: #404040;
+}
+
+/* Gogh: Selenized Black (dark). */
+:root[data-theme="selenized-black"] {
+  --v2-paper:      #181818;
+  --v2-panel:      #202020;
+  --v2-ink:        #DEDEDE;
+  --v2-ink-soft:   #B9B9B9;
+  --v2-ink-faint:  #606060;
+  --v2-rule:       #353535;
+  --v2-rule-soft:  #262626;
+  --v2-good:       #83C746;
+  --v2-good-soft:  #243218;
+  --v2-bad:        #FF5E56;
+  --v2-bad-soft:   #3A1B19;
+  --v2-caution:    #EFC541;
+  --v2-accent:     #56D8C9;
+  --v2-flat:       #3B3B3B;
+  --v2-cell-empty: #1E1E1E;
+}
+
+/* Gogh: Relaxed (dark). */
+:root[data-theme="relaxed"] {
+  --v2-paper:      #353A44;
+  --v2-panel:      #3D424B;
+  --v2-ink:        #F7F7F7;
+  --v2-ink-soft:   #D9D9D9;
+  --v2-ink-faint:  #7F8287;
+  --v2-rule:       #53575F;
+  --v2-rule-soft:  #444851;
+  --v2-good:       #A0AC77;
+  --v2-good-soft:  #353D2E;
+  --v2-bad:        #BC5653;
+  --v2-bad-soft:   #3F2A2C;
+  --v2-caution:    #EBC17A;
+  --v2-accent:     #7EAAC7;
+  --v2-flat:       #636363;
+  --v2-cell-empty: #3C404A;
+}
+
+/* Gogh: Espresso (dark). */
+:root[data-theme="espresso"] {
+  --v2-paper:      #323232;
+  --v2-panel:      #3A3A3A;
+  --v2-ink:        #FFFFFF;
+  --v2-ink-soft:   #D9D9D9;
+  --v2-ink-faint:  #8A8A8A;
+  --v2-rule:       #4C4C4C;
+  --v2-rule-soft:  #3E3E3E;
+  --v2-good:       #A5C261;
+  --v2-good-soft:  #353D24;
+  --v2-bad:        #D25252;
+  --v2-bad-soft:   #3D2424;
+  --v2-caution:    #FFC66D;
+  --v2-accent:     #6C99BB;
+  --v2-flat:       #6E6E6E;
+  --v2-cell-empty: #383838;
+}
+
+/* Gogh: Dracula (dark). */
+:root[data-theme="dracula"] {
+  --v2-paper:      #282A36;
+  --v2-panel:      #343746;
+  --v2-ink:        #F8F8F2;
+  --v2-ink-soft:   #D4D4CF;
+  --v2-ink-faint:  #6272A4;
+  --v2-rule:       #44475A;
+  --v2-rule-soft:  #353848;
+  --v2-good:       #50FA7B;
+  --v2-good-soft:  #213A2A;
+  --v2-bad:        #FF5555;
+  --v2-bad-soft:   #3C2329;
+  --v2-caution:    #F1FA8C;   /* dracula yellow */
+  --v2-accent:     #BD93F9;   /* dracula purple: signature accent — LIVE pill, highlights, active state */
+  --v2-flat:       #6272A4;   /* dracula comment: unchanged / muted */
+  --v2-cell-empty: #2E303D;
+}
+
+/* Gogh: Ubuntu (dark — the classic aubergine terminal). */
+:root[data-theme="ubuntu"] {
+  --v2-paper:      #300A24;
+  --v2-panel:      #3D1530;
+  --v2-ink:        #EEEEEC;
+  --v2-ink-soft:   #CBC3C9;
+  --v2-ink-faint:  #8A7383;
+  --v2-rule:       #4B2640;
+  --v2-rule-soft:  #3E1A32;
+  --v2-good:       #8AE234;
+  --v2-good-soft:  #2E3320;
+  --v2-bad:        #CC0000;
+  --v2-bad-soft:   #45161F;
+  --v2-caution:    #FCE94F;
+  --v2-accent:     #34E2E2;
+  --v2-flat:       #847683;
+  --v2-cell-empty: #371129;
+}
+
+/* The palette in force before the bundle stamps a theme on the root. It
+ * repeats google-light and google-dark so that the first paint already
+ * matches the default the bundle then applies; the values must stay equal
+ * to the two blocks above. A stored choice wins over both, and the bundle
+ * applies it as soon as it runs. */
+:root {
+  --v2-paper:      #FFFFFF;
+  --v2-panel:      #F4F4F4;
+  --v2-ink:        #474A4E;
+  --v2-ink-soft:   #5F6368;
+  --v2-ink-faint:  #9FA1A4;
+  --v2-rule:       #E2E3E4;
+  --v2-rule-soft:  #F1F1F1;
+  --v2-good:       #34A853;
+  --v2-good-soft:  #D2ECD9;
+  --v2-bad:        #EA4335;
+  --v2-bad-soft:   #FAD6D3;
+  --v2-caution:    #C99700;
+  --v2-accent:     #1B9CB8;
+  --v2-flat:       #9AA0A6;
+  --v2-cell-empty: #F8F8F8;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --v2-paper:      #202124;
+    --v2-panel:      #2C2D30;
+    --v2-ink:        #FFFFFF;
+    --v2-ink-soft:   #E8EAED;
+    --v2-ink-faint:  #989A9D;
+    --v2-rule:       #444548;
+    --v2-rule-soft:  #323336;
+    --v2-good:       #34A853;
+    --v2-good-soft:  #243F2E;
+    --v2-bad:        #EA4335;
+    --v2-bad-soft:   #4C2828;
+    --v2-caution:    #FBBC05;
+    --v2-accent:     #24C1E0;
+    --v2-flat:       #5F6368;
+    --v2-cell-empty: #28292C;
+  }
+}
+
+/* The brand accent belongs to the brand mark's one dot alone and is a token
+ * separate from --v2-accent. The dark value is stated first because most of
+ * the sixteen themes are dark; the five light-ground themes override it, and
+ * so does a root with no theme stamped on it unless the machine asks for a
+ * dark ground. */
+:root { --brand-accent: #E8A43E; }
+:root:not([data-theme]) { --brand-accent: #C7791A; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme]) { --brand-accent: #E8A43E; } }
+:root[data-theme="solarized-light"],
+:root[data-theme="google-light"],
+:root[data-theme="lunaria-light"],
+:root[data-theme="belafonte-day"],
+:root[data-theme="paper"] { --brand-accent: #C7791A; }
+
+/* ===================  type, spacing, radii  ===================
+ *
+ * No font is fetched: every stack resolves against the machine's own copy
+ * of the named face and falls back to the system monospace. */
+:root {
+  --v2-mono: "Inconsolata", "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --v2-sans: var(--v2-mono);
+  --v2-brand-mono: "JetBrains Mono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --dt-font-scale: 1;
+
+  --dt-gap-line: 3px;
+  --dt-gap-item: 6px;
+  --dt-gap-edge: 10px;
+  --dt-gap-group: 14px;
+  --dt-radius-panel: 4px;
+  --dt-radius-card: 5px;
+  --dt-radius-mark: 3px;
+  --dt-radius-hovercard: 6px;
+
+  --pane-yaml: 380px;
+  --pane-props: 300px;
+  --pane-status: 150px;
+}
+
+* { box-sizing: border-box; }
+
+/* Every stroke is a hairline and stays one whatever scales the figure. */
+svg :is(path, line, rect, circle, ellipse, polyline, polygon) {
+  vector-effect: non-scaling-stroke;
+}
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--v2-paper);
+  color: var(--v2-ink);
+  font-family: var(--v2-sans);
+  font-size: calc(13px * var(--dt-font-scale, 1));
+  line-height: 1.45;
+  transition: background 0.18s ease, color 0.18s ease;
+}
+
+button, input, select, textarea { font: inherit; color: inherit; }
+
+button {
+  background: transparent;
+  border: 1px solid var(--v2-rule);
+  border-radius: var(--dt-radius-card);
+  padding: 2px 8px;
+  cursor: pointer;
+  color: var(--v2-ink-soft);
+  font-family: var(--v2-mono);
+  font-size: calc(11px * var(--dt-font-scale, 1));
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  white-space: nowrap;
+}
+button:hover { color: var(--v2-ink); border-color: var(--v2-ink-faint); }
+
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible,
+[tabindex]:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--v2-accent);
+  outline-offset: 2px;
+}
+
+input[type="text"], input[type="number"], select, textarea {
+  background: var(--v2-paper);
+  border: 1px solid var(--v2-rule);
+  border-radius: var(--dt-radius-panel);
+  padding: 2px 6px;
+  font-family: var(--v2-mono);
+  font-size: calc(11.5px * var(--dt-font-scale, 1));
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-ink);
+  min-width: 0;
+  width: 100%;
+}
+input[type="checkbox"] { accent-color: var(--v2-accent); margin: 0; }
+
+.mono {
+  font-family: var(--v2-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* An eyebrow is a faint, tracked, uppercase label above a group. */
+.eyebrow {
+  font-family: var(--v2-mono);
+  font-weight: 600;
+  font-size: calc(10px * var(--dt-font-scale, 1));
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--v2-ink-faint);
+  margin: 0;
+}
+
+[hidden] { display: none !important; }
+
+/* ---- frame ---- */
+
+.app {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  overflow: hidden;
+}
+
+.body {
+  display: grid;
+  grid-template-columns: var(--pane-yaml) auto minmax(0, 1fr) auto var(--pane-props);
+  min-height: 0;
+  min-width: 0;
+}
+
+.column-left {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto var(--pane-status);
+  min-height: 0;
+  min-width: 0;
+  background: var(--v2-panel);
+  border-right: 1px solid var(--v2-rule);
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.pane-head {
+  display: flex;
+  align-items: center;
+  gap: var(--dt-gap-item);
+  padding: var(--dt-gap-item) var(--dt-gap-edge) var(--dt-gap-line);
+  flex: none;
+  flex-wrap: wrap;
+}
+.pane-head .spacer { flex: 1; }
+
+.pane textarea {
+  flex: 1;
+  margin: 0 var(--dt-gap-edge) var(--dt-gap-edge);
+  resize: none;
+  white-space: pre;
+  overflow: auto;
+  line-height: 1.4;
+  tab-size: 2;
+}
+
+.pane-note {
+  flex: none;
+  padding: 0 var(--dt-gap-edge) var(--dt-gap-item);
+  font-family: var(--v2-mono);
+  font-size: calc(10.5px * var(--dt-font-scale, 1));
+  color: var(--v2-ink-faint);
+  min-height: 1.4em;
+  overflow-wrap: anywhere;
+}
+.pane-note.bad { color: var(--v2-bad); }
+
+/* ---- grips ---- */
+
+.grip {
+  position: relative;
+  background: transparent;
+  border: none;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 0;
+}
+.grip.col { width: 7px; cursor: col-resize; }
+.grip.row { height: 7px; cursor: row-resize; }
+.grip::before { content: ""; position: absolute; background: var(--v2-rule); }
+.grip.col::before { inset: 0 auto 0 3px; width: 1px; }
+.grip.row::before { inset: 3px 0 auto 0; height: 1px; }
+.grip-pill {
+  position: relative;
+  display: block;
+  border-radius: 2px;
+  background: var(--v2-ink-faint);
+  transition: background 0.12s ease;
+}
+.grip.col .grip-pill { width: 4px; height: 28px; }
+.grip.row .grip-pill { width: 28px; height: 4px; }
+.grip:hover .grip-pill, .grip:focus-visible .grip-pill, .grip.dragging .grip-pill { background: var(--v2-accent); }
+.grip:focus-visible { outline: 2px solid var(--v2-accent); outline-offset: -2px; }
+body.resizing-col, body.resizing-col * { cursor: col-resize !important; user-select: none; }
+body.resizing-row, body.resizing-row * { cursor: row-resize !important; user-select: none; }
+
+/* ---- top bar ---- */
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: var(--dt-gap-group);
+  padding: var(--dt-gap-item) var(--dt-gap-group);
+  background: color-mix(in srgb, var(--v2-paper) 92%, transparent);
+  backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--v2-rule);
+  min-width: 0;
+}
+.brand { display: inline-flex; align-items: center; gap: 8px; color: var(--v2-ink); flex: none; }
+.brand-mark { display: block; height: calc(20px * var(--dt-font-scale, 1)); width: auto; }
+.brand-name {
+  font-family: var(--v2-brand-mono);
+  font-weight: 600;
+  font-size: calc(14px * var(--dt-font-scale, 1));
+  letter-spacing: 0.01em;
+}
+.surface-tag {
+  font-family: var(--v2-mono);
+  font-size: calc(9.5px * var(--dt-font-scale, 1));
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--v2-ink-faint);
+  border-left: 1px solid var(--v2-rule);
+  padding-left: 7px;
+  user-select: none;
+}
+.crumbs {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  font-family: var(--v2-mono);
+  font-size: calc(11px * var(--dt-font-scale, 1));
+  color: var(--v2-ink-faint);
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.crumbs .crumb-current { color: var(--v2-ink); }
+.topbar .spacer { flex: 1; }
+
+/* popover picker */
+.cd { position: relative; display: inline-flex; }
+.cd .trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 7px;
+  font-size: calc(9.5px * var(--dt-font-scale, 1));
+}
+.cd .trigger:hover { border-color: var(--v2-accent); }
+.cd-name { color: var(--v2-ink); white-space: nowrap; }
+.cd .caret { color: var(--v2-ink-faint); font-size: calc(8px * var(--dt-font-scale, 1)); transition: transform 0.15s; }
+.cd.open .caret { transform: rotate(180deg); }
+.swatch-strip { display: inline-flex; border-radius: var(--dt-radius-mark); overflow: hidden; border: 1px solid var(--v2-rule); }
+.swatch { display: inline-block; width: 11px; height: 13px; }
+.swatch-strip.sm .swatch { width: 9px; height: 11px; }
+.cd-list {
+  display: none;
+  position: absolute;
+  top: calc(100% + 5px);
+  right: 0;
+  z-index: 30;
+  min-width: 190px;
+  max-height: 60vh;
+  overflow-y: auto;
+  background: var(--v2-panel);
+  border: 1px solid var(--v2-rule);
+  border-radius: var(--dt-radius-hovercard);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--v2-ink) 18%, transparent);
+  padding: 4px;
+  margin: 0;
+  list-style: none;
+}
+.cd.open > .cd-list { display: block; }
+.cd-list.left { right: auto; left: 0; }
+.cd-option {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 7px;
+  border: none;
+  border-radius: var(--dt-radius-mark);
+  text-align: left;
+  font-family: var(--v2-mono);
+  font-size: calc(10.5px * var(--dt-font-scale, 1));
+}
+.cd-option:hover, .cd-option.active { background: var(--v2-rule-soft); }
+.cd-option[aria-selected="true"] .cd-name { color: var(--v2-accent); }
+
+.scale-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--v2-rule);
+  border-radius: var(--dt-radius-card);
+  padding: 2px 7px;
+  font-family: var(--v2-mono);
+  font-size: calc(10px * var(--dt-font-scale, 1));
+  color: var(--v2-ink-soft);
+}
+.scale-range { width: 84px; height: 12px; margin: 0; accent-color: var(--v2-accent); background: transparent; }
+.scale-val { min-width: 4ch; text-align: right; font-variant-numeric: tabular-nums; color: var(--v2-ink); }
+.scale-reset { border: none; padding: 0 2px; font-size: calc(12px * var(--dt-font-scale, 1)); line-height: 1; color: var(--v2-ink-faint); }
+.scale-reset:hover { color: var(--v2-accent); }
+
+/* ---- canvas column ---- */
+
+.canvas-column {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  min-height: 0;
+  min-width: 0;
+}
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--dt-gap-item);
+  padding: var(--dt-gap-item) var(--dt-gap-edge);
+  border-bottom: 1px solid var(--v2-rule);
+  flex-wrap: wrap;
+}
+.toolbar .spacer { flex: 1; }
+.toolbar .hint {
+  font-family: var(--v2-mono);
+  font-size: calc(10px * var(--dt-font-scale, 1));
+  color: var(--v2-ink-faint);
+  white-space: nowrap;
+}
+.canvas-host { position: relative; overflow: hidden; min-height: 0; background: var(--v2-paper); }
+.canvas-host.panning { cursor: grabbing; }
+svg.canvas { display: block; width: 100%; height: 100%; }
+svg.canvas.connecting { cursor: crosshair; }
+
+.status-strip {
+  border-top: 1px solid var(--v2-rule);
+  padding: var(--dt-gap-line) var(--dt-gap-edge);
+  font-family: var(--v2-mono);
+  font-size: calc(10.5px * var(--dt-font-scale, 1));
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-ink-faint);
+  min-height: 1.9em;
+  max-height: 6.5em;
+  overflow-y: auto;
+  line-height: 1.5;
+}
+.status-strip .line { overflow-wrap: anywhere; }
+.status-strip .line.bad { color: var(--v2-bad); }
+
+/* ---- figure ---- */
+
+.node-body { fill: var(--v2-panel); stroke: var(--v2-rule); stroke-width: 1; }
+.node:hover .node-body { stroke: var(--v2-ink-faint); }
+.node.invalid .node-body { stroke: var(--v2-bad); stroke-dasharray: 4 3; }
+.node-spine { stroke: transparent; stroke-width: 2.2; stroke-linecap: round; }
+.node.selected .node-spine { stroke: var(--v2-accent); }
+.node-name { fill: var(--v2-ink-soft); font-family: var(--v2-sans); font-size: 12.5px; }
+.node.selected .node-name { fill: var(--v2-ink); }
+.node-sub { fill: var(--v2-ink-faint); font-family: var(--v2-mono); font-size: 9.5px; font-variant-numeric: tabular-nums; }
+.node { cursor: grab; }
+.node.dragging { cursor: grabbing; }
+.port { fill: var(--v2-paper); stroke: var(--v2-ink-faint); stroke-width: 1; cursor: crosshair; }
+.port:hover, .port.armed { stroke: var(--v2-accent); }
+
+.glyph { fill: none; stroke: var(--v2-ink-soft); stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round; }
+.glyph.filled { fill: var(--v2-paper); }
+.glyph.dotted { stroke-dasharray: 1.5 2; }
+.glyph.bad { stroke: var(--v2-bad); }
+.glyph.faint { stroke: var(--v2-ink-faint); }
+
+.edge-line { fill: none; stroke: var(--v2-ink-faint); stroke-width: 1.2; }
+.edge.lifted .edge-line { stroke-width: 2.2; }
+.edge.overflow .edge-line { stroke-dasharray: 5 4; }
+.edge.selected .edge-line { stroke: var(--v2-accent); stroke-width: 2.2; }
+.edge.invalid .edge-line { stroke: var(--v2-bad); stroke-dasharray: 4 3; }
+.edge-hit { fill: none; stroke: transparent; stroke-width: 14; cursor: pointer; }
+.edge:hover .edge-line { stroke: var(--v2-ink-soft); }
+.edge.selected:hover .edge-line { stroke: var(--v2-accent); }
+.edge-label { fill: var(--v2-ink-soft); font-family: var(--v2-mono); font-size: 10px; font-variant-numeric: tabular-nums; text-anchor: middle; }
+.edge.selected .edge-label { fill: var(--v2-ink); }
+.edge-meta { fill: var(--v2-ink-faint); font-family: var(--v2-mono); font-size: 9px; font-variant-numeric: tabular-nums; text-anchor: middle; }
+.edge-mark { fill: none; stroke: var(--v2-ink-soft); stroke-width: 1.3; stroke-linecap: round; stroke-linejoin: round; }
+.edge-mark.filled { fill: var(--v2-paper); }
+.edge-mark.arrow { stroke: var(--v2-ink-faint); }
+.edge.selected .edge-mark.arrow { stroke: var(--v2-accent); }
+.mark-hit { cursor: help; outline: none; }
+.mark-hit:focus-visible { outline: 2px solid var(--v2-accent); }
+
+.draft-line { fill: none; stroke: var(--v2-accent); stroke-width: 1.2; stroke-dasharray: 4 3; pointer-events: none; }
+.ingress { cursor: crosshair; }
+.ingress-label { fill: var(--v2-ink-faint); font-family: var(--v2-mono); font-size: 9px; text-anchor: middle; }
+.empty-note { fill: var(--v2-ink-faint); font-family: var(--v2-mono); font-size: 11px; text-anchor: middle; }
+
+/* ---- the hovercard every mark shares ---- */
+
+.hovercard {
+  position: absolute;
+  z-index: 4;
+  max-width: 340px;
+  padding: 6px 9px;
+  background: var(--v2-panel);
+  border: 1px solid var(--v2-rule);
+  border-radius: var(--dt-radius-hovercard);
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--v2-ink) 14%, transparent);
+  pointer-events: none;
+  font-family: var(--v2-mono);
+  font-size: calc(10.5px * var(--dt-font-scale, 1));
+  font-variant-numeric: tabular-nums;
+  line-height: 1.45;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.hovercard.on { opacity: 1; }
+.hovercard-head { color: var(--v2-ink); }
+.hovercard-meta { color: var(--v2-ink-faint); overflow-wrap: anywhere; }
+.hovercard-detail { color: var(--v2-ink-soft); overflow-wrap: anywhere; margin-top: 3px; }
+
+.rename {
+  position: absolute;
+  z-index: 5;
+  font-family: var(--v2-sans);
+  font-size: 12.5px;
+  padding: 1px 4px;
+}
+
+/* ---- properties pane ---- */
+
+.props {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--v2-panel);
+  border-left: 1px solid var(--v2-rule);
+  container-type: inline-size;
+}
+.props .group { padding: var(--dt-gap-item) var(--dt-gap-edge) var(--dt-gap-group); border-bottom: 1px solid var(--v2-rule-soft); }
+.props .group:last-child { border-bottom: none; }
+.props .eyebrow { margin-bottom: var(--dt-gap-item); }
+.field { display: grid; grid-template-columns: 9ch minmax(0, 1fr); gap: var(--dt-gap-line) var(--dt-gap-item); align-items: center; margin-bottom: var(--dt-gap-item); }
+@container (max-width: 230px) { .field { grid-template-columns: 1fr; } }
+.field-key { font-family: var(--v2-mono); font-size: calc(10.5px * var(--dt-font-scale, 1)); color: var(--v2-ink-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.field-row { display: flex; gap: var(--dt-gap-item); min-width: 0; }
+.field-row > * { flex: 1; min-width: 0; }
+.field textarea { min-height: 120px; font-size: calc(10.5px * var(--dt-font-scale, 1)); resize: vertical; }
+.props .empty { padding: var(--dt-gap-group) var(--dt-gap-edge); font-family: var(--v2-mono); font-size: calc(11px * var(--dt-font-scale, 1)); color: var(--v2-ink-faint); }
+.props .actions { display: flex; gap: var(--dt-gap-item); flex-wrap: wrap; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 30 22" role="img" aria-label="stark8s mark" focusable="false">
+        <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M6.6,15.2 L12.4,7.6 M17.6,7.6 L23.4,15.2"/>
+          <circle cx="4.5" cy="17" r="2.6"/>
+          <circle cx="25.5" cy="17" r="2.6"/>
+          <circle cx="15" cy="5" r="2.6"/>
+        </g>
+        <circle cx="15" cy="5" r="1.4" fill="var(--brand-accent)"/>
+      </svg>
+      <span class="brand-name">stark8s</span>
+      <span class="surface-tag" role="note">editor</span>
+    </div>
+    <nav class="crumbs" aria-label="workload">
+      <span>workload</span><span aria-hidden="true">/</span><span class="crumb-current" id="crumb-name">untitled</span>
+    </nav>
+    <span class="spacer"></span>
+    <div class="cd" id="theme-cd">
+      <button class="trigger" id="theme-trigger" aria-haspopup="listbox" aria-expanded="false" aria-controls="theme-list">
+        <span class="swatch-strip sm" id="theme-strip" aria-hidden="true"></span>
+        <span class="cd-name" id="theme-name">theme</span>
+        <span class="caret" aria-hidden="true">▼</span>
+      </button>
+      <ul class="cd-list" id="theme-list" role="listbox" aria-label="colour theme" tabindex="-1"></ul>
+    </div>
+    <span class="scale-pill">
+      <label for="scale-range" class="mono">scale</label>
+      <input class="scale-range" id="scale-range" type="range" min="70" max="150" step="5" value="100" aria-label="page scale">
+      <span class="scale-val" id="scale-val">100%</span>
+      <button class="scale-reset" id="scale-reset" aria-label="reset page scale">⟲</button>
+    </span>
+  </header>
+
+  <div class="body" id="body">
+    <div class="column-left">
+      <section class="pane" aria-label="workload yaml">
+        <div class="pane-head">
+          <h2 class="eyebrow">yaml</h2>
+          <span class="spacer"></span>
+          <button id="btn-copy">copy yaml</button>
+          <button id="btn-download">download yaml</button>
+          <div class="cd" id="example-cd">
+            <button class="trigger" id="example-trigger" aria-haspopup="listbox" aria-expanded="false" aria-controls="example-list">
+              <span class="cd-name">load example</span><span class="caret" aria-hidden="true">▼</span>
+            </button>
+            <ul class="cd-list" id="example-list" role="listbox" aria-label="example workloads" tabindex="-1"></ul>
+          </div>
+          <button id="btn-new">new</button>
+        </div>
+        <textarea id="yaml" class="mono" spellcheck="false" aria-label="workload yaml" wrap="off"></textarea>
+        <div class="pane-note" id="yaml-note" aria-live="polite"></div>
+      </section>
+      <button class="grip row" id="grip-status" role="separator" aria-orientation="horizontal" aria-label="resize status pane" aria-valuenow="150"><span class="grip-pill"></span></button>
+      <section class="pane" aria-label="observed status">
+        <div class="pane-head">
+          <h2 class="eyebrow">status</h2>
+          <span class="hint mono pane-note" style="padding:0">paste kubectl get workload -o yaml</span>
+          <span class="spacer"></span>
+          <button id="btn-status-clear">clear</button>
+        </div>
+        <textarea id="status" class="mono" spellcheck="false" aria-label="observed workload status yaml" wrap="off"></textarea>
+        <div class="pane-note" id="status-note" aria-live="polite"></div>
+      </section>
+    </div>
+
+    <button class="grip col" id="grip-yaml" role="separator" aria-orientation="vertical" aria-label="resize yaml pane" aria-valuenow="380"><span class="grip-pill"></span></button>
+
+    <div class="canvas-column">
+      <div class="toolbar">
+        <div class="field-row" style="flex:none;gap:var(--dt-gap-item)">
+          <label class="field-key" for="wl-name">name</label>
+          <input type="text" id="wl-name" style="width:14ch" aria-label="workload name">
+          <label class="field-key" for="wl-ns">namespace</label>
+          <input type="text" id="wl-ns" style="width:12ch" aria-label="workload namespace" placeholder="default">
+        </div>
+        <span class="spacer"></span>
+        <button id="btn-add">add operation</button>
+        <button id="btn-layout">auto layout</button>
+        <button id="btn-fit">fit</button>
+        <span class="hint">double-click to add · drag a port to connect · l layout · f fit · / yaml</span>
+      </div>
+      <div class="canvas-host" id="canvas-host">
+        <svg class="canvas" id="canvas" role="img" aria-label="workload graph" preserveAspectRatio="xMidYMid meet" tabindex="0"></svg>
+        <div class="hovercard" id="hovercard" role="tooltip" aria-hidden="true">
+          <div class="hovercard-head"></div>
+          <div class="hovercard-meta"></div>
+          <div class="hovercard-detail"></div>
+        </div>
+      </div>
+      <div class="status-strip" id="status-strip" aria-live="polite"></div>
+    </div>
+
+    <button class="grip col" id="grip-props" role="separator" aria-orientation="vertical" aria-label="resize properties pane" aria-valuenow="300"><span class="grip-pill"></span></button>
+
+    <aside class="props" id="props" aria-label="properties"></aside>
+  </div>
+</div>
+
+<!-- The model: a YAML subset reader and writer, the Workload helpers, the
+     validation the controller applies, and the layered layout. This block
+     touches no DOM, so web/roundtrip_test.mjs loads it under Node. -->
+<script id="core">
+const Core = (function () {
+'use strict';
+
+// ---------- YAML subset ----------
+//
+// Supported: block mappings and sequences, flow mappings and sequences,
+// plain and quoted scalars, literal and folded block scalars, comments,
+// document markers. Not supported: anchors, aliases, tags, multiple
+// documents, complex keys.
+
+class YAMLError extends Error {
+  constructor(message, line) { super(message); this.name = 'YAMLError'; this.line = line; }
+}
+
+function stripComment(line) {
+  let q = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (q) {
+      if (q === '"' && c === '\\') { i++; continue; }
+      if (c === q) { if (q === "'" && line[i + 1] === "'") { i++; continue; } q = null; }
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      const p = line[i - 1];
+      if (i === 0 || /[\s:\-\[\{,]/.test(p)) q = c;
+      continue;
+    }
+    if (c === '#' && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i);
+  }
+  return line;
+}
+
+function isSeqItem(text) { return text === '-' || text.startsWith('- '); }
+
+// Splits "key: rest" outside quotes and brackets; null when the line is
+// not a mapping entry.
+function splitKey(text) {
+  if (text[0] === '{' || text[0] === '[') return null;
+  let i = 0, key;
+  if (text[0] === '"' || text[0] === "'") {
+    const r = readQuoted(text, 0);
+    key = r.value; i = r.end;
+    while (i < text.length && text[i] === ' ') i++;
+    if (text[i] !== ':') return null;
+    if (i + 1 < text.length && text[i + 1] !== ' ') return null;
+    return { key, rest: text.slice(i + 1).trim() };
+  }
+  let depth = 0;
+  for (; i < text.length; i++) {
+    const c = text[i];
+    if (c === '[' || c === '{') depth++;
+    else if (c === ']' || c === '}') depth--;
+    else if (c === ':' && depth === 0 && (i + 1 === text.length || text[i + 1] === ' ')) {
+      key = text.slice(0, i).trim();
+      if (key === '' || key === '-') return null;
+      return { key, rest: text.slice(i + 1).trim() };
+    }
+  }
+  return null;
+}
+
+function readQuoted(s, i) {
+  const q = s[i];
+  let out = '';
+  i++;
+  for (; i < s.length; i++) {
+    const c = s[i];
+    if (q === "'") {
+      if (c === "'") { if (s[i + 1] === "'") { out += "'"; i++; continue; } return { value: out, end: i + 1 }; }
+      out += c; continue;
+    }
+    if (c === '\\') {
+      const n = s[++i];
+      const map = { n: '\n', t: '\t', r: '\r', '"': '"', '\\': '\\', '/': '/', '0': '\0', ' ': ' ', b: '\b', f: '\f', e: '\x1b' };
+      if (n in map) { out += map[n]; continue; }
+      if (n === 'u') { out += String.fromCharCode(parseInt(s.substr(i + 1, 4), 16)); i += 4; continue; }
+      if (n === 'x') { out += String.fromCharCode(parseInt(s.substr(i + 1, 2), 16)); i += 2; continue; }
+      out += n; continue;
+    }
+    if (c === '"') return { value: out, end: i + 1 };
+    out += c;
+  }
+  throw new Error('unterminated quoted string');
+}
+
+const RE_INT = /^[-+]?(0|[1-9][0-9]*)$/;
+const RE_FLOAT = /^[-+]?([0-9]+\.[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?$/;
+
+function typed(t) {
+  if (t === '' || t === '~' || t === 'null' || t === 'Null' || t === 'NULL') return null;
+  if (t === 'true' || t === 'True' || t === 'TRUE') return true;
+  if (t === 'false' || t === 'False' || t === 'FALSE') return false;
+  if (RE_INT.test(t)) return parseInt(t, 10);
+  if (RE_FLOAT.test(t)) return parseFloat(t);
+  return t;
+}
+
+function bracketBalance(s) {
+  let depth = 0, q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { if (q === '"' && c === '\\') i++; else if (c === q) q = null; continue; }
+    if (c === '"' || c === "'") q = c;
+    else if (c === '[' || c === '{') depth++;
+    else if (c === ']' || c === '}') depth--;
+  }
+  return depth;
+}
+
+function parseFlow(s, no) {
+  let i = 0;
+  const err = (m) => new YAMLError(m, no);
+  const ws = () => { while (i < s.length && /\s/.test(s[i])) i++; };
+  function plainUntil(stops) {
+    let j = i;
+    while (j < s.length) {
+      const d = s[j];
+      if (stops.includes(d)) break;
+      if (d === ':' && (j + 1 >= s.length || /[\s,\]\}]/.test(s[j + 1]))) break;
+      j++;
+    }
+    const t = s.slice(i, j).trim(); i = j; return t;
+  }
+  function value() {
+    ws();
+    const c = s[i];
+    if (c === undefined) throw err('unexpected end of flow value');
+    if (c === '{') return map();
+    if (c === '[') return seq();
+    if (c === '"' || c === "'") { const r = readQuoted(s, i); i = r.end; return r.value; }
+    return typed(plainUntil(',]}'));
+  }
+  function map() {
+    i++; const o = {}; ws();
+    if (s[i] === '}') { i++; return o; }
+    for (;;) {
+      ws();
+      let key;
+      if (s[i] === '"' || s[i] === "'") { const r = readQuoted(s, i); i = r.end; key = r.value; }
+      else key = plainUntil(',}');
+      ws();
+      if (s[i] === ':') { i++; o[key] = value(); } else o[key] = null;
+      ws();
+      if (s[i] === ',') { i++; ws(); if (s[i] === '}') { i++; return o; } continue; }
+      if (s[i] === '}') { i++; return o; }
+      throw err('expected "," or "}" in flow mapping');
+    }
+  }
+  function seq() {
+    i++; const a = []; ws();
+    if (s[i] === ']') { i++; return a; }
+    for (;;) {
+      a.push(value()); ws();
+      if (s[i] === ',') { i++; ws(); if (s[i] === ']') { i++; return a; } continue; }
+      if (s[i] === ']') { i++; return a; }
+      throw err('expected "," or "]" in flow sequence');
+    }
+  }
+  const v = value(); ws();
+  if (i < s.length) throw err('trailing content after value');
+  return v;
+}
+
+function parseYAML(text) {
+  const raw = String(text).replace(/\r\n?/g, '\n').split('\n');
+  const lines = [];
+  for (let i = 0; i < raw.length; i++) {
+    const r = raw[i];
+    if (/^(---|\.\.\.)(\s|$)/.test(r) || /^%/.test(r)) continue;
+    const t = stripComment(r).trimEnd();
+    if (t.trim() === '') continue;
+    const lead = r.slice(0, r.length - r.trimStart().length);
+    if (lead.includes('\t')) throw new YAMLError('tab used for indentation', i + 1);
+    lines.push({ no: i + 1, rawIndex: i, indent: t.length - t.trimStart().length, text: t.trim() });
+  }
+  if (!lines.length) return null;
+  const st = { lines, raw, p: 0 };
+  const v = parseNode(st, -1);
+  if (st.p < lines.length) throw new YAMLError('unexpected content', lines[st.p].no);
+  return v;
+}
+
+function parseNode(st, parentIndent) {
+  const L = st.lines[st.p];
+  if (!L || L.indent <= parentIndent) return null;
+  if (isSeqItem(L.text)) return parseSeq(st, L.indent);
+  if (splitKey(L.text)) return parseMap(st, L.indent);
+  st.p++;
+  return parseInline(st, L.text, L, parentIndent);
+}
+
+function parseSeq(st, indent) {
+  const arr = [];
+  while (st.p < st.lines.length && st.lines[st.p].indent === indent && isSeqItem(st.lines[st.p].text)) {
+    const L = st.lines[st.p];
+    const rest = L.text === '-' ? '' : L.text.slice(2).trim();
+    if (rest === '') { st.p++; arr.push(parseNode(st, indent)); continue; }
+    const col = L.indent + (L.text.length - rest.length);
+    st.lines[st.p] = { no: L.no, rawIndex: L.rawIndex, indent: col, text: rest };
+    arr.push(parseNode(st, indent));
+  }
+  return arr;
+}
+
+function parseMap(st, indent) {
+  const obj = {};
+  while (st.p < st.lines.length && st.lines[st.p].indent === indent && !isSeqItem(st.lines[st.p].text)) {
+    const L = st.lines[st.p];
+    const kv = splitKey(L.text);
+    if (!kv) throw new YAMLError('expected "key: value"', L.no);
+    st.p++;
+    let val;
+    if (kv.rest === '') {
+      const N = st.lines[st.p];
+      if (N && N.indent > indent) val = parseNode(st, indent);
+      else if (N && N.indent === indent && isSeqItem(N.text)) val = parseSeq(st, indent);
+      else val = null;
+    } else {
+      val = parseInline(st, kv.rest, L, indent);
+    }
+    obj[kv.key] = val;
+  }
+  return obj;
+}
+
+function parseInline(st, s, L, parentIndent) {
+  if (s[0] === '|' || s[0] === '>') return parseBlockScalar(st, s, L, parentIndent);
+  if (s[0] === '{' || s[0] === '[') {
+    let text = s;
+    while (bracketBalance(text) > 0 && st.p < st.lines.length) { text += ' ' + st.lines[st.p].text; st.p++; }
+    if (bracketBalance(text) !== 0) throw new YAMLError('unbalanced flow collection', L.no);
+    return parseFlow(text, L.no);
+  }
+  if (s[0] === '"' || s[0] === "'") {
+    let r;
+    try { r = readQuoted(s, 0); } catch (e) { throw new YAMLError(e.message, L.no); }
+    if (s.slice(r.end).trim() !== '') throw new YAMLError('trailing content after quoted string', L.no);
+    return r.value;
+  }
+  if (s[0] === '&' || s[0] === '*' || s[0] === '!') throw new YAMLError('anchors, aliases, and tags are not supported', L.no);
+  return typed(s);
+}
+
+function parseBlockScalar(st, header, L, parentIndent) {
+  const m = /^([|>])([+-]?)(\d?)([+-]?)\s*$/.exec(header);
+  if (!m) throw new YAMLError('malformed block scalar header', L.no);
+  const folded = m[1] === '>';
+  const chomp = m[2] || m[4] || '';
+  const body = [];
+  let i = L.rawIndex + 1, contentIndent = -1;
+  for (; i < st.raw.length; i++) {
+    const r = st.raw[i];
+    if (r.trim() === '') { body.push(''); continue; }
+    const ind = r.length - r.trimStart().length;
+    if (contentIndent < 0) { if (ind <= parentIndent) break; contentIndent = ind; }
+    if (ind < contentIndent) break;
+    body.push(r.slice(contentIndent));
+  }
+  while (st.p < st.lines.length && st.lines[st.p].rawIndex < i) st.p++;
+  while (body.length && body[body.length - 1] === '') body.pop();
+  let out;
+  if (folded) {
+    out = '';
+    for (let k = 0; k < body.length; k++) {
+      const l = body[k];
+      if (k === 0) { out = l; continue; }
+      if (l === '') { out += '\n'; continue; }
+      out += (body[k - 1] === '' ? '' : ' ') + l;
+    }
+  } else out = body.join('\n');
+  if (chomp !== '-' && out !== '') out += '\n';
+  return out;
+}
+
+// ---------- emitter ----------
+
+const RE_PLAIN = /^[A-Za-z0-9_./][A-Za-z0-9_./:%+@~=|()\- ]*$/;
+
+function needsQuote(s) {
+  if (s === '') return true;
+  if (!RE_PLAIN.test(s)) return true;
+  if (s !== s.trim()) return true;
+  if (s.includes(': ') || s.includes(' #') || s.endsWith(':')) return true;
+  if (typed(s) !== s) return true;
+  return false;
+}
+
+function scalar(v) {
+  if (v === null || v === undefined) return 'null';
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  if (typeof v === 'number') return Number.isFinite(v) ? String(v) : 'null';
+  const s = String(v);
+  return needsQuote(s) ? JSON.stringify(s) : s;
+}
+
+function isScalar(v) { return v === null || v === undefined || typeof v !== 'object'; }
+function isEmpty(v) { return Array.isArray(v) ? v.length === 0 : Object.keys(v).length === 0; }
+
+function flowText(v) {
+  if (Array.isArray(v)) return '[' + v.map(scalar).join(', ') + ']';
+  return '{' + Object.entries(v).map(([k, x]) => scalar(k) + ': ' + scalar(x)).join(', ') + '}';
+}
+
+// A short collection of scalars three or more levels down is written in
+// flow style, which keeps a container's command and a channel's
+// partitioning on one line each.
+function flowable(v, depth) {
+  if (depth < 3) return false;
+  if (Array.isArray(v)) return v.every(isScalar) && flowText(v).length <= 80;
+  const vals = Object.values(v);
+  return vals.length <= 6 && vals.every(isScalar) && flowText(v).length <= 90;
+}
+
+function emitYAML(v) {
+  if (isScalar(v)) return scalar(v) + '\n';
+  if (isEmpty(v)) return (Array.isArray(v) ? '[]' : '{}') + '\n';
+  return emitBlock(v, 0, 0).join('\n') + '\n';
+}
+
+function emitBlock(v, indent, depth) {
+  return Array.isArray(v) ? emitSeq(v, indent, depth) : emitMap(v, indent, depth);
+}
+
+function emitMap(obj, indent, depth) {
+  const pad = ' '.repeat(indent);
+  const out = [];
+  for (const [k, val] of Object.entries(obj)) {
+    if (val === undefined) continue;
+    const key = pad + scalar(k) + ':';
+    if (isScalar(val)) out.push(key + ' ' + scalar(val));
+    else if (isEmpty(val)) out.push(key + ' ' + (Array.isArray(val) ? '[]' : '{}'));
+    else if (flowable(val, depth + 1)) out.push(key + ' ' + flowText(val));
+    else { out.push(key); out.push(...emitBlock(val, indent + 2, depth + 1)); }
+  }
+  return out;
+}
+
+function emitSeq(arr, indent, depth) {
+  const pad = ' '.repeat(indent);
+  const out = [];
+  for (const item of arr) {
+    if (isScalar(item)) out.push(pad + '- ' + scalar(item));
+    else if (isEmpty(item)) out.push(pad + '- ' + (Array.isArray(item) ? '[]' : '{}'));
+    else if (Array.isArray(item) && flowable(item, depth + 1)) out.push(pad + '- ' + flowText(item));
+    else if (Array.isArray(item)) { out.push(pad + '-'); out.push(...emitSeq(item, indent + 2, depth + 1)); }
+    else {
+      const lines = emitMap(item, indent + 2, depth + 1);
+      lines[0] = pad + '- ' + lines[0].slice(indent + 2);
+      out.push(...lines);
+    }
+  }
+  return out;
+}
+
+// ---------- model ----------
+
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a !== typeof b || a === null || b === null || typeof a !== 'object') return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) return a.length === b.length && a.every((x, i) => deepEqual(x, b[i]));
+  const ka = Object.keys(a).filter((k) => a[k] !== undefined), kb = Object.keys(b).filter((k) => b[k] !== undefined);
+  if (ka.length !== kb.length) return false;
+  return ka.every((k) => k in b && deepEqual(a[k], b[k]));
+}
+
+function clone(v) { return v === undefined ? undefined : JSON.parse(JSON.stringify(v)); }
+
+function blankWorkload(name) {
+  return { apiVersion: 'stark8s.io/v1alpha1', kind: 'Workload', metadata: { name: name || 'untitled' }, spec: { operations: [], channels: [] } };
+}
+
+// Ensures the shape the editor relies on and returns the reasons the
+// document is not a Workload, if any.
+function normalize(doc) {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) throw new Error('document is not a mapping');
+  if (!doc.metadata || typeof doc.metadata !== 'object') doc.metadata = {};
+  if (!doc.spec || typeof doc.spec !== 'object') doc.spec = {};
+  if (!Array.isArray(doc.spec.operations)) doc.spec.operations = [];
+  if (!Array.isArray(doc.spec.channels)) doc.spec.channels = [];
+  for (const o of doc.spec.operations) {
+    if (!o || typeof o !== 'object') throw new Error('an operation is not a mapping');
+    if (typeof o.name !== 'string') throw new Error('an operation has no name');
+  }
+  for (const c of doc.spec.channels) {
+    if (!c || typeof c !== 'object') throw new Error('a channel is not a mapping');
+    if (typeof c.name !== 'string') throw new Error('a channel has no name');
+  }
+  return doc;
+}
+
+// Canonical key order for the fields the editor writes; unknown keys keep
+// their place after the known ones.
+const OP_ORDER = ['name', 'completion', 'slots', 'scaling', 'template'];
+const CH_ORDER = ['name', 'from', 'to', 'partitioning', 'delivery', 'durability', 'feedback'];
+const TOP_ORDER = ['apiVersion', 'kind', 'metadata', 'spec', 'status'];
+const SPEC_ORDER = ['operations', 'channels', 'coordinator'];
+
+function ordered(obj, order) {
+  const out = {};
+  for (const k of order) if (k in obj && obj[k] !== undefined) out[k] = obj[k];
+  for (const k of Object.keys(obj)) if (!(k in out) && obj[k] !== undefined) out[k] = obj[k];
+  return out;
+}
+
+function toYAML(doc) {
+  const d = ordered(doc, TOP_ORDER);
+  if (d.spec && typeof d.spec === 'object') {
+    d.spec = ordered(d.spec, SPEC_ORDER);
+    if (Array.isArray(d.spec.operations)) d.spec.operations = d.spec.operations.map((o) => ordered(o, OP_ORDER));
+    if (Array.isArray(d.spec.channels)) d.spec.channels = d.spec.channels.map((c) => ordered(c, CH_ORDER));
+  }
+  return emitYAML(d);
+}
+
+function fromYAML(text) {
+  const doc = parseYAML(text);
+  if (doc === null) return blankWorkload();
+  return normalize(doc);
+}
+
+// Effective values after CRD defaults.
+const DEFAULTS = {
+  completion: 'Drain', slots: 1, hmin: 1, hmax: 1,
+  partitioning: { mode: 'RoundRobin', partitions: 8 },
+  delivery: 'Pipelined', durability: 'Ephemeral', feedbackMode: 'Synchronous',
+};
+
+function opEffective(o) {
+  const h = (o.scaling && o.scaling.horizontal) || {};
+  return {
+    completion: o.completion || DEFAULTS.completion,
+    slots: o.slots == null ? DEFAULTS.slots : o.slots,
+    min: h.min == null ? DEFAULTS.hmin : h.min,
+    max: h.max == null ? DEFAULTS.hmax : h.max,
+    backlog: h.targetBacklogPerReplica || 0,
+    cpu: h.cpuUtilizationPercent || 0,
+    vertical: (o.scaling && o.scaling.vertical && o.scaling.vertical.mode) || 'Off',
+  };
+}
+
+function chEffective(c) {
+  const p = c.partitioning || {};
+  return {
+    mode: p.mode || DEFAULTS.partitioning.mode,
+    partitions: p.partitions == null ? DEFAULTS.partitioning.partitions : p.partitions,
+    delivery: c.delivery || DEFAULTS.delivery,
+    durability: c.durability || (c.to ? DEFAULTS.durability : 'Retained'),
+    feedback: c.feedback ? { mode: c.feedback.mode || DEFAULTS.feedbackMode, maxEpochs: c.feedback.maxEpochs, overflow: c.feedback.overflow || '' } : null,
+  };
+}
+
+// ---------- validation ----------
+//
+// The same checks as Validate in pkg/controller/reconciler.go, reported
+// all at once rather than at the first failure, plus two checks the
+// runtime documents as constraints: a Hash consumer's replica bound may
+// not exceed the partition count, and a feedback overflow must name a
+// declared channel.
+function validate(doc) {
+  const errs = [];
+  const ops = new Map();
+  for (const o of doc.spec.operations) {
+    if (ops.has(o.name)) errs.push({ message: `duplicate operation "${o.name}"`, op: o.name });
+    ops.set(o.name, o);
+  }
+  const chans = new Set();
+  const adj = new Map();
+  for (const c of doc.spec.channels) {
+    if (chans.has(c.name)) errs.push({ message: `duplicate channel "${c.name}"`, channel: c.name });
+    chans.add(c.name);
+    if (c.from && !ops.has(c.from)) errs.push({ message: `channel "${c.name}": unknown producer "${c.from}"`, channel: c.name });
+    if (c.to && !ops.has(c.to)) errs.push({ message: `channel "${c.name}": unknown consumer "${c.to}"`, channel: c.name });
+    if (c.feedback && !c.to) errs.push({ message: `channel "${c.name}": feedback channels need a consuming operation`, channel: c.name });
+    if (c.from && c.to && !c.feedback) {
+      if (!adj.has(c.from)) adj.set(c.from, []);
+      adj.get(c.from).push({ to: c.to, channel: c.name });
+    }
+    if (c.feedback && c.feedback.overflow && !doc.spec.channels.some((x) => x.name === c.feedback.overflow)) {
+      errs.push({ message: `channel "${c.name}": overflow names undeclared channel "${c.feedback.overflow}"`, channel: c.name });
+    }
+    if (c.to && ops.has(c.to)) {
+      const e = chEffective(c), consumer = opEffective(ops.get(c.to));
+      if (e.mode === 'Hash' && consumer.max > e.partitions) {
+        errs.push({ message: `channel "${c.name}": consumer "${c.to}" may reach ${consumer.max} replicas but has ${e.partitions} partitions`, channel: c.name });
+      }
+    }
+  }
+  // With feedback edges removed the graph must be acyclic.
+  const WHITE = 0, GREY = 1, BLACK = 2;
+  const color = new Map();
+  const visit = (n) => {
+    color.set(n, GREY);
+    for (const { to, channel } of adj.get(n) || []) {
+      const c = color.get(to) || WHITE;
+      if (c === GREY) { errs.push({ message: `cycle through "${n}" and "${to}" has no feedback channel`, channel, op: to }); continue; }
+      if (c === WHITE) visit(to);
+    }
+    color.set(n, BLACK);
+  };
+  for (const name of ops.keys()) if ((color.get(name) || WHITE) === WHITE) visit(name);
+  return errs;
+}
+
+// ---------- layout ----------
+//
+// Operations are ranked by longest path over the channels that are not
+// feedback (left to right), ordered within a rank by barycenter sweeps,
+// and placed on a grid. A pinned position overrides the computed one.
+
+const NODE_H = 46, GAP_X = 130, GAP_Y = 44, MARGIN = 80;
+
+function nodeWidth(o) {
+  const e = opEffective(o);
+  const sub = subLine(e).length;
+  return Math.max(150, 30 + Math.max(o.name.length * 7.4, sub * 5.9) + 30);
+}
+
+function subLine(e) {
+  const reps = e.min === e.max ? `${e.max} replica${e.max === 1 ? '' : 's'}` : `${e.min}–${e.max} replicas`;
+  return `${e.completion} · slots ${e.slots} · ${reps}`;
+}
+
+function layout(doc, pinned) {
+  const ops = doc.spec.operations;
+  const names = ops.map((o) => o.name);
+  const index = new Map(names.map((n, i) => [n, i]));
+  const succ = new Map(names.map((n) => [n, []]));
+  const pred = new Map(names.map((n) => [n, []]));
+  for (const c of doc.spec.channels) {
+    if (c.from && c.to && !c.feedback && index.has(c.from) && index.has(c.to) && c.from !== c.to) {
+      succ.get(c.from).push(c.to);
+      pred.get(c.to).push(c.from);
+    }
+  }
+  const rank = new Map();
+  const onStack = new Set();
+  const rankOf = (n) => {
+    if (rank.has(n)) return rank.get(n);
+    if (onStack.has(n)) return 0;
+    onStack.add(n);
+    let r = 0;
+    for (const p of pred.get(n)) r = Math.max(r, rankOf(p) + 1);
+    onStack.delete(n);
+    rank.set(n, r);
+    return r;
+  };
+  names.forEach(rankOf);
+  const columns = [];
+  for (const n of names) {
+    const r = rank.get(n);
+    (columns[r] = columns[r] || []).push(n);
+  }
+  const pos = new Map();
+  const reorder = (col, neighbours) => {
+    const bary = new Map(col.map((n) => {
+      const ns = neighbours.get(n).filter((m) => pos.has(m));
+      return [n, ns.length ? ns.reduce((s, m) => s + pos.get(m), 0) / ns.length : pos.get(n)];
+    }));
+    col.sort((a, b) => bary.get(a) - bary.get(b) || index.get(a) - index.get(b));
+    col.forEach((n, i) => pos.set(n, i));
+  };
+  columns.forEach((col) => col.forEach((n, i) => pos.set(n, i)));
+  for (let sweep = 0; sweep < 4; sweep++) {
+    for (let r = 1; r < columns.length; r++) reorder(columns[r], pred);
+    for (let r = columns.length - 2; r >= 0; r--) reorder(columns[r], succ);
+  }
+  const widths = new Map(ops.map((o) => [o.name, nodeWidth(o)]));
+  const colWidth = columns.map((col) => Math.max(...col.map((n) => widths.get(n))));
+  const maxRows = Math.max(1, ...columns.map((c) => c.length));
+  const nodes = new Map();
+  let x = MARGIN;
+  columns.forEach((col, r) => {
+    const offset = ((maxRows - col.length) * (NODE_H + GAP_Y)) / 2;
+    col.forEach((n, i) => {
+      const w = widths.get(n);
+      nodes.set(n, { x: x + (colWidth[r] - w) / 2, y: MARGIN + offset + i * (NODE_H + GAP_Y), w, h: NODE_H, rank: r });
+    });
+    x += colWidth[r] + GAP_X;
+  });
+  if (pinned) {
+    for (const [n, p] of Object.entries(pinned)) {
+      const node = nodes.get(n);
+      if (node && p && Number.isFinite(p.x) && Number.isFinite(p.y)) { node.x = p.x; node.y = p.y; }
+    }
+  }
+  return nodes;
+}
+
+// Parses YAML, writes it back, parses the result, and compares.
+function roundTrip(text) {
+  const a = fromYAML(text);
+  const out = toYAML(a);
+  const b = fromYAML(out);
+  return { ok: deepEqual(a, b), yaml: out, first: a, second: b };
+}
+
+return { YAMLError, parseYAML, emitYAML, toYAML, fromYAML, blankWorkload, normalize, validate, layout,
+  opEffective, chEffective, subLine, nodeWidth, deepEqual, clone, roundTrip, DEFAULTS, NODE_H };
+})();
+</script>
+
+<script class="example" type="text/plain" data-name="wordcount">
+# Map/shuffle/reduce. "shuffle" is a Materialized Hash channel: reduce is not
+# started until map has completed, and each reduce replica owns a fixed set of
+# key partitions — the stage barrier and exchange of a Spark shuffle.
+apiVersion: stark8s.io/v1alpha1
+kind: Workload
+metadata:
+  name: wordcount
+spec:
+  operations:
+    - name: read
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/wordcount", "read"]
+    - name: map
+      scaling:
+        horizontal: {min: 1, max: 4, targetBacklogPerReplica: 300}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/wordcount", "map"]
+    - name: reduce
+      scaling:
+        horizontal: {min: 1, max: 3, targetBacklogPerReplica: 4000}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/wordcount", "reduce"]
+  channels:
+    - name: lines
+      from: read
+      to: map
+      partitioning: {mode: RoundRobin, partitions: 8}
+      delivery: Pipelined
+    - name: shuffle
+      from: map
+      to: reduce
+      partitioning: {mode: Hash, partitions: 6}
+      delivery: Materialized
+    - name: totals
+      from: reduce
+      # No consumer: results are read from outside through the exchange API.
+</script>
+<script class="example" type="text/plain" data-name="pagerank">
+# PageRank as a cyclic graph. "contrib" is a feedback channel: it loops from
+# rank back into rank, records carry an epoch, and epoch e+1 is released only
+# after every rank replica has finished epoch e (bulk-synchronous supersteps).
+apiVersion: stark8s.io/v1alpha1
+kind: Workload
+metadata:
+  name: pagerank
+spec:
+  operations:
+    - name: seed
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/pagerank", "seed"]
+    - name: rank
+      scaling:
+        horizontal: {min: 2, max: 2}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/pagerank", "rank"]
+  channels:
+    - name: graph
+      from: seed
+      to: rank
+      partitioning: {mode: Hash, partitions: 4}
+      delivery: Materialized
+    - name: contrib
+      from: rank
+      to: rank
+      partitioning: {mode: Hash, partitions: 4}
+      feedback: {maxEpochs: 20}
+    - name: ranks
+      from: rank
+</script>
+
+<script>
+(function () {
+'use strict';
+
+const $ = (id) => document.getElementById(id);
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const STORE = 'stark8s.editor.';
+
+function store(key, value) {
+  try { localStorage.setItem(STORE + key, JSON.stringify(value)); } catch (e) { /* storage may be unavailable */ }
+}
+function load(key, fallback) {
+  try { const v = localStorage.getItem(STORE + key); return v === null ? fallback : JSON.parse(v); } catch (e) { return fallback; }
+}
+
+// ---------- examples ----------
+
+const EXAMPLES = [];
+for (const s of document.querySelectorAll("script.example")) {
+  EXAMPLES.push({ name: s.dataset.name, text: s.textContent.replace(/^\n/, '') });
+}
+
+// ---------- appearance ----------
+
+// Preview tuples in the order ground, surface, ink, improve, regress,
+// accent; they draw the swatch strips only. lunaria-eclipse previews a
+// substituted magenta because its live accent is too close to its ink to
+// read in a strip.
+const THEMES = [
+  { id: 'monokai', label: 'monokai', preview: ['#1e1f1c', '#272822', '#f8f8f2', '#a6e22e', '#f92672', '#66d9ef'] },
+  { id: 'solarized-dark', label: 'solarized dark', preview: ['#04222B', '#0A2D38', '#93A1A1', '#8BB80E', '#E0483C', '#2AA198'] },
+  { id: 'solarized-light', label: 'solarized light', preview: ['#FDF6E3', '#FBF1D6', '#586E75', '#6B9B0B', '#DC322F', '#268BD2'] },
+  { id: 'google-light', label: 'google light', preview: ['#FFFFFF', '#F4F4F4', '#474A4E', '#34A853', '#EA4335', '#1B9CB8'] },
+  { id: 'google-dark', label: 'google dark', preview: ['#202124', '#2C2D30', '#FFFFFF', '#34A853', '#EA4335', '#24C1E0'] },
+  { id: 'lunaria-light', label: 'lunaria light', preview: ['#EBE4E1', '#E2DCD9', '#363434', '#497D46', '#783C1F', '#3778A9'] },
+  { id: 'lunaria-eclipse', label: 'lunaria eclipse', preview: ['#323F46', '#3B484F', '#DFE2ED', '#BEDBC1', '#BA9088', '#C8429F'] },
+  { id: 'belafonte-day', label: 'belafonte day', preview: ['#D5CCBA', '#CCC3B2', '#34292D', '#6e6a4e', '#BE100E', '#426A79'] },
+  { id: 'belafonte-night', label: 'belafonte night', preview: ['#20111B', '#271821', '#D5CCBA', '#a6a07a', '#d6403e', '#6F8E97'] },
+  { id: 'paper', label: 'paper', preview: ['#F2EEDE', '#E6E2D3', '#1A1A1A', '#216609', '#CC3E28', '#1E6FCC'] },
+  { id: 'zenburn', label: 'zenburn', preview: ['#3A3A3A', '#424241', '#DCDCCC', '#8FB28F', '#CC9393', '#8CD0D3'] },
+  { id: 'selenized-black', label: 'selenized black', preview: ['#181818', '#202020', '#DEDEDE', '#83C746', '#FF5E56', '#56D8C9'] },
+  { id: 'relaxed', label: 'relaxed', preview: ['#353A44', '#3D424B', '#F7F7F7', '#A0AC77', '#BC5653', '#7EAAC7'] },
+  { id: 'espresso', label: 'espresso', preview: ['#323232', '#3A3A3A', '#FFFFFF', '#A5C261', '#D25252', '#6C99BB'] },
+  { id: 'dracula', label: 'dracula', preview: ['#282A36', '#343746', '#F8F8F2', '#50FA7B', '#FF5555', '#BD93F9'] },
+  { id: 'ubuntu', label: 'ubuntu', preview: ['#300A24', '#3D1530', '#EEEEEC', '#8AE234', '#CC0000', '#34E2E2'] },
+];
+
+function swatchStrip(preview, host) {
+  host.textContent = '';
+  for (const c of preview) {
+    const s = document.createElement('span');
+    s.className = 'swatch';
+    s.style.background = c;
+    host.appendChild(s);
+  }
+}
+
+function applyTheme(id) {
+  const t = THEMES.find((x) => x.id === id);
+  if (!t) return;
+  document.documentElement.setAttribute('data-theme', t.id);
+  $('theme-name').textContent = t.label;
+  swatchStrip(t.preview, $('theme-strip'));
+  for (const li of $('theme-list').children) li.setAttribute('aria-selected', li.dataset.id === t.id ? 'true' : 'false');
+  store('theme', t.id);
+}
+
+function applyScale(pct) {
+  const v = Math.min(150, Math.max(70, Math.round(pct / 5) * 5));
+  $('app').style.zoom = String(v / 100);
+  $('scale-range').value = String(v);
+  $('scale-val').textContent = v + '%';
+  store('scale', v);
+}
+
+function setupPicker(cd, trigger, list, onPick) {
+  const open = (yes) => { cd.classList.toggle('open', yes); trigger.setAttribute('aria-expanded', yes ? 'true' : 'false'); };
+  trigger.addEventListener('click', () => {
+    const now = !cd.classList.contains('open');
+    open(now);
+    if (now) { const sel = list.querySelector('[aria-selected="true"]') || list.firstElementChild; if (sel) sel.focus(); }
+  });
+  list.addEventListener('click', (e) => { const li = e.target.closest('[role="option"]'); if (li) { onPick(li.dataset.id); open(false); trigger.focus(); } });
+  list.addEventListener('keydown', (e) => {
+    const items = [...list.children];
+    const i = items.indexOf(document.activeElement);
+    if (e.key === 'ArrowDown') { e.preventDefault(); (items[i + 1] || items[0]).focus(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); (items[i - 1] || items[items.length - 1]).focus(); }
+    else if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); if (i >= 0) { onPick(items[i].dataset.id); open(false); trigger.focus(); } }
+    else if (e.key === 'Escape') { e.preventDefault(); open(false); trigger.focus(); }
+  });
+  document.addEventListener('pointerdown', (e) => { if (!cd.contains(e.target)) open(false); });
+}
+
+// ---------- state ----------
+
+const state = {
+  doc: Core.blankWorkload('untitled'),
+  yamlText: '',
+  pinned: {},           // operation name -> {x, y} for dragged nodes
+  selection: null,      // {kind: 'op'|'ch', name}
+  status: null,         // parsed observed status, or null
+  view: null,           // {x, y, w, h} viewBox; null means fit
+  userView: false,
+  digest: '',
+  propsDigest: '',
+  errors: [],
+  notes: [],            // transient lines for the status strip
+};
+
+const svg = $('canvas');
+const host = $('canvas-host');
+const hovercard = $('hovercard');
+
+function el(name, attrs, children) {
+  const e = document.createElementNS(SVG_NS, name);
+  for (const [k, v] of Object.entries(attrs || {})) if (v !== undefined && v !== null) e.setAttribute(k, String(v));
+  for (const c of children || []) if (c) e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+  return e;
+}
+
+function hov(node, name, context, detail) {
+  node.dataset.hn = name; node.dataset.hc = context || ''; node.dataset.hd = detail || '';
+  return node;
+}
+
+// ---------- hovercard ----------
+
+function showHover(target, cx, cy) {
+  hovercard.querySelector('.hovercard-head').textContent = target.dataset.hn;
+  hovercard.querySelector('.hovercard-meta').textContent = target.dataset.hc;
+  hovercard.querySelector('.hovercard-detail').textContent = target.dataset.hd;
+  hovercard.querySelector('.hovercard-meta').hidden = !target.dataset.hc;
+  hovercard.querySelector('.hovercard-detail').hidden = !target.dataset.hd;
+  hovercard.classList.add('on');
+  hovercard.setAttribute('aria-hidden', 'false');
+  const hr = host.getBoundingClientRect(), z = zoomFactor();
+  const cw = hovercard.offsetWidth, ch = hovercard.offsetHeight;
+  const hw = hr.width / z, hh = hr.height / z;
+  let x = (cx - hr.left) / z + 12, y = (cy - hr.top) / z + 16;
+  if (x + cw > hw - 6) x = Math.max(6, hw - cw - 6);
+  if (y + ch > hh - 6) y = (cy - hr.top) / z - ch - 10;
+  hovercard.style.left = x + 'px';
+  hovercard.style.top = Math.max(4, y) + 'px';
+}
+function hideHover() { hovercard.classList.remove('on'); hovercard.setAttribute('aria-hidden', 'true'); }
+
+svg.addEventListener('pointerover', (e) => {
+  if (drag) return;
+  const t = e.target.closest('[data-hn]');
+  if (t) showHover(t, e.clientX, e.clientY);
+});
+svg.addEventListener('pointermove', (e) => {
+  if (drag || !hovercard.classList.contains('on')) return;
+  const t = e.target.closest('[data-hn]');
+  if (t) showHover(t, e.clientX, e.clientY); else hideHover();
+});
+svg.addEventListener('pointerout', (e) => { if (!e.relatedTarget || !e.relatedTarget.closest || !e.relatedTarget.closest('[data-hn]')) hideHover(); });
+svg.addEventListener('focusin', (e) => {
+  const t = e.target.closest('[data-hn]');
+  if (t) { const r = t.getBoundingClientRect(); showHover(t, r.left + r.width / 2, r.bottom); }
+});
+svg.addEventListener('focusout', hideHover);
+
+// ---------- geometry ----------
+
+function bez(p0, p1, p2, p3, t) {
+  const mt = 1 - t;
+  return {
+    x: mt * mt * mt * p0.x + 3 * mt * mt * t * p1.x + 3 * mt * t * t * p2.x + t * t * t * p3.x,
+    y: mt * mt * mt * p0.y + 3 * mt * mt * t * p1.y + 3 * mt * t * t * p2.y + t * t * t * p3.y,
+  };
+}
+function bezAngle(p0, p1, p2, p3, t) {
+  const mt = 1 - t;
+  const dx = 3 * mt * mt * (p1.x - p0.x) + 6 * mt * t * (p2.x - p1.x) + 3 * t * t * (p3.x - p2.x);
+  const dy = 3 * mt * mt * (p1.y - p0.y) + 6 * mt * t * (p2.y - p1.y) + 3 * t * t * (p3.y - p2.y);
+  return (Math.atan2(dy, dx) * 180) / Math.PI;
+}
+
+// Places each channel: endpoints, control points, and the glyph that
+// stands in for a missing producer or consumer.
+function edgeGeometry(doc, nodes) {
+  const groups = new Map();
+  for (const c of doc.spec.channels) {
+    const key = (c.from || '') + '→' + (c.to || '');
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(c);
+  }
+  const out = [];
+  for (const c of doc.spec.channels) {
+    const siblings = groups.get((c.from || '') + '→' + (c.to || ''));
+    const k = siblings.indexOf(c) - (siblings.length - 1) / 2;
+    // An endpoint that names no operation, or one that is not declared,
+    // is drawn as an external glyph; validation reports the undeclared one.
+    const a = (c.from && nodes.get(c.from)) || null;
+    const b = (c.to && nodes.get(c.to)) || null;
+    const unknownFrom = !!c.from && !a, unknownTo = !!c.to && !b;
+    if (!a && !b) { out.push({ c, missing: true }); continue; }
+    let p0, p1, p2, p3, kind = 'flow', glyph = null;
+    if (a && b && c.from === c.to) {
+      kind = 'self';
+      p0 = { x: a.x + a.w, y: a.y + a.h / 2 };
+      p3 = { x: a.x, y: a.y + a.h / 2 };
+      const lift = 70 + Math.abs(k) * 22;
+      p1 = { x: a.x + a.w + 70, y: a.y - lift };
+      p2 = { x: a.x - 70, y: a.y - lift };
+    } else if (a && b && c.feedback) {
+      kind = 'feedback';
+      p0 = { x: a.x + a.w, y: a.y + a.h / 2 };
+      p3 = { x: b.x, y: b.y + b.h / 2 };
+      const lift = 90 + Math.abs(k) * 22;
+      p1 = { x: p0.x + 90, y: Math.min(a.y, b.y) - lift };
+      p2 = { x: p3.x - 90, y: Math.min(a.y, b.y) - lift };
+    } else {
+      if (a) p0 = { x: a.x + a.w, y: a.y + a.h / 2 + k * 10 };
+      if (b) p3 = { x: b.x, y: b.y + b.h / 2 + k * 10 };
+      if (!a) { kind = 'source'; p0 = { x: p3.x - 100, y: p3.y }; glyph = { x: p0.x - 8, y: p0.y }; }
+      if (!b) { kind = 'sink'; p3 = { x: p0.x + 100, y: p0.y }; glyph = { x: p3.x + 8, y: p3.y }; }
+      const dx = Math.max(40, Math.abs(p3.x - p0.x) * 0.45);
+      p1 = { x: p0.x + dx, y: p0.y };
+      p2 = { x: p3.x - dx, y: p3.y };
+    }
+    out.push({ c, kind, p0, p1, p2, p3, glyph, unknownFrom, unknownTo });
+  }
+  return out;
+}
+
+// CSS zoom on the app root scales layout but client coordinates stay in
+// screen pixels, so a position inside the zoomed host divides by it.
+function zoomFactor() { return parseFloat($('app').style.zoom || '1') || 1; }
+
+// ---------- render ----------
+
+const MARK_TEXT = {
+  Hash: ['Hash partitioning', 'records with equal keys always reach the same consumer replica'],
+  RoundRobin: ['RoundRobin partitioning', 'records spread evenly across consumer replicas with no key affinity'],
+  Broadcast: ['Broadcast partitioning', 'every consumer replica receives every record'],
+  Materialized: ['Materialized delivery', 'a stage barrier: nothing is delivered until the producer has completed, and the consumer is not started before then'],
+  Retained: ['Retained durability', 'records are kept after acknowledgement, so the channel can be replayed or read from outside'],
+  Drain: ['Drain completion', 'finishes once every inbound channel is sealed and consumed; realised as a Job'],
+  Never: ['Never completes', 'runs until the workload is deleted; realised as a Deployment'],
+};
+
+function phaseGlyph(phase) {
+  const g = el('g', { class: 'glyph' + (phase === 'Failed' ? ' bad' : '') });
+  if (phase === 'Waiting') g.appendChild(el('circle', { r: 4 }));
+  else if (phase === 'Running') g.appendChild(el('circle', { r: 4, class: 'glyph dotted' }));
+  else if (phase === 'Succeeded') g.appendChild(el('path', { d: 'M-4,0.5 L-1.2,3.2 L4,-3' }));
+  else if (phase === 'Failed') g.appendChild(el('path', { d: 'M-3.5,-3.5 L3.5,3.5 M3.5,-3.5 L-3.5,3.5', class: 'glyph bad' }));
+  return g;
+}
+
+function statusOf(kind, name) {
+  const s = state.status;
+  if (!s) return null;
+  const list = kind === 'op' ? s.operations : s.channels;
+  return Array.isArray(list) ? list.find((x) => x && x.name === name) || null : null;
+}
+
+function renderCanvas() {
+  const doc = state.doc;
+  const errors = Core.validate(doc);
+  state.errors = errors;
+  const badOps = new Set(errors.filter((e) => e.op).map((e) => e.op));
+  const badChs = new Set(errors.filter((e) => e.channel).map((e) => e.channel));
+  const digest = JSON.stringify([doc, state.pinned, state.selection, state.status]);
+  if (digest === state.digest && svg.firstChild) return;
+  state.digest = digest;
+
+  const nodes = Core.layout(doc, state.pinned);
+  const edges = edgeGeometry(doc, nodes);
+  const sel = state.selection;
+  svg.textContent = '';
+  const gEdges = el('g', { class: 'edges' });
+  const gNodes = el('g', { class: 'nodes' });
+  svg.appendChild(gEdges);
+  svg.appendChild(gNodes);
+
+  // Bounding box of the drawing, extended by the ingress origin and every
+  // arc's control points so that fit shows the whole figure.
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const grow = (x, y) => { minX = Math.min(minX, x); minY = Math.min(minY, y); maxX = Math.max(maxX, x); maxY = Math.max(maxY, y); };
+  for (const n of nodes.values()) { grow(n.x, n.y); grow(n.x + n.w, n.y + n.h); }
+  if (!nodes.size) { grow(0, 0); grow(400, 200); }
+
+  for (const e of edges) {
+    if (e.missing) continue;
+    const c = e.c, eff = Core.chEffective(c);
+    const st = statusOf('ch', c.name);
+    const g = el('g', { class: 'edge' + (sel && sel.kind === 'ch' && sel.name === c.name ? ' selected' : '') + (badChs.has(c.name) ? ' invalid' : '') + (st && st.pending > 0 ? ' lifted' : ''), 'data-edge': c.name });
+    const isOverflow = doc.spec.channels.some((x) => x.feedback && x.feedback.overflow === c.name);
+    if (isOverflow) g.classList.add('overflow');
+    const d = `M${e.p0.x},${e.p0.y} C${e.p1.x},${e.p1.y} ${e.p2.x},${e.p2.y} ${e.p3.x},${e.p3.y}`;
+    const ends = `${c.from || 'outside'} → ${c.to || 'outside'}`;
+    const detailBits = [`${eff.mode} · ${eff.partitions} partitions`, eff.delivery, eff.durability];
+    if (eff.feedback) detailBits.push(`feedback ${eff.feedback.mode} · ${eff.feedback.maxEpochs} epochs`);
+    if (isOverflow) detailBits.push('overflow target');
+    g.appendChild(el('path', { d, class: 'edge-line' }));
+    const hit = hov(el('path', { d, class: 'edge-hit', tabindex: 0, role: 'button', 'aria-label': `channel ${c.name}` }), c.name, ends, detailBits.join(' · '));
+    g.appendChild(hit);
+    for (const t of [0.25, 0.5, 0.75]) grow(bez(e.p0, e.p1, e.p2, e.p3, t).x, bez(e.p0, e.p1, e.p2, e.p3, t).y);
+
+    // Arrowhead at the consumer end.
+    const aEnd = bezAngle(e.p0, e.p1, e.p2, e.p3, 1);
+    g.appendChild(el('g', { transform: `translate(${e.p3.x},${e.p3.y}) rotate(${aEnd})` }, [el('path', { d: 'M-7,-4.5 L0,0 L-7,4.5', class: 'edge-mark arrow' })]));
+
+    // Marks: durability at the producer end, partitioning at the midpoint,
+    // delivery near the consumer.
+    const markAt = (t, build, name, context, detail) => {
+      const p = bez(e.p0, e.p1, e.p2, e.p3, t), ang = bezAngle(e.p0, e.p1, e.p2, e.p3, t);
+      const m = el('g', { class: 'mark-hit', transform: `translate(${p.x},${p.y}) rotate(${ang})`, tabindex: 0, role: 'img', 'aria-label': name });
+      m.appendChild(el('circle', { r: 9, fill: 'transparent', stroke: 'none' }));
+      build(m);
+      g.appendChild(hov(m, name, context, detail));
+    };
+    if (eff.durability === 'Retained') {
+      markAt(e.kind === 'source' ? 0.3 : 0.12, (m) => m.appendChild(el('rect', { x: -3.5, y: -3.5, width: 7, height: 7, class: 'edge-mark filled' })), MARK_TEXT.Retained[0], c.name, MARK_TEXT.Retained[1]);
+    }
+    if (eff.mode === 'Hash') {
+      markAt(0.5, (m) => m.appendChild(el('path', { d: 'M-6,-5 L-2,5 M-2,-5 L2,5 M2,-5 L6,5', class: 'edge-mark' })), MARK_TEXT.Hash[0], `${c.name} · ${eff.partitions} partitions`, MARK_TEXT.Hash[1]);
+    } else if (eff.mode === 'RoundRobin') {
+      markAt(0.5, (m) => m.appendChild(el('circle', { r: 4.5, class: 'edge-mark filled' })), MARK_TEXT.RoundRobin[0], `${c.name} · ${eff.partitions} partitions`, MARK_TEXT.RoundRobin[1]);
+    } else if (eff.mode === 'Broadcast') {
+      markAt(0.5, (m) => { m.appendChild(el('circle', { r: 5.5, class: 'edge-mark filled', stroke: 'none' })); m.appendChild(el('path', { d: 'M-2,0 L6,-5 M-2,0 L7,0 M-2,0 L6,5', class: 'edge-mark' })); }, MARK_TEXT.Broadcast[0], c.name, MARK_TEXT.Broadcast[1]);
+    }
+    if (eff.delivery === 'Materialized') {
+      markAt(e.kind === 'sink' ? 0.7 : 0.86, (m) => m.appendChild(el('line', { x1: 0, y1: -7, x2: 0, y2: 7, class: 'edge-mark' })), MARK_TEXT.Materialized[0], c.name, MARK_TEXT.Materialized[1]);
+    }
+
+    // Labels: the name above the midpoint; feedback bound and observed
+    // counters below it.
+    const mid = bez(e.p0, e.p1, e.p2, e.p3, 0.5);
+    const above = e.kind === 'self' || e.kind === 'feedback' ? -12 : -14;
+    g.appendChild(el('text', { x: mid.x, y: mid.y + above, class: 'edge-label' }, [c.name]));
+    const meta = [];
+    if (eff.feedback) meta.push(`${eff.feedback.maxEpochs} epochs · ${eff.feedback.mode}`);
+    if (st) {
+      const bits = [];
+      if (st.pending != null) bits.push(`pending ${st.pending}`);
+      if (st.inFlight != null) bits.push(`inflight ${st.inFlight}`);
+      if (st.produced != null) bits.push(`produced ${st.produced}`);
+      if (st.epoch != null) bits.push(`epoch ${st.epoch}`);
+      if (st.sealed) bits.push('sealed');
+      meta.push(bits.join(' · '));
+    }
+    meta.forEach((line, i) => g.appendChild(el('text', { x: mid.x, y: mid.y + 20 + i * 11, class: 'edge-meta' }, [line])));
+
+    // Glyphs for a producer or consumer outside the workload.
+    if (e.kind === 'source') {
+      const s = e.unknownFrom
+        ? hov(el('g', { class: 'mark-hit', transform: `translate(${e.glyph.x},${e.glyph.y})`, tabindex: 0, role: 'img', 'aria-label': 'unknown producer' }), `unknown producer "${c.from}"`, c.name, 'no operation of this name is declared')
+        : hov(el('g', { class: 'mark-hit', transform: `translate(${e.glyph.x},${e.glyph.y})`, tabindex: 0, role: 'img', 'aria-label': 'external producer' }), 'external producer', c.name, 'records are produced from outside the workload through the exchange API');
+      s.appendChild(el('circle', { r: 6, class: 'glyph filled' }));
+      s.appendChild(el('circle', { r: 1.6, class: 'glyph', fill: 'currentColor' }));
+      g.appendChild(s);
+      grow(e.glyph.x - 8, e.glyph.y - 8);
+    }
+    if (e.kind === 'sink') {
+      const s = e.unknownTo
+        ? hov(el('g', { class: 'mark-hit', transform: `translate(${e.glyph.x},${e.glyph.y})`, tabindex: 0, role: 'img', 'aria-label': 'unknown consumer' }), `unknown consumer "${c.to}"`, c.name, 'no operation of this name is declared')
+        : hov(el('g', { class: 'mark-hit', transform: `translate(${e.glyph.x},${e.glyph.y})`, tabindex: 0, role: 'img', 'aria-label': 'external consumer' }), 'external consumer', c.name, 'records are read from outside the workload through the exchange API; such channels are always retained');
+      s.appendChild(el('circle', { r: 6, class: 'glyph filled' }));
+      s.appendChild(el('line', { x1: -3, y1: 0, x2: 3, y2: 0, class: 'glyph' }));
+      g.appendChild(s);
+      grow(e.glyph.x + 8, e.glyph.y + 8);
+    }
+    gEdges.appendChild(g);
+  }
+
+  for (const o of doc.spec.operations) {
+    const n = nodes.get(o.name);
+    const eff = Core.opEffective(o);
+    const st = statusOf('op', o.name);
+    const selected = sel && sel.kind === 'op' && sel.name === o.name;
+    const g = el('g', { class: 'node' + (selected ? ' selected' : '') + (badOps.has(o.name) ? ' invalid' : ''), transform: `translate(${n.x},${n.y})`, 'data-node': o.name, tabindex: 0, role: 'button', 'aria-label': `operation ${o.name}` });
+    const image = (((o.template || {}).spec || {}).containers || [])[0];
+    hov(g, o.name, Core.subLine(eff) + (eff.vertical !== 'Off' ? ` · vertical ${eff.vertical}` : ''), image && image.image ? `image ${image.image}` + (Array.isArray(image.command) ? ' · ' + image.command.join(' ') : '') : 'no container image');
+    g.appendChild(el('rect', { width: n.w, height: n.h, rx: 4, class: 'node-body' }));
+    g.appendChild(el('line', { x1: 0, y1: 6, x2: 0, y2: n.h - 6, class: 'node-spine' }));
+    g.appendChild(el('text', { x: 12, y: 19, class: 'node-name' }, [o.name]));
+    let subText = Core.subLine(eff);
+    if (st && st.replicas != null) subText += ` · ${st.ready == null ? st.replicas : st.ready}/${st.replicas}`;
+    g.appendChild(el('text', { x: 12, y: 35, class: 'node-sub' }, [subText]));
+    // Completion glyph at the top right: a tick for Drain, a ring for Never.
+    const cg = hov(el('g', { class: 'mark-hit', transform: `translate(${n.w - 14},14)`, tabindex: 0, role: 'img', 'aria-label': MARK_TEXT[eff.completion][0] }), MARK_TEXT[eff.completion][0], o.name, MARK_TEXT[eff.completion][1]);
+    cg.appendChild(el('circle', { r: 8, fill: 'transparent', stroke: 'none' }));
+    if (eff.completion === 'Never') cg.appendChild(el('circle', { r: 4, class: 'glyph' }));
+    else cg.appendChild(el('path', { d: 'M-4,0.5 L-1.2,3.2 L4,-3', class: 'glyph' }));
+    g.appendChild(cg);
+    if (st && st.phase) {
+      const pg = hov(el('g', { class: 'mark-hit', transform: `translate(${n.w - 30},14)`, tabindex: 0, role: 'img', 'aria-label': `phase ${st.phase}` }), `phase ${st.phase}`, o.name, `${st.ready == null ? '' : st.ready + ' ready of '}${st.replicas == null ? '' : st.replicas + ' replicas'}${st.runnableTasks != null ? ' · ' + st.runnableTasks + ' runnable tasks' : ''}`);
+      pg.appendChild(el('circle', { r: 8, fill: 'transparent', stroke: 'none' }));
+      pg.appendChild(phaseGlyph(st.phase));
+      g.appendChild(pg);
+    }
+    g.appendChild(el('circle', { cx: n.w, cy: n.h / 2, r: 4, class: 'port', 'data-port': 'out', 'data-node': o.name }));
+    g.appendChild(el('circle', { cx: 0, cy: n.h / 2, r: 4, class: 'port', 'data-port': 'in', 'data-node': o.name }));
+    gNodes.appendChild(g);
+  }
+
+  // The ingress origin: dragging from it creates a channel with no producer.
+  const ing = hov(el('g', { class: 'ingress mark-hit', transform: `translate(${minX - 50},${(minY + maxY) / 2})`, 'data-ingress': '1', tabindex: 0, role: 'button', 'aria-label': 'ingress origin: drag to an operation to create an external-source channel' }), 'ingress', 'drag to an operation', 'creates a channel with no producer, fed from outside the workload');
+  ing.appendChild(el('circle', { r: 7, class: 'glyph filled faint' }));
+  ing.appendChild(el('path', { d: 'M-2,-3 L2,0 L-2,3', class: 'glyph faint' }));
+  ing.appendChild(el('text', { y: 18, class: 'ingress-label' }, ['ingress']));
+  gNodes.appendChild(ing);
+  grow(minX - 62, minY);
+
+  if (!nodes.size) {
+    gNodes.appendChild(el('text', { x: 200, y: 100, class: 'empty-note' }, ['double-click to add an operation, or load an example']));
+  }
+
+  state.bbox = { x: minX - 40, y: minY - 40, w: maxX - minX + 80, h: maxY - minY + 80 };
+  svg.setAttribute('aria-label', `workload graph: ${doc.spec.operations.length} operations, ${doc.spec.channels.length} channels`);
+  if (!state.userView) fitView();
+  else applyView();
+}
+
+function fitView() {
+  const b = state.bbox;
+  if (!b) return;
+  const hr = host.getBoundingClientRect();
+  const aspect = hr.width > 0 && hr.height > 0 ? hr.width / hr.height : 2;
+  let w = b.w, h = b.h;
+  if (w / h < aspect) w = h * aspect; else h = w / aspect;
+  state.view = { x: b.x + (b.w - w) / 2, y: b.y + (b.h - h) / 2, w, h };
+  state.userView = false;
+  applyView();
+}
+function applyView() {
+  const v = state.view;
+  if (v) svg.setAttribute('viewBox', `${v.x} ${v.y} ${v.w} ${v.h}`);
+}
+
+function svgPoint(e) {
+  const pt = new DOMPoint(e.clientX, e.clientY);
+  const m = svg.getScreenCTM();
+  if (!m) return { x: 0, y: 0 };
+  const p = pt.matrixTransform(m.inverse());
+  return { x: p.x, y: p.y };
+}
+
+// ---------- status strip ----------
+
+function renderStatus() {
+  const strip = $('status-strip');
+  strip.textContent = '';
+  const lines = [];
+  for (const e of state.errors) lines.push({ text: e.message, bad: true });
+  for (const n of state.notes) lines.push({ text: n });
+  if (!lines.length) {
+    const d = state.doc.spec;
+    lines.push({ text: `${d.operations.length} operations · ${d.channels.length} channels · valid` });
+  }
+  for (const l of lines) {
+    const div = document.createElement('div');
+    div.className = 'line' + (l.bad ? ' bad' : '');
+    div.textContent = l.text;
+    strip.appendChild(div);
+  }
+}
+
+function note(text) {
+  state.notes.push(text);
+  renderStatus();
+  setTimeout(() => { state.notes = state.notes.filter((n) => n !== text); renderStatus(); }, 6000);
+}
+
+// ---------- model changes ----------
+
+function afterModelChange(source) {
+  if (source !== 'yaml') {
+    const text = Core.toYAML(state.doc);
+    if (text !== state.yamlText) { state.yamlText = text; $('yaml').value = text; }
+    $('yaml-note').textContent = '';
+    $('yaml-note').classList.remove('bad');
+  }
+  $('crumb-name').textContent = state.doc.metadata.name || 'untitled';
+  if (document.activeElement !== $('wl-name')) $('wl-name').value = state.doc.metadata.name || '';
+  if (document.activeElement !== $('wl-ns')) $('wl-ns').value = state.doc.metadata.namespace || '';
+  renderCanvas();
+  renderStatus();
+  if (source !== 'props') renderProps();
+  persistModel();
+}
+
+function persistModel() {
+  store('model', { yaml: state.yamlText, pinned: state.pinned, status: $('status').value });
+}
+
+function opByName(name) { return state.doc.spec.operations.find((o) => o.name === name); }
+function chByName(name) { return state.doc.spec.channels.find((c) => c.name === name); }
+
+function uniqueName(base, taken) {
+  let name = base, i = 2;
+  while (taken.has(name)) name = `${base}-${i++}`;
+  return name;
+}
+
+function addOperation(at) {
+  const taken = new Set(state.doc.spec.operations.map((o) => o.name));
+  const name = uniqueName('op', taken);
+  state.doc.spec.operations.push({ name, template: { spec: { containers: [{ name: 'main', image: 'stark8s:dev' }] } } });
+  if (at) state.pinned[name] = { x: at.x, y: at.y };
+  state.selection = { kind: 'op', name };
+  afterModelChange('canvas');
+  return name;
+}
+
+function addChannel(from, to) {
+  const taken = new Set(state.doc.spec.channels.map((c) => c.name));
+  const name = uniqueName(from && to ? `${from}-${to}` : from ? `${from}-out` : `${to}-in`, taken);
+  const c = { name };
+  if (from) c.from = from;
+  if (to) c.to = to;
+  if (from && to && from === to) c.feedback = { maxEpochs: 10 };
+  else if (from && to && createsCycle(from, to)) c.feedback = { maxEpochs: 10 };
+  state.doc.spec.channels.push(c);
+  state.selection = { kind: 'ch', name };
+  afterModelChange('canvas');
+  return name;
+}
+
+// True when a non-feedback channel from → to would close a cycle, in
+// which case the new channel is created as feedback.
+function createsCycle(from, to) {
+  const adj = new Map();
+  for (const c of state.doc.spec.channels) {
+    if (c.from && c.to && !c.feedback) { if (!adj.has(c.from)) adj.set(c.from, []); adj.get(c.from).push(c.to); }
+  }
+  const seen = new Set();
+  const stack = [to];
+  while (stack.length) {
+    const n = stack.pop();
+    if (n === from) return true;
+    if (seen.has(n)) continue;
+    seen.add(n);
+    for (const m of adj.get(n) || []) stack.push(m);
+  }
+  return false;
+}
+
+function deleteSelection() {
+  const sel = state.selection;
+  if (!sel) return;
+  const spec = state.doc.spec;
+  if (sel.kind === 'op') {
+    spec.operations = spec.operations.filter((o) => o.name !== sel.name);
+    for (const c of spec.channels) {
+      if (c.from === sel.name) delete c.from;
+      if (c.to === sel.name) delete c.to;
+    }
+    delete state.pinned[sel.name];
+  } else {
+    spec.channels = spec.channels.filter((c) => c.name !== sel.name);
+    for (const c of spec.channels) if (c.feedback && c.feedback.overflow === sel.name) delete c.feedback.overflow;
+  }
+  state.selection = null;
+  afterModelChange('canvas');
+}
+
+function renameOperation(oldName, newName) {
+  newName = newName.trim();
+  if (!newName || newName === oldName) return false;
+  if (opByName(newName)) { note(`an operation named "${newName}" already exists`); return false; }
+  const o = opByName(oldName);
+  if (!o) return false;
+  o.name = newName;
+  for (const c of state.doc.spec.channels) {
+    if (c.from === oldName) c.from = newName;
+    if (c.to === oldName) c.to = newName;
+  }
+  if (state.pinned[oldName]) { state.pinned[newName] = state.pinned[oldName]; delete state.pinned[oldName]; }
+  if (state.selection && state.selection.kind === 'op' && state.selection.name === oldName) state.selection.name = newName;
+  return true;
+}
+
+function renameChannel(oldName, newName) {
+  newName = newName.trim();
+  if (!newName || newName === oldName) return false;
+  if (chByName(newName)) { note(`a channel named "${newName}" already exists`); return false; }
+  const c = chByName(oldName);
+  if (!c) return false;
+  c.name = newName;
+  for (const x of state.doc.spec.channels) if (x.feedback && x.feedback.overflow === oldName) x.feedback.overflow = newName;
+  if (state.selection && state.selection.kind === 'ch' && state.selection.name === oldName) state.selection.name = newName;
+  return true;
+}
+
+// ---------- canvas interaction ----------
+
+let drag = null;   // {mode: 'node'|'connect'|'pan', ...}
+let renameBox = null;
+
+svg.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0) return;
+  if (renameBox) commitRename();
+  hideHover();
+  const p = svgPoint(e);
+  const port = e.target.closest('[data-port]');
+  const nodeEl = e.target.closest('[data-node]');
+  const edgeEl = e.target.closest('[data-edge]');
+  const ingress = e.target.closest('[data-ingress]');
+  svg.setPointerCapture(e.pointerId);
+  if (port && port.dataset.port === 'out') {
+    drag = { mode: 'connect', from: port.dataset.node, start: p };
+    beginDraft(p);
+  } else if (ingress) {
+    drag = { mode: 'connect', from: '', start: p };
+    beginDraft(p);
+  } else if (nodeEl) {
+    const name = nodeEl.dataset.node;
+    const nodes = Core.layout(state.doc, state.pinned);
+    const n = nodes.get(name);
+    drag = { mode: 'node', name, offset: { x: p.x - n.x, y: p.y - n.y }, moved: false };
+    nodeEl.classList.add('dragging');
+    if (!(state.selection && state.selection.kind === 'op' && state.selection.name === name)) { state.selection = { kind: 'op', name }; afterModelChange('canvas'); }
+  } else if (edgeEl) {
+    state.selection = { kind: 'ch', name: edgeEl.dataset.edge };
+    afterModelChange('canvas');
+    drag = { mode: 'none' };
+  } else {
+    drag = { mode: 'pan', start: { x: e.clientX, y: e.clientY }, view: { ...state.view }, moved: false };
+    host.classList.add('panning');
+  }
+  e.preventDefault();
+});
+
+svg.addEventListener('pointermove', (e) => {
+  if (!drag) return;
+  const p = svgPoint(e);
+  if (drag.mode === 'node') {
+    drag.moved = true;
+    state.pinned[drag.name] = { x: Math.round(p.x - drag.offset.x), y: Math.round(p.y - drag.offset.y) };
+    renderCanvas();
+  } else if (drag.mode === 'connect') {
+    updateDraft(p);
+    for (const port of svg.querySelectorAll('.port.armed')) port.classList.remove('armed');
+    const target = e.target.closest('[data-node]');
+    if (target) { const inPort = target.closest('.node') && target.closest('.node').querySelector('[data-port="in"]'); if (inPort) inPort.classList.add('armed'); }
+  } else if (drag.mode === 'pan') {
+    const hr = host.getBoundingClientRect();
+    const scale = state.view.w / hr.width;
+    const dx = (e.clientX - drag.start.x) * scale, dy = (e.clientY - drag.start.y) * scale;
+    if (Math.abs(dx) + Math.abs(dy) > 2) drag.moved = true;
+    state.view = { ...drag.view, x: drag.view.x - dx, y: drag.view.y - dy };
+    state.userView = true;
+    applyView();
+  }
+});
+
+svg.addEventListener('pointerup', (e) => {
+  if (!drag) return;
+  const p = svgPoint(e);
+  if (drag.mode === 'node') {
+    const g = svg.querySelector(`[data-node="${CSS.escape(drag.name)}"]`);
+    if (g) g.classList.remove('dragging');
+    if (drag.moved) persistModel();
+  } else if (drag.mode === 'connect') {
+    endDraft();
+    const under = document.elementFromPoint(e.clientX, e.clientY);
+    const target = under && under.closest ? under.closest('[data-node]') : null;
+    if (target) {
+      addChannel(drag.from, target.dataset.node);
+    } else if (drag.from && p.x > drag.start.x + 40) {
+      addChannel(drag.from, '');
+    }
+  } else if (drag.mode === 'pan') {
+    host.classList.remove('panning');
+    if (!drag.moved && state.selection) { state.selection = null; afterModelChange('canvas'); }
+  }
+  drag = null;
+});
+
+svg.addEventListener('dblclick', (e) => {
+  const nodeEl = e.target.closest('[data-node]');
+  const p = svgPoint(e);
+  if (nodeEl && !e.target.closest('[data-port]')) { startRename(nodeEl.dataset.node); return; }
+  if (e.target.closest('[data-edge]') || e.target.closest('[data-ingress]')) return;
+  addOperation({ x: Math.round(p.x - 75), y: Math.round(p.y - Core.NODE_H / 2) });
+});
+
+svg.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const v = state.view;
+  if (!v) return;
+  const factor = Math.exp(e.deltaY * 0.0015);
+  const p = svgPoint(e);
+  const w = Math.min(20000, Math.max(120, v.w * factor));
+  const h = v.h * (w / v.w);
+  state.view = { x: p.x - (p.x - v.x) * (w / v.w), y: p.y - (p.y - v.y) * (h / v.h), w, h };
+  state.userView = true;
+  applyView();
+}, { passive: false });
+
+svg.addEventListener('keydown', (e) => {
+  const t = e.target;
+  if ((e.key === 'Enter' || e.key === ' ') && t.dataset) {
+    if (t.dataset.node && !t.dataset.port) { e.preventDefault(); state.selection = { kind: 'op', name: t.dataset.node }; afterModelChange('canvas'); }
+    else if (t.dataset.edge || (t.closest && t.closest('[data-edge]'))) { e.preventDefault(); state.selection = { kind: 'ch', name: (t.dataset.edge ? t : t.closest('[data-edge]')).dataset.edge }; afterModelChange('canvas'); }
+  }
+});
+
+let draftLine = null;
+function beginDraft(p) { draftLine = el('path', { class: 'draft-line', d: `M${p.x},${p.y} L${p.x},${p.y}` }); svg.appendChild(draftLine); svg.classList.add('connecting'); }
+function updateDraft(p) { if (draftLine && drag) draftLine.setAttribute('d', `M${drag.start.x},${drag.start.y} L${p.x},${p.y}`); }
+function endDraft() { if (draftLine) draftLine.remove(); draftLine = null; svg.classList.remove('connecting'); for (const port of svg.querySelectorAll('.port.armed')) port.classList.remove('armed'); }
+
+function startRename(name) {
+  const g = svg.querySelector(`[data-node="${CSS.escape(name)}"]`);
+  if (!g) return;
+  const text = g.querySelector('.node-name');
+  const r = text.getBoundingClientRect(), hr = host.getBoundingClientRect(), z = zoomFactor();
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'rename';
+  input.value = name;
+  input.setAttribute('aria-label', 'operation name');
+  input.style.left = ((r.left - hr.left) / z - 4) + 'px';
+  input.style.top = ((r.top - hr.top) / z - 3) + 'px';
+  input.style.width = Math.max(120, r.width / z + 40) + 'px';
+  host.appendChild(input);
+  renameBox = { input, name };
+  input.focus();
+  input.select();
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); commitRename(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancelRename(); }
+    e.stopPropagation();
+  });
+  input.addEventListener('blur', commitRename);
+}
+function commitRename() {
+  if (!renameBox) return;
+  const { input, name } = renameBox;
+  renameBox = null;
+  const changed = renameOperation(name, input.value);
+  input.remove();
+  if (changed) afterModelChange('canvas');
+  svg.focus({ preventScroll: true });
+}
+function cancelRename() { if (!renameBox) return; renameBox.input.remove(); renameBox = null; svg.focus({ preventScroll: true }); }
+
+// ---------- properties pane ----------
+
+function field(label, control, id) {
+  const wrap = document.createElement('div');
+  wrap.className = 'field';
+  const key = document.createElement('label');
+  key.className = 'field-key';
+  key.textContent = label;
+  if (id) { key.htmlFor = id; control.id = id; }
+  wrap.appendChild(key);
+  wrap.appendChild(control);
+  return wrap;
+}
+function textInput(value, onChange, opts) {
+  const i = document.createElement('input');
+  i.type = opts && opts.number ? 'number' : 'text';
+  if (opts && opts.min != null) i.min = String(opts.min);
+  if (opts && opts.placeholder) i.placeholder = opts.placeholder;
+  i.value = value == null ? '' : String(value);
+  i.addEventListener('change', () => onChange(i.value));
+  return i;
+}
+function selectInput(options, value, onChange) {
+  const s = document.createElement('select');
+  for (const [v, label] of options) {
+    const o = document.createElement('option');
+    o.value = v; o.textContent = label;
+    if (v === (value == null ? '' : String(value))) o.selected = true;
+    s.appendChild(o);
+  }
+  s.addEventListener('change', () => onChange(s.value));
+  return s;
+}
+function group(title, children) {
+  const g = document.createElement('div');
+  g.className = 'group';
+  const h = document.createElement('h2');
+  h.className = 'eyebrow';
+  h.textContent = title;
+  g.appendChild(h);
+  for (const c of children) if (c) g.appendChild(c);
+  return g;
+}
+function numOrDelete(obj, key, raw, opts) {
+  const v = raw === '' ? null : Number(raw);
+  if (v === null || !Number.isFinite(v) || (opts && opts.zeroDeletes && v === 0)) delete obj[key]; else obj[key] = v;
+}
+function prune(obj, key) {
+  if (obj[key] && typeof obj[key] === 'object' && !Object.keys(obj[key]).length) delete obj[key];
+}
+
+function renderProps() {
+  const pane = $('props');
+  const sel = state.selection;
+  const digest = JSON.stringify([sel, sel && (sel.kind === 'op' ? opByName(sel.name) : chByName(sel.name)), state.doc.spec.operations.map((o) => o.name), state.doc.spec.channels.map((c) => c.name)]);
+  if (digest === state.propsDigest && pane.firstChild) return;
+  state.propsDigest = digest;
+  pane.textContent = '';
+  if (!sel) {
+    const d = document.createElement('div');
+    d.className = 'empty';
+    d.textContent = 'select an operation or a channel to edit it';
+    pane.appendChild(d);
+    return;
+  }
+  if (sel.kind === 'op') renderOpProps(pane, opByName(sel.name));
+  else renderChProps(pane, chByName(sel.name));
+}
+
+function renderOpProps(pane, o) {
+  if (!o) return;
+  const change = () => afterModelChange('props');
+  const scaling = () => { o.scaling = o.scaling || {}; o.scaling.horizontal = o.scaling.horizontal || {}; return o.scaling.horizontal; };
+  const tidyScaling = () => { if (o.scaling) { prune(o.scaling, 'horizontal'); prune(o.scaling, 'vertical'); prune(o, 'scaling'); } };
+  const eff = Core.opEffective(o);
+  const container = () => { o.template = o.template || {}; o.template.spec = o.template.spec || {}; o.template.spec.containers = o.template.spec.containers || []; if (!o.template.spec.containers[0]) o.template.spec.containers[0] = { name: 'main' }; return o.template.spec.containers[0]; };
+  const c0 = (((o.template || {}).spec || {}).containers || [])[0] || {};
+  const res = (kind, key) => (((c0.resources || {})[kind] || {})[key]) || '';
+  const setRes = (kind, key, v) => {
+    const c = container();
+    c.resources = c.resources || {}; c.resources[kind] = c.resources[kind] || {};
+    if (v) c.resources[kind][key] = v; else delete c.resources[kind][key];
+    prune(c.resources, kind); prune(c, 'resources');
+    change();
+  };
+
+  pane.appendChild(group('operation', [
+    field('name', textInput(o.name, (v) => { if (renameOperation(o.name, v)) change(); else renderProps(); }), 'p-op-name'),
+    field('completion', selectInput([['', `default (${Core.DEFAULTS.completion})`], ['Drain', 'Drain'], ['Never', 'Never']], o.completion || '', (v) => { if (v) o.completion = v; else delete o.completion; change(); }), 'p-op-completion'),
+    field('slots', textInput(o.slots, (v) => { numOrDelete(o, 'slots', v); change(); }, { number: true, min: 1, placeholder: '1' }), 'p-op-slots'),
+  ]));
+
+  pane.appendChild(group('container', [
+    field('image', textInput(c0.image, (v) => { const c = container(); if (v) c.image = v; else delete c.image; change(); }), 'p-op-image'),
+    field('command', textInput((c0.command || []).join(' '), (v) => { const c = container(); const args = v.trim() ? v.trim().split(/\s+/) : []; if (args.length) c.command = args; else delete c.command; change(); }, { placeholder: 'space-separated args' }), 'p-op-command'),
+    field('requests', (() => { const r = document.createElement('div'); r.className = 'field-row'; r.appendChild(textInput(res('requests', 'cpu'), (v) => setRes('requests', 'cpu', v), { placeholder: 'cpu' })); r.appendChild(textInput(res('requests', 'memory'), (v) => setRes('requests', 'memory', v), { placeholder: 'memory' })); return r; })()),
+    field('limits', (() => { const r = document.createElement('div'); r.className = 'field-row'; r.appendChild(textInput(res('limits', 'cpu'), (v) => setRes('limits', 'cpu', v), { placeholder: 'cpu' })); r.appendChild(textInput(res('limits', 'memory'), (v) => setRes('limits', 'memory', v), { placeholder: 'memory' })); return r; })()),
+  ]));
+
+  const h = (o.scaling && o.scaling.horizontal) || {};
+  pane.appendChild(group('scaling', [
+    field('replicas', (() => { const r = document.createElement('div'); r.className = 'field-row';
+      r.appendChild(textInput(h.min, (v) => { numOrDelete(scaling(), 'min', v); tidyScaling(); change(); }, { number: true, min: 0, placeholder: 'min 1' }));
+      r.appendChild(textInput(h.max, (v) => { numOrDelete(scaling(), 'max', v); tidyScaling(); change(); }, { number: true, min: 1, placeholder: 'max 1' }));
+      return r; })()),
+    field('backlog', textInput(h.targetBacklogPerReplica, (v) => { numOrDelete(scaling(), 'targetBacklogPerReplica', v, { zeroDeletes: true }); tidyScaling(); change(); }, { number: true, min: 0, placeholder: 'per replica · 0 off' }), 'p-op-backlog'),
+    field('cpu %', textInput(h.cpuUtilizationPercent, (v) => { numOrDelete(scaling(), 'cpuUtilizationPercent', v, { zeroDeletes: true }); tidyScaling(); change(); }, { number: true, min: 0, placeholder: 'Never only · 0 off' }), 'p-op-cpu'),
+    field('vertical', selectInput([['', 'default (Off)'], ['Off', 'Off'], ['Initial', 'Initial'], ['Auto', 'Auto']], (o.scaling && o.scaling.vertical && o.scaling.vertical.mode) || '', (v) => { o.scaling = o.scaling || {}; if (v) o.scaling.vertical = { mode: v }; else delete o.scaling.vertical; tidyScaling(); change(); }), 'p-op-vertical'),
+  ]));
+
+  const ta = document.createElement('textarea');
+  ta.value = JSON.stringify(o.template || {}, null, 2);
+  ta.spellcheck = false;
+  ta.setAttribute('aria-label', 'pod template as JSON');
+  const noteEl = document.createElement('div');
+  noteEl.className = 'pane-note';
+  noteEl.style.padding = '0';
+  ta.addEventListener('change', () => {
+    try {
+      const v = JSON.parse(ta.value);
+      if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('template must be a JSON object');
+      o.template = v;
+      noteEl.textContent = '';
+      noteEl.classList.remove('bad');
+      change();
+    } catch (err) {
+      noteEl.textContent = err.message;
+      noteEl.classList.add('bad');
+    }
+  });
+  pane.appendChild(group('advanced pod template', [field('json', ta, 'p-op-template'), noteEl]));
+
+  const actions = document.createElement('div');
+  actions.className = 'group actions';
+  const del = document.createElement('button');
+  del.textContent = 'delete operation';
+  del.addEventListener('click', deleteSelection);
+  actions.appendChild(del);
+  pane.appendChild(actions);
+}
+
+function renderChProps(pane, c) {
+  if (!c) return;
+  const change = () => afterModelChange('props');
+  // A change that alters which fields the form shows rebuilds the form.
+  const rebuild = () => afterModelChange('canvas');
+  const ops = state.doc.spec.operations.map((o) => [o.name, o.name]);
+  const part = () => { c.partitioning = c.partitioning || {}; return c.partitioning; };
+
+  pane.appendChild(group('channel', [
+    field('name', textInput(c.name, (v) => { if (renameChannel(c.name, v)) change(); else renderProps(); }), 'p-ch-name'),
+    field('from', selectInput([['', 'outside (no producer)'], ...ops], c.from || '', (v) => { if (v) c.from = v; else delete c.from; rebuild(); }), 'p-ch-from'),
+    field('to', selectInput([['', 'outside (no consumer)'], ...ops], c.to || '', (v) => { if (v) c.to = v; else delete c.to; rebuild(); }), 'p-ch-to'),
+  ]));
+
+  pane.appendChild(group('partitioning', [
+    field('mode', selectInput([['', `default (${Core.DEFAULTS.partitioning.mode})`], ['Hash', 'Hash'], ['RoundRobin', 'RoundRobin'], ['Broadcast', 'Broadcast']], (c.partitioning || {}).mode || '', (v) => { if (v) part().mode = v; else if (c.partitioning) delete c.partitioning.mode; prune(c, 'partitioning'); change(); }), 'p-ch-mode'),
+    field('partitions', textInput((c.partitioning || {}).partitions, (v) => { numOrDelete(part(), 'partitions', v); prune(c, 'partitioning'); change(); }, { number: true, min: 1, placeholder: String(Core.DEFAULTS.partitioning.partitions) }), 'p-ch-partitions'),
+  ]));
+
+  pane.appendChild(group('delivery and durability', [
+    field('delivery', selectInput([['', `default (${Core.DEFAULTS.delivery})`], ['Pipelined', 'Pipelined'], ['Materialized', 'Materialized']], c.delivery || '', (v) => { if (v) c.delivery = v; else delete c.delivery; change(); }), 'p-ch-delivery'),
+    field('durability', selectInput([['', `default (${c.to ? Core.DEFAULTS.durability : 'Retained'})`], ['Ephemeral', 'Ephemeral'], ['Retained', 'Retained']], c.durability || '', (v) => { if (v) c.durability = v; else delete c.durability; change(); }), 'p-ch-durability'),
+  ]));
+
+  const fbToggle = document.createElement('input');
+  fbToggle.type = 'checkbox';
+  fbToggle.checked = !!c.feedback;
+  fbToggle.style.width = 'auto';
+  fbToggle.addEventListener('change', () => { if (fbToggle.checked) c.feedback = c.feedback || { maxEpochs: 10 }; else delete c.feedback; rebuild(); });
+  const fb = c.feedback || {};
+  const others = state.doc.spec.channels.filter((x) => x.name !== c.name).map((x) => [x.name, x.name]);
+  pane.appendChild(group('feedback', [
+    field('closes loop', fbToggle, 'p-ch-feedback'),
+    c.feedback ? field('mode', selectInput([['', `default (${Core.DEFAULTS.feedbackMode})`], ['Synchronous', 'Synchronous'], ['Asynchronous', 'Asynchronous']], fb.mode || '', (v) => { if (v) c.feedback.mode = v; else delete c.feedback.mode; change(); }), 'p-ch-fbmode') : null,
+    c.feedback ? field('max epochs', textInput(fb.maxEpochs, (v) => { const n = Number(v); if (Number.isFinite(n) && n >= 1) c.feedback.maxEpochs = n; change(); }, { number: true, min: 1 }), 'p-ch-epochs') : null,
+    c.feedback ? field('overflow', selectInput([['', 'none'], ...others], fb.overflow || '', (v) => { if (v) c.feedback.overflow = v; else delete c.feedback.overflow; change(); }), 'p-ch-overflow') : null,
+  ]));
+
+  const actions = document.createElement('div');
+  actions.className = 'group actions';
+  const del = document.createElement('button');
+  del.textContent = 'delete channel';
+  del.addEventListener('click', deleteSelection);
+  actions.appendChild(del);
+  pane.appendChild(actions);
+}
+
+// ---------- yaml pane ----------
+
+let yamlTimer = null;
+$('yaml').addEventListener('input', () => {
+  clearTimeout(yamlTimer);
+  yamlTimer = setTimeout(applyYamlText, 180);
+});
+
+function applyYamlText() {
+  const text = $('yaml').value;
+  const noteEl = $('yaml-note');
+  try {
+    const doc = Core.fromYAML(text);
+    state.doc = doc;
+    state.yamlText = text;
+    if (state.selection) {
+      const exists = state.selection.kind === 'op' ? opByName(state.selection.name) : chByName(state.selection.name);
+      if (!exists) state.selection = null;
+    }
+    noteEl.textContent = '';
+    noteEl.classList.remove('bad');
+    afterModelChange('yaml');
+  } catch (err) {
+    noteEl.textContent = (err.line ? `line ${err.line}: ` : '') + err.message + ' · showing the last good model';
+    noteEl.classList.add('bad');
+  }
+}
+
+function loadYaml(text, resetView) {
+  $('yaml').value = text;
+  state.pinned = {};
+  state.selection = null;
+  if (resetView) state.userView = false;
+  applyYamlText();
+}
+
+$('btn-copy').addEventListener('click', () => copyText(state.yamlText || $('yaml').value));
+$('btn-download').addEventListener('click', () => {
+  const text = state.yamlText || $('yaml').value;
+  const name = (state.doc.metadata.name || 'workload') + '.yaml';
+  try {
+    const url = URL.createObjectURL(new Blob([text], { type: 'application/yaml' }));
+    const a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    note(`download requested as ${name} · if this host blocks downloads, use copy yaml`);
+  } catch (err) {
+    copyText(text);
+  }
+});
+$('btn-new').addEventListener('click', () => { loadYaml(Core.toYAML(Core.blankWorkload('untitled')), true); });
+$('btn-status-clear').addEventListener('click', () => { $('status').value = ''; applyStatusText(); });
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    note('yaml copied to the clipboard');
+    return;
+  } catch (e) { /* fall through to the selection fallback */ }
+  const ta = $('yaml');
+  ta.focus();
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+  note(ok ? 'yaml copied to the clipboard' : 'the yaml is selected · press ctrl+c or cmd+c to copy');
+}
+
+// Example menu.
+for (const ex of EXAMPLES) {
+  const li = document.createElement('li');
+  li.className = 'cd-option';
+  li.setAttribute('role', 'option');
+  li.tabIndex = -1;
+  li.dataset.id = ex.name;
+  li.setAttribute('aria-selected', 'false');
+  const n = document.createElement('span');
+  n.className = 'cd-name';
+  n.textContent = ex.name;
+  li.appendChild(n);
+  $('example-list').appendChild(li);
+}
+$('example-list').classList.add('left');
+setupPicker($('example-cd'), $('example-trigger'), $('example-list'), (id) => {
+  const ex = EXAMPLES.find((x) => x.name === id);
+  if (ex) loadYaml(ex.text, true);
+});
+
+// ---------- status pane ----------
+
+let statusTimer = null;
+$('status').addEventListener('input', () => { clearTimeout(statusTimer); statusTimer = setTimeout(applyStatusText, 200); });
+
+function applyStatusText() {
+  const text = $('status').value;
+  const noteEl = $('status-note');
+  if (!text.trim()) { state.status = null; noteEl.textContent = ''; noteEl.classList.remove('bad'); afterModelChange('status'); return; }
+  try {
+    const doc = Core.parseYAML(text);
+    const s = doc && typeof doc === 'object' ? (doc.status && typeof doc.status === 'object' ? doc.status : doc) : null;
+    if (!s || (!Array.isArray(s.operations) && !Array.isArray(s.channels))) throw new Error('no status.operations or status.channels found');
+    state.status = { operations: s.operations || [], channels: s.channels || [], phase: s.phase, message: s.message };
+    noteEl.textContent = `phase ${s.phase || 'unknown'}${s.message ? ' · ' + s.message : ''}`;
+    noteEl.classList.remove('bad');
+  } catch (err) {
+    state.status = null;
+    noteEl.textContent = (err.line ? `line ${err.line}: ` : '') + err.message;
+    noteEl.classList.add('bad');
+  }
+  afterModelChange('status');
+}
+
+// ---------- workload name ----------
+
+$('wl-name').addEventListener('change', () => { const v = $('wl-name').value.trim(); if (v) state.doc.metadata.name = v; else delete state.doc.metadata.name; afterModelChange('meta'); });
+$('wl-ns').addEventListener('change', () => { const v = $('wl-ns').value.trim(); if (v) state.doc.metadata.namespace = v; else delete state.doc.metadata.namespace; afterModelChange('meta'); });
+
+// ---------- toolbar ----------
+
+$('btn-add').addEventListener('click', () => { addOperation(null); });
+$('btn-layout').addEventListener('click', autoLayout);
+$('btn-fit').addEventListener('click', () => { state.userView = false; fitView(); });
+
+function autoLayout() { state.pinned = {}; state.userView = false; afterModelChange('canvas'); }
+
+// ---------- keyboard ----------
+
+document.addEventListener('keydown', (e) => {
+  const t = e.target;
+  const typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+  if (e.key === 'Escape') {
+    if (typing) { t.blur(); return; }
+    if (state.selection) { state.selection = null; afterModelChange('canvas'); }
+    hideHover();
+    return;
+  }
+  if (typing) return;
+  if (e.key === 'Delete' || e.key === 'Backspace') { if (state.selection) { e.preventDefault(); deleteSelection(); } }
+  else if (e.key === 'l') { e.preventDefault(); autoLayout(); }
+  else if (e.key === 'f') { e.preventDefault(); state.userView = false; fitView(); }
+  else if (e.key === '/') { e.preventDefault(); $('yaml').focus(); }
+});
+
+// ---------- grips ----------
+
+const PANES = { yaml: { css: '--pane-yaml', min: 200, max: 900, dflt: 380 }, props: { css: '--pane-props', min: 200, max: 700, dflt: 300 }, status: { css: '--pane-status', min: 60, max: 600, dflt: 150 } };
+const paneSizes = load('panes', {});
+
+function applyPane(name, value, remember) {
+  const p = PANES[name];
+  const v = Math.min(p.max, Math.max(p.min, Math.round(value)));
+  document.documentElement.style.setProperty(p.css, v + 'px');
+  $('grip-' + name).setAttribute('aria-valuenow', String(v));
+  if (remember) { paneSizes[name] = v; store('panes', paneSizes); }
+  return v;
+}
+for (const name of Object.keys(PANES)) if (paneSizes[name]) applyPane(name, paneSizes[name], false);
+
+function setupGrip(name, orientation, sign) {
+  const grip = $('grip-' + name);
+  const p = PANES[name];
+  const current = () => parseFloat(getComputedStyle(document.documentElement).getPropertyValue(p.css)) || p.dflt;
+  let start = null, raf = 0, pending = null;
+  grip.addEventListener('pointerdown', (e) => {
+    start = { pos: orientation === 'col' ? e.clientX : e.clientY, size: current() };
+    grip.setPointerCapture(e.pointerId);
+    grip.classList.add('dragging');
+    document.body.classList.add(orientation === 'col' ? 'resizing-col' : 'resizing-row');
+    e.preventDefault();
+  });
+  grip.addEventListener('pointermove', (e) => {
+    if (!start) return;
+    const zoom = parseFloat($('app').style.zoom || '1') || 1;
+    const pos = orientation === 'col' ? e.clientX : e.clientY;
+    pending = start.size + (sign * (pos - start.pos)) / zoom;
+    if (!raf) raf = requestAnimationFrame(() => { raf = 0; if (pending != null) applyPane(name, pending, true); if (!state.userView) fitView(); });
+  });
+  const end = () => { if (!start) return; start = null; grip.classList.remove('dragging'); document.body.classList.remove('resizing-col', 'resizing-row'); };
+  grip.addEventListener('pointerup', end);
+  grip.addEventListener('pointercancel', end);
+  grip.addEventListener('dblclick', () => { delete paneSizes[name]; store('panes', paneSizes); document.documentElement.style.removeProperty(p.css); grip.setAttribute('aria-valuenow', String(p.dflt)); if (!state.userView) fitView(); });
+  grip.addEventListener('keydown', (e) => {
+    const step = 16;
+    let v = null;
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') v = current() - step * (sign > 0 ? 1 : -1);
+    else if (e.key === 'ArrowRight' || e.key === 'ArrowDown') v = current() + step * (sign > 0 ? 1 : -1);
+    else if (e.key === 'Home') v = p.min;
+    else if (e.key === 'End') v = p.max;
+    if (v !== null) { e.preventDefault(); applyPane(name, v, true); if (!state.userView) fitView(); }
+  });
+}
+setupGrip('yaml', 'col', 1);
+setupGrip('props', 'col', -1);
+setupGrip('status', 'row', -1);
+
+// ---------- self-test ----------
+
+function selfTest() {
+  const results = [];
+  for (const ex of EXAMPLES) {
+    let ok = false, why = '';
+    try { const r = Core.roundTrip(ex.text); ok = r.ok; if (!ok) why = 'emitted yaml parses to a different document'; }
+    catch (err) { why = err.message; }
+    results.push({ name: ex.name, ok, why });
+  }
+  for (const r of results) {
+    const line = `selftest ${r.name}: ${r.ok ? 'pass' : 'fail'}${r.why ? ' · ' + r.why : ''}`;
+    console.log(line);
+    state.notes.push(line);
+  }
+  renderStatus();
+  return results.every((r) => r.ok);
+}
+
+// ---------- startup ----------
+
+for (const t of THEMES) {
+  const li = document.createElement('li');
+  li.className = 'cd-option';
+  li.setAttribute('role', 'option');
+  li.tabIndex = -1;
+  li.dataset.id = t.id;
+  li.setAttribute('aria-selected', 'false');
+  const strip = document.createElement('span');
+  strip.className = 'swatch-strip sm';
+  strip.setAttribute('aria-hidden', 'true');
+  swatchStrip(t.preview, strip);
+  const n = document.createElement('span');
+  n.className = 'cd-name';
+  n.textContent = t.label;
+  li.appendChild(strip);
+  li.appendChild(n);
+  $('theme-list').appendChild(li);
+}
+setupPicker($('theme-cd'), $('theme-trigger'), $('theme-list'), applyTheme);
+
+const storedTheme = load('theme', null);
+applyTheme(storedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'google-dark' : 'google-light'));
+applyScale(load('scale', 100));
+$('scale-range').addEventListener('input', () => applyScale(Number($('scale-range').value)));
+$('scale-reset').addEventListener('click', () => applyScale(100));
+
+new ResizeObserver(() => { if (!state.userView) fitView(); }).observe(host);
+
+const stored = load('model', null);
+if (stored && typeof stored.yaml === 'string' && stored.yaml.trim()) {
+  state.pinned = stored.pinned && typeof stored.pinned === 'object' ? stored.pinned : {};
+  $('yaml').value = stored.yaml;
+  if (typeof stored.status === 'string') $('status').value = stored.status;
+  applyYamlText();
+  if ($('status').value.trim()) applyStatusText();
+} else {
+  loadYaml(EXAMPLES[0].text, true);
+}
+
+if (new URLSearchParams(location.search).has('selftest')) selfTest();
+})();
+</script>
+</body>
+</html>
