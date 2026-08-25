@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>stark8s editor</title>
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Archivo+Narrow:wght@400;600&family=IBM+Plex+Mono:wght@400;600&family=Inconsolata:wght@400;600&family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@400;600&family=Ubuntu+Mono:wght@400;700&display=swap');
 /* ===================  colour role tokens  ===================
  *
  * The sixteen theme blocks, the un-themed default, and the
@@ -520,7 +521,7 @@ input[type="checkbox"] { accent-color: var(--v2-accent); margin: 0; }
 }
 .pane-head .spacer { flex: 1; }
 
-.pane textarea {
+.pane > textarea {
   flex: 1;
   margin: 0 var(--dt-gap-edge) var(--dt-gap-edge);
   resize: none;
@@ -830,6 +831,56 @@ svg.canvas.connecting { cursor: crosshair; }
 .props .empty { padding: var(--dt-gap-group) var(--dt-gap-edge); font-family: var(--v2-mono); font-size: calc(11px * var(--dt-font-scale, 1)); color: var(--v2-ink-faint); }
 .props .actions { display: flex; gap: var(--dt-gap-item); flex-wrap: wrap; }
 
+
+/* research-preview tag — the zicato quiet-tag idiom: a faint hairline
+ * divider, faint tracked mono, no fill and no motion. */
+.surface-preview {
+  display: inline-flex; align-items: center; align-self: center;
+  pointer-events: none; user-select: none;
+  font: calc(9.5px * var(--dt-font-scale, 1))/1.25 var(--v2-mono);
+  text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--v2-ink-faint);
+  border-left: 1px solid var(--v2-rule);
+  padding-left: 7px; margin-left: 1px;
+}
+
+/* text-size segmented control, orthogonal to the page-scale pill */
+.size-seg { display: inline-flex; border: 1px solid var(--v2-rule); border-radius: var(--dt-radius-card); overflow: hidden; }
+.size-seg button { border: none; border-radius: 0; padding: 2px 8px; color: var(--v2-ink-faint); }
+.size-seg button + button { border-left: 1px solid var(--v2-rule); }
+.size-seg button[aria-pressed="true"] { background: var(--v2-rule-soft); color: var(--v2-ink); }
+
+/* typeface picker: each option is a specimen set in its own face */
+.type-group-head { list-style: none; padding: 6px 7px 2px; font-family: var(--v2-mono); font-size: calc(9px * var(--dt-font-scale, 1)); text-transform: uppercase; letter-spacing: 0.08em; color: var(--v2-ink-faint); pointer-events: none; }
+.type-group-head:first-child { padding-top: 2px; }
+.type-specimen { min-width: 3.4em; font-size: calc(13px * var(--dt-font-scale, 1)); color: var(--v2-ink); }
+.type-specimen .num { color: var(--v2-ink-soft); }
+
+/* the yaml editor: a highlighted layer under a caret-only textarea, so the
+ * document reads with token colour while staying fully editable */
+.code { position: relative; flex: 1; margin: 0 var(--dt-gap-edge) var(--dt-gap-edge); min-height: 0; }
+.code-hl, .code-input {
+  position: absolute; inset: 0; margin: 0; box-sizing: border-box;
+  border: 1px solid var(--v2-rule); border-radius: var(--dt-radius-panel);
+  padding: 2px 6px;
+  font-family: var(--v2-mono); font-size: calc(11.5px * var(--dt-font-scale, 1));
+  line-height: 1.4; tab-size: 2; white-space: pre; overflow: auto;
+}
+.code-hl { z-index: 0; pointer-events: none; overflow: hidden; color: var(--v2-ink); background: var(--v2-paper); }
+.code-input { z-index: 1; background: transparent; color: transparent; caret-color: var(--v2-ink); resize: none; width: 100%; }
+.code-input::selection { background: color-mix(in srgb, var(--v2-accent) 26%, transparent); }
+.tok-key { color: var(--v2-ink); }
+.tok-str { color: var(--v2-ink-soft); }
+.tok-num, .tok-bool { color: var(--v2-caution); }
+.tok-punct { color: var(--v2-ink-faint); }
+.tok-comment { color: var(--v2-ink-faint); font-style: italic; }
+.tok-doc { color: var(--v2-ink-faint); }
+
+/* a paper halo so a label reads where an edge or another label crosses it */
+.edge-label, .edge-meta, .ingress-label {
+  paint-order: stroke; stroke: var(--v2-paper); stroke-width: 3px; stroke-linejoin: round;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
@@ -850,11 +901,24 @@ svg.canvas.connecting { cursor: crosshair; }
       </svg>
       <span class="brand-name">stark8s</span>
       <span class="surface-tag" role="note">editor</span>
+      <span class="surface-preview" role="note">research preview</span>
     </div>
     <nav class="crumbs" aria-label="workload">
       <span>workload</span><span aria-hidden="true">/</span><span class="crumb-current" id="crumb-name">untitled</span>
     </nav>
     <span class="spacer"></span>
+    <div class="cd" id="type-cd">
+      <button class="trigger" id="type-trigger" aria-haspopup="listbox" aria-expanded="false" aria-controls="type-list">
+        <span class="cd-name" id="type-name">Inconsolata</span>
+        <span class="caret" aria-hidden="true">▼</span>
+      </button>
+      <ul class="cd-list" id="type-list" role="listbox" aria-label="typeface" tabindex="-1"></ul>
+    </div>
+    <span class="size-seg" role="group" aria-label="text size">
+      <button type="button" data-size="s" aria-pressed="false">S</button>
+      <button type="button" data-size="m" aria-pressed="true">M</button>
+      <button type="button" data-size="l" aria-pressed="false">L</button>
+    </span>
     <div class="cd" id="theme-cd">
       <button class="trigger" id="theme-trigger" aria-haspopup="listbox" aria-expanded="false" aria-controls="theme-list">
         <span class="swatch-strip sm" id="theme-strip" aria-hidden="true"></span>
@@ -887,7 +951,10 @@ svg.canvas.connecting { cursor: crosshair; }
           </div>
           <button id="btn-new">new</button>
         </div>
-        <textarea id="yaml" class="mono" spellcheck="false" aria-label="workload yaml" wrap="off"></textarea>
+        <div class="code" id="yaml-code">
+          <pre class="code-hl" id="yaml-hl" aria-hidden="true"></pre>
+          <textarea id="yaml" class="code-input mono" spellcheck="false" aria-label="workload yaml" wrap="off"></textarea>
+        </div>
         <div class="pane-note" id="yaml-note" aria-live="polite"></div>
       </section>
       <button class="grip row" id="grip-status" role="separator" aria-orientation="horizontal" aria-label="resize status pane" aria-valuenow="150"><span class="grip-pill"></span></button>
@@ -1816,7 +1883,7 @@ function setupPicker(cd, trigger, list, onPick) {
   });
   list.addEventListener('click', (e) => { const li = e.target.closest('[role="option"]'); if (li) { onPick(li.dataset.id); open(false); trigger.focus(); } });
   list.addEventListener('keydown', (e) => {
-    const items = [...list.children];
+    const items = [...list.querySelectorAll('[role="option"]')];
     const i = items.indexOf(document.activeElement);
     if (e.key === 'ArrowDown') { e.preventDefault(); (items[i + 1] || items[0]).focus(); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); (items[i - 1] || items[items.length - 1]).focus(); }
@@ -1824,6 +1891,101 @@ function setupPicker(cd, trigger, list, onPick) {
     else if (e.key === 'Escape') { e.preventDefault(); open(false); trigger.focus(); }
   });
   document.addEventListener('pointerdown', (e) => { if (!cd.contains(e.target)) open(false); });
+}
+
+// ---------- yaml syntax highlight ----------
+//
+// A highlighted layer sits under a caret-only textarea. Colour is carried
+// by ink weight, not hue: keys in full ink, values a step softer, comments
+// faintest, and the few literal numbers and booleans in the caution token.
+
+function escHtml(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+function hlValue(v) {
+  const lead = v.slice(0, v.length - v.trimStart().length);
+  const t = v.trim();
+  if (t === '') return escHtml(v);
+  let body;
+  if (/^".*"$/.test(t) || /^'.*'$/.test(t)) body = `<span class="tok-str">${escHtml(t)}</span>`;
+  else if (/^[[{]/.test(t)) body = escHtml(t).replace(/([[\]{}:,])/g, '<span class="tok-punct">$1</span>');
+  else if (/^-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(t)) body = `<span class="tok-num">${escHtml(t)}</span>`;
+  else if (/^(true|false|null|~|True|False|Null|TRUE|FALSE|NULL)$/.test(t)) body = `<span class="tok-bool">${escHtml(t)}</span>`;
+  else body = `<span class="tok-str">${escHtml(t)}</span>`;
+  return escHtml(lead) + body;
+}
+
+function hlLine(raw) {
+  // Split off an unquoted trailing comment.
+  let code = raw, comment = '', q = null;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (q) { if (q === '"' && c === '\\') { i++; continue; } if (c === q) q = null; continue; }
+    if (c === '"' || c === "'") { q = c; continue; }
+    if (c === '#' && (i === 0 || /\s/.test(raw[i - 1]))) { code = raw.slice(0, i); comment = raw.slice(i); break; }
+  }
+  const m = /^(\s*)((?:- )*)(.*)$/.exec(code);
+  const indent = m[1], dashes = m[2], rest = m[3];
+  let out = escHtml(indent);
+  if (dashes) out += `<span class="tok-punct">${escHtml(dashes)}</span>`;
+  if (/^(---|\.\.\.)\s*$/.test(rest)) {
+    out += `<span class="tok-doc">${escHtml(rest)}</span>`;
+  } else {
+    const kv = /^([^:{}[\]]+?):($|\s.*)$/.exec(rest);
+    if (kv) {
+      out += `<span class="tok-key">${escHtml(kv[1])}</span><span class="tok-punct">:</span>`;
+      const after = kv[2];
+      if (after !== '') out += escHtml(after[0]) + hlValue(after.slice(1));
+    } else {
+      out += hlValue(rest);
+    }
+  }
+  if (comment) out += `<span class="tok-comment">${escHtml(comment)}</span>`;
+  return out || '\u200b';
+}
+
+function highlightYAML(text) { return text.split('\n').map(hlLine).join('\n'); }
+
+function refreshHl() {
+  const ta = $('yaml'), hl = $('yaml-hl');
+  if (!hl) return;
+  hl.innerHTML = highlightYAML(ta.value);
+  hl.scrollTop = ta.scrollTop;
+  hl.scrollLeft = ta.scrollLeft;
+}
+
+// ---------- typeface ----------
+
+const TYPEFACES = [
+  { group: 'technical', faces: [
+    { id: 'inconsolata', label: 'Inconsolata', stack: "'Inconsolata', ui-monospace, 'SF Mono', Menlo, monospace" },
+    { id: 'jetbrains', label: 'JetBrains Mono', stack: "'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace" },
+    { id: 'plex', label: 'IBM Plex Mono', stack: "'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace" },
+    { id: 'ubuntu-mono', label: 'Ubuntu Mono', stack: "'Ubuntu Mono', ui-monospace, 'SF Mono', Menlo, monospace" },
+  ] },
+  { group: 'display', faces: [
+    { id: 'space-grotesk', label: 'Space Grotesk', stack: "'Space Grotesk', ui-sans-serif, system-ui, sans-serif" },
+    { id: 'archivo', label: 'Archivo Narrow', stack: "'Archivo Narrow', ui-sans-serif, system-ui, sans-serif" },
+  ] },
+];
+const ALL_FACES = TYPEFACES.flatMap((g) => g.faces);
+
+function applyTypeface(id) {
+  const face = ALL_FACES.find((f) => f.id === id) || ALL_FACES[0];
+  document.documentElement.style.setProperty('--v2-mono', face.stack);
+  document.documentElement.style.setProperty('--v2-sans', face.stack);
+  $('type-name').textContent = face.label;
+  for (const li of $('type-list').querySelectorAll('[role="option"]')) li.setAttribute('aria-selected', li.dataset.id === face.id ? 'true' : 'false');
+  store('typeface', face.id);
+}
+
+const SIZES = { s: 0.9, m: 1, l: 1.14 };
+function applySize(key) {
+  const k = SIZES[key] ? key : 'm';
+  document.documentElement.style.setProperty('--dt-font-scale', String(SIZES[k]));
+  for (const b of document.querySelectorAll('.size-seg button')) b.setAttribute('aria-pressed', b.dataset.size === k ? 'true' : 'false');
+  store('fontsize', k);
+  if (!state.userView) fitView();
+  refreshHl();
 }
 
 // ---------- state ----------
@@ -2021,6 +2183,7 @@ function renderCanvas() {
   for (const n of nodes.values()) { grow(n.x, n.y); grow(n.x + n.w, n.y + n.h); }
   if (!nodes.size) { grow(0, 0); grow(400, 200); }
 
+  const labelBlocks = [];
   for (const e of edges) {
     if (e.missing) continue;
     const c = e.c, eff = Core.chEffective(c);
@@ -2065,11 +2228,12 @@ function renderCanvas() {
       markAt(e.kind === 'sink' ? 0.7 : 0.86, (m) => m.appendChild(el('line', { x1: 0, y1: -7, x2: 0, y2: 7, class: 'edge-mark' })), MARK_TEXT.Materialized[0], c.name, MARK_TEXT.Materialized[1]);
     }
 
-    // Labels: the name above the midpoint; feedback bound and observed
-    // counters below it.
+    // Labels: the channel name, and below it the feedback bound and any
+    // observed counters. Positions are collected and de-collided after the
+    // whole edge set is placed, because several channels can leave one node
+    // at almost the same point.
     const mid = bez(e.p0, e.p1, e.p2, e.p3, 0.5);
     const above = e.kind === 'self' || e.kind === 'feedback' ? -12 : -14;
-    g.appendChild(el('text', { x: mid.x, y: mid.y + above, class: 'edge-label' }, [c.name]));
     const meta = [];
     if (eff.feedback) meta.push(`${eff.feedback.maxEpochs} epochs · ${eff.feedback.mode}`);
     if (st) {
@@ -2081,7 +2245,8 @@ function renderCanvas() {
       if (st.sealed) bits.push('sealed');
       meta.push(bits.join(' · '));
     }
-    meta.forEach((line, i) => g.appendChild(el('text', { x: mid.x, y: mid.y + 20 + i * 11, class: 'edge-meta' }, [line])));
+    const widthChars = Math.max(c.name.length * 6, ...meta.map((m) => m.length * 5.4), 1);
+    labelBlocks.push({ g, x: mid.x, y: mid.y + above, w: widthChars, name: c.name, meta });
 
     // Glyphs for a producer or consumer outside the workload.
     if (e.kind === 'source') {
@@ -2103,6 +2268,31 @@ function renderCanvas() {
       grow(e.glyph.x + 8, e.glyph.y + 8);
     }
     gEdges.appendChild(g);
+  }
+
+  // Resolve vertical overlaps between label blocks: sort by y and push a
+  // block down until it clears the ones already placed whose x-range it
+  // shares, then draw name and meta lines with a paper halo.
+  const ROW = 11;
+  labelBlocks.sort((a, b) => a.y - b.y || a.x - b.x);
+  const placed = [];
+  for (const bk of labelBlocks) {
+    const h = ROW * (1 + bk.meta.length);
+    const half = bk.w / 2;
+    let y = bk.y;
+    let moved = true;
+    while (moved) {
+      moved = false;
+      for (const q of placed) {
+        const xOverlap = Math.abs(q.cx - bk.x) < (q.half + half + 6);
+        const yOverlap = y < q.y2 + 3 && y + h > q.y1 - 3;
+        if (xOverlap && yOverlap) { y = q.y2 + 3 + ROW; moved = true; }
+      }
+    }
+    placed.push({ cx: bk.x, half, y1: y, y2: y + h });
+    bk.g.appendChild(el('text', { x: bk.x, y, class: 'edge-label' }, [bk.name]));
+    bk.meta.forEach((line, i) => bk.g.appendChild(el('text', { x: bk.x, y: y + (i + 1) * ROW, class: 'edge-meta' }, [line])));
+    grow(bk.x - half, y - ROW); grow(bk.x + half, y + h);
   }
 
   for (const o of doc.spec.operations) {
@@ -2209,7 +2399,7 @@ function note(text) {
 function afterModelChange(source) {
   if (source !== 'yaml') {
     const text = Core.toYAML(state.doc);
-    if (text !== state.yamlText) { state.yamlText = text; $('yaml').value = text; }
+    if (text !== state.yamlText) { state.yamlText = text; $('yaml').value = text; refreshHl(); }
     $('yaml-note').textContent = '';
     $('yaml-note').classList.remove('bad');
   }
@@ -2670,6 +2860,7 @@ function renderChProps(pane, c) {
 
 let yamlTimer = null;
 $('yaml').addEventListener('input', () => {
+  refreshHl();
   clearTimeout(yamlTimer);
   yamlTimer = setTimeout(applyYamlText, 180);
 });
@@ -2696,6 +2887,7 @@ function applyYamlText() {
 
 function loadYaml(text, resetView) {
   $('yaml').value = text;
+  refreshHl();
   state.pinned = {};
   state.selection = null;
   if (resetView) state.userView = false;
@@ -2759,6 +2951,7 @@ setupPicker($('example-cd'), $('example-trigger'), $('example-list'), (id) => {
 // ---------- status pane ----------
 
 let statusTimer = null;
+$('yaml').addEventListener('scroll', () => { const hl = $('yaml-hl'); hl.scrollTop = $('yaml').scrollTop; hl.scrollLeft = $('yaml').scrollLeft; });
 $('status').addEventListener('input', () => { clearTimeout(statusTimer); statusTimer = setTimeout(applyStatusText, 200); });
 
 function applyStatusText() {
@@ -2904,6 +3097,38 @@ for (const t of THEMES) {
 }
 setupPicker($('theme-cd'), $('theme-trigger'), $('theme-list'), applyTheme);
 
+// typeface picker options, grouped, each a specimen in its own face
+for (const grp of TYPEFACES) {
+  const head = document.createElement('li');
+  head.className = 'type-group-head';
+  head.setAttribute('aria-hidden', 'true');
+  head.textContent = grp.group;
+  $('type-list').appendChild(head);
+  for (const f of grp.faces) {
+    const li = document.createElement('li');
+    li.className = 'cd-option';
+    li.setAttribute('role', 'option');
+    li.tabIndex = -1;
+    li.dataset.id = f.id;
+    li.setAttribute('aria-selected', 'false');
+    const spec = document.createElement('span');
+    spec.className = 'type-specimen';
+    spec.style.fontFamily = f.stack;
+    spec.innerHTML = 'Aa<span class="num"> 01</span>';
+    const nm = document.createElement('span');
+    nm.className = 'cd-name';
+    nm.textContent = f.label;
+    li.appendChild(spec);
+    li.appendChild(nm);
+    $('type-list').appendChild(li);
+  }
+}
+setupPicker($('type-cd'), $('type-trigger'), $('type-list'), applyTypeface);
+applyTypeface(load('typeface', 'inconsolata'));
+for (const b of document.querySelectorAll('.size-seg button')) b.addEventListener('click', () => applySize(b.dataset.size));
+applySize(load('fontsize', 'm'));
+
+
 // A host that stamps data-theme="dark" or "light" on the root before this
 // runs names a mode rather than a zicato theme; it selects the matching
 // default until the viewer picks one.
@@ -2931,6 +3156,7 @@ if (stored && typeof stored.yaml === 'string' && stored.yaml.trim()) {
 } else {
   loadYaml(EXAMPLES[0].text, true);
 }
+refreshHl();
 
 if (new URLSearchParams(location.search).has('selftest')) selfTest();
 })();

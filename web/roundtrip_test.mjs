@@ -37,8 +37,8 @@ const expected = {
     spec: {
       operations: [
         { name: 'read', template: { spec: { containers: [container(['/wordcount', 'read'])] } } },
-        { name: 'map', scaling: { horizontal: { min: 1, max: 4 } }, template: { spec: { containers: [container(['/wordcount', 'map'])] } } },
-        { name: 'reduce', scaling: { horizontal: { min: 1, max: 3 } }, template: { spec: { containers: [container(['/wordcount', 'reduce'])] } } },
+        { name: 'map', slots: 2, scaling: { horizontal: { min: 1, max: 4 } }, template: { spec: { containers: [container(['/wordcount', 'map'])] } } },
+        { name: 'reduce', slots: 2, scaling: { horizontal: { min: 1, max: 3 } }, template: { spec: { containers: [container(['/wordcount', 'reduce'])] } } },
       ],
       channels: [
         { name: 'lines', from: 'read', to: 'map', partitioning: { mode: 'RoundRobin', partitions: 8 }, delivery: 'Pipelined' },
@@ -52,7 +52,7 @@ const expected = {
     spec: {
       operations: [
         { name: 'seed', template: { spec: { containers: [container(['/pagerank', 'seed'])] } } },
-        { name: 'rank', scaling: { horizontal: { min: 2, max: 2 } }, template: { spec: { containers: [container(['/pagerank', 'rank'])] } } },
+        { name: 'rank', slots: 2, scaling: { horizontal: { min: 2, max: 2 } }, template: { spec: { containers: [container(['/pagerank', 'rank'])] } } },
       ],
       channels: [
         { name: 'graph', from: 'seed', to: 'rank', partitioning: { mode: 'Hash', partitions: 4 }, delivery: 'Materialized' },
