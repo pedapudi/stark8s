@@ -503,12 +503,11 @@ func TestHoldsUnconsumedAndCompleteTransitions(t *testing.T) {
 	if rel := co.Released("src-0"); len(rel) != 0 {
 		t.Fatalf("Retained segment offered for deletion: %v", rel)
 	}
-	// Completion latches: a pod that registers afterwards (for example a
-	// replacement created by a scale-up) does not make the operation
-	// incomplete again.
+	// Completion survives a scale to zero: with no live pods the latched
+	// source stays complete.
 	register(t, co, "src", "src-2")
 	if om := operationMetrics(co, "src"); !om.Complete {
-		t.Fatalf("completion did not latch: %+v", om)
+		t.Fatalf("completion did not survive scale to zero: %+v", om)
 	}
 	now = now.Add(PodTTL / 2)
 	register(t, co, "src", "src-0")

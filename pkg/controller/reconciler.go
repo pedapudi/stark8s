@@ -451,15 +451,6 @@ func (r *Reconciler) reconcileOperation(ctx context.Context, wl *v1alpha1.Worklo
 	om, hasMetrics := metrics.operations[op.Name]
 	st.RunnableTasks, st.HoldsUnconsumed = om.RunnableTasks, om.HoldsUnconsumed
 
-	// Succeeded is terminal: a completed operation is never restarted, even
-	// if the coordinator's view changes after its pods are gone.
-	for _, prev := range wl.Status.Operations {
-		if prev.Name == op.Name && prev.Phase == v1alpha1.OperationSucceeded {
-			st.Phase = v1alpha1.OperationSucceeded
-			return st, nil
-		}
-	}
-
 	// Stage barrier: a consumer of a Materialized channel is not started
 	// until that channel is sealed. Feedback channels are excluded because
 	// they seal only when the loop terminates.

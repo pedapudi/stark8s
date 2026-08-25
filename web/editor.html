@@ -1942,8 +1942,11 @@ function edgeGeometry(doc, nodes) {
       p1 = { x: p0.x + 90, y: Math.min(a.y, b.y) - lift };
       p2 = { x: p3.x - 90, y: Math.min(a.y, b.y) - lift };
     } else {
-      if (a) p0 = { x: a.x + a.w, y: a.y + a.h / 2 + k * 10 };
-      if (b) p3 = { x: b.x, y: b.y + b.h / 2 + k * 10 };
+      // Siblings that share both endpoints fan out slightly; siblings that
+      // end outside the workload need room for a label and a glyph each.
+      const spread = a && b ? 10 : 34;
+      if (a) p0 = { x: a.x + a.w, y: a.y + a.h / 2 + k * spread };
+      if (b) p3 = { x: b.x, y: b.y + b.h / 2 + k * spread };
       if (!a) { kind = 'source'; p0 = { x: p3.x - 100, y: p3.y }; glyph = { x: p0.x - 8, y: p0.y }; }
       if (!b) { kind = 'sink'; p3 = { x: p0.x + 100, y: p0.y }; glyph = { x: p3.x + 8, y: p3.y }; }
       const dx = Math.max(40, Math.abs(p3.x - p0.x) * 0.45);

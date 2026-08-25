@@ -48,9 +48,10 @@ type operation struct {
 	pods map[string]*pod
 	// owner maps "partitions/p" -> pod name.
 	owner map[string]string
-	// completed latches Complete: once every input is drained and every
-	// live pod has reported done, the operation stays complete even after
-	// its pods are scaled away, so the controller never restarts it.
+	// completed latches completion so an operation scaled to zero stays
+	// complete. It is set once inputs are drained and every live pod has
+	// reported done, and cleared as soon as an inbound channel has runnable
+	// work again, so late input restarts the operation.
 	completed bool
 }
 
@@ -1052,13 +1053,23 @@ func (co *Coordinator) Metrics() Metrics {
 	return m
 }
 
+// operationMetrics derives an operation's state from the channels rather
+// than latching it. An operation that consumes channels is complete when
+// every inbound channel is sealed, drained, and holds nothing, and no
+// partition still has runnable work; live pods are not required, so an
+// operation that has been scaled to zero stays complete, and new input on
+// an inbound channel makes it incomplete again. A source (no inbound
+// channels) is complete when it has a live pod and every live pod has
+// reported that it will emit nothing more.
 func (co *Coordinator) operationMetrics(name string) OperationMetrics {
 	o := co.op(name)
 	om := OperationMetrics{Name: name, LivePods: int32(len(o.pods))}
 	complete := true
+	hasInbound := false
 	runnable := map[string]bool{}
 	for _, c := range co.channels {
 		if c.spec.To == name {
+			hasInbound = true
 			if !(c.sealed && c.quiet() && c.heldRecords() == 0) {
 				complete = false
 			}
@@ -1084,7 +1095,18 @@ func (co *Coordinator) operationMetrics(name string) OperationMetrics {
 		}
 	}
 	om.RunnableTasks = int32(len(runnable))
-	if len(o.pods) == 0 {
+	if len(runnable) > 0 {
+		complete = false
+	}
+	if !hasInbound {
+		// A source has no inbound channels; it is done producing when its
+		// pods say so.
+		complete = complete && len(o.pods) > 0
+	}
+	// Completion also requires that every live pod has reported done, so an
+	// operation with an OnDrain step is not torn down before that step has
+	// produced its output.
+	if len(o.pods) == 0 && !o.completed {
 		complete = false
 	}
 	for _, p := range o.pods {
@@ -1094,6 +1116,9 @@ func (co *Coordinator) operationMetrics(name string) OperationMetrics {
 	}
 	if complete {
 		o.completed = true
+	} else if len(runnable) > 0 {
+		// Late input on an inbound channel restarts a completed operation.
+		o.completed = false
 	}
 	om.Complete = o.completed
 	return om
