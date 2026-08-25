@@ -411,6 +411,7 @@ svg :is(path, line, rect, circle, ellipse, polyline, polygon) {
 html, body {
   margin: 0;
   height: 100%;
+  min-height: 0;
   background: var(--v2-paper);
   color: var(--v2-ink);
   font-family: var(--v2-sans);
@@ -475,10 +476,14 @@ input[type="checkbox"] { accent-color: var(--v2-accent); margin: 0; }
 
 /* ---- frame ---- */
 
+/* The app fills the viewport directly rather than inheriting a percentage
+ * height through the document, so it lays out correctly inside a host whose
+ * body has no intrinsic height until the page has drawn. */
 .app {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  height: 100%;
+  height: 100vh;
+  height: 100dvh;
   overflow: hidden;
 }
 
@@ -2911,6 +2916,10 @@ $('scale-range').addEventListener('input', () => applyScale(Number($('scale-rang
 $('scale-reset').addEventListener('click', () => applyScale(100));
 
 new ResizeObserver(() => { if (!state.userView) fitView(); }).observe(host);
+// The host iframe may report a zero-height body until the first frame; fit
+// again once layout has settled so the graph is not drawn into a sliver.
+requestAnimationFrame(() => { if (!state.userView) fitView(); });
+window.addEventListener('load', () => { if (!state.userView) fitView(); });
 
 const stored = load('model', null);
 if (stored && typeof stored.yaml === 'string' && stored.yaml.trim()) {
