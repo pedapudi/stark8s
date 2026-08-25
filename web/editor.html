@@ -890,14 +890,20 @@ svg.canvas.connecting { cursor: crosshair; }
 <div class="app" id="app">
   <header class="topbar">
     <div class="brand">
-      <svg class="brand-mark" viewBox="0 0 30 22" role="img" aria-label="stark8s mark" focusable="false">
-        <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M6.6,15.2 L12.4,7.6 M17.6,7.6 L23.4,15.2"/>
-          <circle cx="4.5" cy="17" r="2.6"/>
-          <circle cx="25.5" cy="17" r="2.6"/>
-          <circle cx="15" cy="5" r="2.6"/>
+      <svg class="brand-mark" viewBox="0 0 24 24" role="img" aria-label="stark8s mark" focusable="false">
+        <!-- A graph whose five nodes sit at the points of a star and whose
+             edges trace it in one stroke: the same node-and-edge mark as
+             before, evolved into the star of stark8s. The apex node is the
+             one accent. -->
+        <path d="M12,2.4 L17.63,19.72 L2.9,9.02 L21.1,9.02 L6.37,19.72 Z"
+              fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <g fill="currentColor">
+          <circle cx="17.63" cy="19.72" r="1.6"/>
+          <circle cx="2.9" cy="9.02" r="1.6"/>
+          <circle cx="21.1" cy="9.02" r="1.6"/>
+          <circle cx="6.37" cy="19.72" r="1.6"/>
         </g>
-        <circle cx="15" cy="5" r="1.4" fill="var(--brand-accent)"/>
+        <circle cx="12" cy="2.4" r="2.1" fill="var(--brand-accent)"/>
       </svg>
       <span class="brand-name">stark8s</span>
       <span class="surface-tag" role="note">editor</span>
@@ -1901,17 +1907,37 @@ function setupPicker(cd, trigger, list, onPick) {
 
 function escHtml(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 
+function classifyScalar(t, isKey) {
+  if (isKey) return 'tok-key';
+  if (/^".*"$/.test(t) || /^'.*'$/.test(t)) return 'tok-str';
+  if (/^-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(t)) return 'tok-num';
+  if (/^(true|false|null|~|True|False|Null|TRUE|FALSE|NULL)$/.test(t)) return 'tok-bool';
+  return 'tok-str';
+}
+
+// Colours a value: a plain scalar, or a flow collection whose keys,
+// punctuation, and scalar leaves are each tokenised. A word is classified
+// by the delimiter that closes it — a colon marks a key, anything else a
+// value.
 function hlValue(v) {
-  const lead = v.slice(0, v.length - v.trimStart().length);
-  const t = v.trim();
-  if (t === '') return escHtml(v);
-  let body;
-  if (/^".*"$/.test(t) || /^'.*'$/.test(t)) body = `<span class="tok-str">${escHtml(t)}</span>`;
-  else if (/^[[{]/.test(t)) body = escHtml(t).replace(/([[\]{}:,])/g, '<span class="tok-punct">$1</span>');
-  else if (/^-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(t)) body = `<span class="tok-num">${escHtml(t)}</span>`;
-  else if (/^(true|false|null|~|True|False|Null|TRUE|FALSE|NULL)$/.test(t)) body = `<span class="tok-bool">${escHtml(t)}</span>`;
-  else body = `<span class="tok-str">${escHtml(t)}</span>`;
-  return escHtml(lead) + body;
+  let out = '', word = '', q = null;
+  const flush = (delim) => {
+    const w = word; word = '';
+    const t = w.trim();
+    if (t === '') { out += escHtml(w); return; }
+    const lead = w.slice(0, w.length - w.trimStart().length);
+    const tail = w.slice(w.trimEnd().length);
+    out += escHtml(lead) + `<span class="${classifyScalar(t, delim === ':')}">${escHtml(t)}</span>` + escHtml(tail);
+  };
+  for (let i = 0; i < v.length; i++) {
+    const c = v[i];
+    if (q) { word += c; if (c === q && !(q === '"' && v[i - 1] === '\\')) q = null; continue; }
+    if (c === '"' || c === "'") { q = c; word += c; continue; }
+    if ('{}[],:'.indexOf(c) >= 0) { flush(c); out += `<span class="tok-punct">${escHtml(c)}</span>`; }
+    else word += c;
+  }
+  flush(null);
+  return out;
 }
 
 function hlLine(raw) {
