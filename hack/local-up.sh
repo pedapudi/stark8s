@@ -11,7 +11,7 @@ IMAGE=${IMAGE:-stark8s:dev}
 
 if ! kind get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
   if [ "${STARK8S_CNI:-}" = calico ]; then
-    kind create cluster --name "$CLUSTER" --config hack/kind-calico.yaml
+    kind create cluster --name "$CLUSTER" --config hack/kind-without-default-cni.yaml
     kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/calico.yaml
     kubectl -n kube-system rollout status ds/calico-node --timeout=300s
   else

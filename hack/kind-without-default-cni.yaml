@@ -1,0 +1,8 @@
+# A kind cluster with no built-in network plugin, so that a plugin that
+# enforces NetworkPolicy can be installed after creation. The pod subnet is
+# the one Calico's default manifest expects.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  disableDefaultCNI: true
+  podSubnet: 192.168.0.0/16
