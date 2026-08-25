@@ -20,11 +20,8 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["*"]
-  - apiGroups: ["batch"]
-    resources: ["jobs"]
-    verbs: ["*"]
   - apiGroups: [""]
-    resources: ["services", "pods"]
+    resources: ["services", "serviceaccounts", "pods"]
     verbs: ["*"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
@@ -74,7 +71,7 @@ spec:
         - name: controller
           image: stark8s:dev
           imagePullPolicy: IfNotPresent
-          args: ["--exchange-image=stark8s:dev"]
+          args: ["--coordinator-image=stark8s:dev"]
           env:
             - name: POD_NAMESPACE
               valueFrom:

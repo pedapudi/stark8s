@@ -1,6 +1,9 @@
 # Map/shuffle/reduce. "shuffle" is a Materialized Hash channel: reduce is not
 # started until map has completed, and each reduce replica owns a fixed set of
 # key partitions — the stage barrier and exchange of a Spark shuffle.
+#
+# Replica counts follow the coordinator's count of runnable partitions:
+# replicas = clamp(ceil(runnableTasks / slots), min, max).
 apiVersion: stark8s.io/v1alpha1
 kind: Workload
 metadata:
@@ -16,8 +19,9 @@ spec:
               imagePullPolicy: IfNotPresent
               command: ["/wordcount", "read"]
     - name: map
+      slots: 2
       scaling:
-        horizontal: {min: 1, max: 4, targetBacklogPerReplica: 300}
+        horizontal: {min: 1, max: 4}
       template:
         spec:
           containers:
@@ -26,8 +30,9 @@ spec:
               imagePullPolicy: IfNotPresent
               command: ["/wordcount", "map"]
     - name: reduce
+      slots: 2
       scaling:
-        horizontal: {min: 1, max: 3, targetBacklogPerReplica: 4000}
+        horizontal: {min: 1, max: 3}
       template:
         spec:
           containers:
@@ -48,4 +53,4 @@ spec:
       delivery: Materialized
     - name: totals
       from: reduce
-      # No consumer: results are read from outside through the exchange API.
+      # No consumer: results are read from outside through the coordinator API.

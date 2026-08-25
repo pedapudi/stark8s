@@ -2,23 +2,32 @@
 //
 // Mapping, per workload:
 //
-//	exchange        -> one Deployment + Service (<workload>-exchange)
-//	operation       -> Job (completion Drain) or Deployment (completion Never),
+//	coordinator     -> one Deployment + Service (<workload>-coordinator) holding
+//	                   topology, pod registry, partition ownership, segment
+//	                   index, seals, and loop epochs
+//	operation       -> Deployment (<workload>-<operation>) whatever its
+//	                   completion rule, plus a ServiceAccount of the same name,
 //	                   labelled stark8s.io/workload and stark8s.io/operation,
-//	                   with STARK8S_* environment injected into every container
-//	channels        -> pushed to the exchange as topology; sealed when their
-//	                   producing operation's Job completes
-//	scaling         -> Job parallelism / Deployment replicas computed from
-//	                   exchange backlog; HorizontalPodAutoscaler for CPU on
-//	                   streaming operations; VerticalPodAutoscaler when requested
-//	                   and the VPA API is installed
-//	network         -> two NetworkPolicies: operation pods may only talk to the
-//	                   exchange (and DNS); the exchange accepts only workload
-//	                   pods and the controller namespace
+//	                   with STARK8S_* environment, a segment volume, and the
+//	                   segment port injected into every pod
+//	channels        -> pushed to the coordinator as topology; sealed when the
+//	                   coordinator reports their producing operation complete
+//	scaling         -> replicas = clamp(ceil(runnableTasks / slots), min, max)
+//	                   from coordinator metrics; HorizontalPodAutoscaler for
+//	                   CPU on streaming operations; VerticalPodAutoscaler for
+//	                   streaming operations when requested and the API exists
+//	network         -> one NetworkPolicy per channel edge (consumer pods may
+//	                   open the producer's segment port), one for all
+//	                   operation pods, one for the coordinator
+//
+// Completion of a batch operation is a coordinator decision, expressed by
+// the controller as scaling the Deployment to zero. Pods that still hold
+// Ephemeral segments a consumer has not fetched are kept until the
+// coordinator reports them released.
 //
 // An operation whose inbound Materialized channels are not all sealed is not
-// started: its Job is created only when its inputs are complete. This is the
-// stage barrier of a shuffle-based engine expressed as scheduling.
+// started: its Deployment is created only when its inputs are complete. This
+// is the stage barrier of a shuffle-based engine expressed as scheduling.
 package controller
 
 import (
@@ -29,15 +38,14 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -49,27 +57,38 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/pedapudi/stark8s/api/v1alpha1"
-	"github.com/pedapudi/stark8s/pkg/exchange"
+	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
 
 const (
 	LabelWorkload  = "stark8s.io/workload"
 	LabelOperation = "stark8s.io/operation"
 	LabelRole      = "stark8s.io/role"
-	exchangePort   = 8080
-	pollInterval   = 3 * time.Second
+	// LabelChannel is set on per-edge NetworkPolicies so that policies for
+	// channels removed from the spec can be found and deleted.
+	LabelChannel = "stark8s.io/channel"
+
+	RoleOperation   = "operation"
+	RoleCoordinator = "coordinator"
+
+	// SegmentDir is where operation pods keep local segments; an emptyDir
+	// volume is mounted there in every container.
+	SegmentDir        = "/var/lib/stark8s/segments"
+	segmentVolumeName = "stark8s-segments"
+
+	pollInterval = 3 * time.Second
 )
 
 // Reconciler reconciles Workloads.
 type Reconciler struct {
 	client.Client
-	// ExchangeImage is used when the workload does not name one.
-	ExchangeImage string
-	// ControllerNamespace is allowed through the exchange's ingress policy.
+	// CoordinatorImage is used when the workload does not name one.
+	CoordinatorImage string
+	// ControllerNamespace is allowed through the coordinator's ingress policy.
 	ControllerNamespace string
-	// ExchangeURL overrides the in-cluster exchange address (tests).
-	ExchangeURL func(wl *v1alpha1.Workload) string
-	HTTP        *http.Client
+	// CoordinatorURL overrides the in-cluster coordinator address (tests).
+	CoordinatorURL func(wl *v1alpha1.Workload) string
+	HTTP           *http.Client
 }
 
 // SetupWithManager registers the reconciler.
@@ -79,9 +98,9 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.Workload{}).
-		Owns(&batchv1.Job{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
+		Owns(&corev1.ServiceAccount{}).
 		Owns(&networkingv1.NetworkPolicy{}).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Complete(r)
@@ -90,6 +109,9 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 // Reconcile drives one workload toward its spec.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	if r.HTTP == nil {
+		r.HTTP = &http.Client{Timeout: 10 * time.Second}
+	}
 	wl := &v1alpha1.Workload{}
 	if err := r.Get(ctx, req.NamespacedName, wl); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -100,15 +122,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err := Validate(&wl.Spec); err != nil {
 		return r.setPhase(ctx, wl, v1alpha1.WorkloadFailed, "invalid workload: "+err.Error())
 	}
-	if err := r.ensureExchange(ctx, wl); err != nil {
+	if err := r.ensureCoordinator(ctx, wl); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.ensureServiceAccounts(ctx, wl); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.ensureNetworkPolicies(ctx, wl); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.pushTopology(ctx, wl); err != nil {
-		logger.Info("exchange not ready", "err", err.Error())
-		if _, err := r.setPhase(ctx, wl, v1alpha1.WorkloadPending, "waiting for exchange"); err != nil {
+		logger.Info("coordinator not ready", "err", err.Error())
+		if _, err := r.setPhase(ctx, wl, v1alpha1.WorkloadPending, "waiting for coordinator"); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: pollInterval}, nil
@@ -117,29 +142,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err != nil {
 		return ctrl.Result{RequeueAfter: pollInterval}, nil
 	}
-	byName := map[string]exchange.Metrics{}
-	for _, m := range metrics {
-		byName[m.Name] = m
-	}
 
 	var opStatus []v1alpha1.OperationStatus
-	allDone, anyFailed, anyStreaming := true, false, false
+	allDrained, anyStreaming := true, false
 	for i := range wl.Spec.Operations {
 		op := &wl.Spec.Operations[i]
-		st, err := r.reconcileOperation(ctx, wl, op, byName)
+		st, err := r.reconcileOperation(ctx, wl, op, metrics)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		opStatus = append(opStatus, st)
-		switch st.Phase {
-		case v1alpha1.OperationFailed:
-			anyFailed = true
-		case v1alpha1.OperationSucceeded:
-		default:
-			allDone = false
-		}
 		if op.Completion == v1alpha1.CompletionNever {
 			anyStreaming = true
+		} else if st.Phase != v1alpha1.OperationSucceeded {
+			allDrained = false
 		}
 	}
 
@@ -149,17 +165,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 	wl.Status.Operations = opStatus
 	wl.Status.Channels = nil
-	for _, m := range metrics {
+	for _, m := range metrics.Channels {
 		wl.Status.Channels = append(wl.Status.Channels, v1alpha1.ChannelStatus{
 			Name: m.Name, Sealed: m.Sealed, Pending: m.Pending, InFlight: m.InFlight,
-			Produced: m.Produced, Epoch: m.Epoch,
+			Produced: m.Produced, Epoch: m.Epoch, Overflowed: m.Overflowed, Lost: m.Lost,
 		})
 	}
 	phase, msg := v1alpha1.WorkloadRunning, ""
-	switch {
-	case anyFailed:
-		phase, msg = v1alpha1.WorkloadFailed, "an operation failed"
-	case allDone && !anyStreaming:
+	if allDrained && !anyStreaming {
 		phase, msg = v1alpha1.WorkloadSucceeded, "all operations drained"
 	}
 	wl.Status.Phase, wl.Status.Message = phase, msg
@@ -178,7 +191,8 @@ func (r *Reconciler) setPhase(ctx context.Context, wl *v1alpha1.Workload, phase 
 }
 
 // Validate checks graph integrity: channels reference declared operations,
-// names are unique, and every cycle passes through a feedback channel.
+// names are unique, feedback overflow targets are declared channels, slot
+// counts are positive, and every cycle passes through a feedback channel.
 func Validate(s *v1alpha1.WorkloadSpec) error {
 	ops := map[string]bool{}
 	for _, o := range s.Operations {
@@ -186,28 +200,45 @@ func Validate(s *v1alpha1.WorkloadSpec) error {
 			return fmt.Errorf("duplicate operation %q", o.Name)
 		}
 		ops[o.Name] = true
+		// Zero is the unset value and means one slot.
+		if o.Slots < 0 {
+			return fmt.Errorf("operation %q: slots must be at least 1", o.Name)
+		}
 	}
 	chans := map[string]bool{}
-	adj := map[string][]string{}
 	for _, c := range s.Channels {
 		if chans[c.Name] {
 			return fmt.Errorf("duplicate channel %q", c.Name)
 		}
 		chans[c.Name] = true
+	}
+	adj := map[string][]string{}
+	for _, c := range s.Channels {
 		if c.From != "" && !ops[c.From] {
 			return fmt.Errorf("channel %q: unknown producer %q", c.Name, c.From)
 		}
 		if c.To != "" && !ops[c.To] {
 			return fmt.Errorf("channel %q: unknown consumer %q", c.Name, c.To)
 		}
-		if c.Feedback != nil && c.To == "" {
-			return fmt.Errorf("channel %q: feedback channels need a consuming operation", c.Name)
+		if c.Feedback != nil {
+			if c.To == "" {
+				return fmt.Errorf("channel %q: feedback channels need a consuming operation", c.Name)
+			}
+			if o := c.Feedback.Overflow; o != "" {
+				if !chans[o] {
+					return fmt.Errorf("channel %q: overflow channel %q is not declared", c.Name, o)
+				}
+				if o == c.Name {
+					return fmt.Errorf("channel %q: overflow channel must be a different channel", c.Name)
+				}
+			}
 		}
+		// Feedback channels of either mode close cycles; with them removed
+		// the graph must be acyclic.
 		if c.From != "" && c.To != "" && c.Feedback == nil {
 			adj[c.From] = append(adj[c.From], c.To)
 		}
 	}
-	// With feedback edges removed the graph must be acyclic.
 	const white, grey, black = 0, 1, 2
 	color := map[string]int{}
 	var visit func(string) error
@@ -236,24 +267,28 @@ func Validate(s *v1alpha1.WorkloadSpec) error {
 	return nil
 }
 
-// --- exchange -------------------------------------------------------------
+// --- coordinator ----------------------------------------------------------
 
-func exchangeName(wl *v1alpha1.Workload) string { return wl.Name + "-exchange" }
+func coordinatorName(wl *v1alpha1.Workload) string { return wl.Name + "-coordinator" }
 
-func (r *Reconciler) exchangeURL(wl *v1alpha1.Workload) string {
-	if r.ExchangeURL != nil {
-		return r.ExchangeURL(wl)
-	}
-	return fmt.Sprintf("http://%s.%s.svc:%d", exchangeName(wl), wl.Namespace, exchangePort)
+func coordinatorLabels(wl *v1alpha1.Workload) map[string]string {
+	return map[string]string{LabelWorkload: wl.Name, LabelRole: RoleCoordinator}
 }
 
-func (r *Reconciler) ensureExchange(ctx context.Context, wl *v1alpha1.Workload) error {
-	labels := map[string]string{LabelWorkload: wl.Name, LabelRole: "exchange"}
+func (r *Reconciler) coordinatorURL(wl *v1alpha1.Workload) string {
+	if r.CoordinatorURL != nil {
+		return r.CoordinatorURL(wl)
+	}
+	return fmt.Sprintf("http://%s.%s.svc:%d", coordinatorName(wl), wl.Namespace, coordinator.ControlPort)
+}
+
+func (r *Reconciler) ensureCoordinator(ctx context.Context, wl *v1alpha1.Workload) error {
+	labels := coordinatorLabels(wl)
 	image := wl.Spec.Coordinator.Image
 	if image == "" {
-		image = r.ExchangeImage
+		image = r.CoordinatorImage
 	}
-	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: exchangeName(wl), Namespace: wl.Namespace}}
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: coordinatorName(wl), Namespace: wl.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dep, func() error {
 		dep.Labels = labels
 		one := int32(1)
@@ -262,23 +297,29 @@ func (r *Reconciler) ensureExchange(ctx context.Context, wl *v1alpha1.Workload) 
 		dep.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
 		dep.Spec.Template.Labels = labels
 		dep.Spec.Template.Spec.Containers = []corev1.Container{{
-			Name:    "exchange",
+			Name:    "coordinator",
 			Image:   image,
-			Command: []string{"/exchange"},
-			Ports:   []corev1.ContainerPort{{ContainerPort: exchangePort, Name: "http"}},
+			Command: []string{"/coordinator"},
+			Ports: []corev1.ContainerPort{
+				{ContainerPort: coordinator.ControlPort, Name: "control"},
+				{ContainerPort: coordinator.SegmentPort, Name: "segments"},
+			},
 			ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
-				HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromInt(exchangePort)}}},
+				HTTPGet: &corev1.HTTPGetAction{Path: coordinator.PathHealth, Port: intstr.FromInt(coordinator.ControlPort)}}},
 		}}
 		return controllerutil.SetControllerReference(wl, dep, r.Scheme())
 	})
 	if err != nil {
 		return err
 	}
-	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: exchangeName(wl), Namespace: wl.Namespace}}
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: coordinatorName(wl), Namespace: wl.Namespace}}
 	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, svc, func() error {
 		svc.Labels = labels
 		svc.Spec.Selector = labels
-		svc.Spec.Ports = []corev1.ServicePort{{Port: exchangePort, TargetPort: intstr.FromInt(exchangePort), Name: "http"}}
+		svc.Spec.Ports = []corev1.ServicePort{
+			{Port: coordinator.ControlPort, TargetPort: intstr.FromInt(coordinator.ControlPort), Name: "control"},
+			{Port: coordinator.SegmentPort, TargetPort: intstr.FromInt(coordinator.SegmentPort), Name: "segments"},
+		}
 		return controllerutil.SetControllerReference(wl, svc, r.Scheme())
 	})
 	return err
@@ -286,7 +327,7 @@ func (r *Reconciler) ensureExchange(ctx context.Context, wl *v1alpha1.Workload) 
 
 func (r *Reconciler) pushTopology(ctx context.Context, wl *v1alpha1.Workload) error {
 	body, _ := json.Marshal(wl.Spec.Channels)
-	req, _ := http.NewRequestWithContext(ctx, "PUT", r.exchangeURL(wl)+"/topology", bytes.NewReader(body))
+	req, _ := http.NewRequestWithContext(ctx, "PUT", r.coordinatorURL(wl)+coordinator.PathTopology, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := r.HTTP.Do(req)
 	if err != nil {
@@ -299,19 +340,39 @@ func (r *Reconciler) pushTopology(ctx context.Context, wl *v1alpha1.Workload) er
 	return nil
 }
 
-func (r *Reconciler) metrics(ctx context.Context, wl *v1alpha1.Workload) ([]exchange.Metrics, error) {
-	req, _ := http.NewRequestWithContext(ctx, "GET", r.exchangeURL(wl)+"/metrics", nil)
+// metricsView indexes a coordinator report by channel and operation name.
+type metricsView struct {
+	coordinator.Metrics
+	channels   map[string]coordinator.ChannelMetrics
+	operations map[string]coordinator.OperationMetrics
+}
+
+func (r *Reconciler) metrics(ctx context.Context, wl *v1alpha1.Workload) (metricsView, error) {
+	v := metricsView{channels: map[string]coordinator.ChannelMetrics{}, operations: map[string]coordinator.OperationMetrics{}}
+	req, _ := http.NewRequestWithContext(ctx, "GET", r.coordinatorURL(wl)+coordinator.PathMetrics, nil)
 	resp, err := r.HTTP.Do(req)
 	if err != nil {
-		return nil, err
+		return v, err
 	}
 	defer resp.Body.Close()
-	var out []exchange.Metrics
-	return out, json.NewDecoder(resp.Body).Decode(&out)
+	if resp.StatusCode >= 300 {
+		return v, fmt.Errorf("metrics: %s", resp.Status)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&v.Metrics); err != nil {
+		return v, err
+	}
+	for _, c := range v.Channels {
+		v.channels[c.Name] = c
+	}
+	for _, o := range v.Operations {
+		v.operations[o.Name] = o
+	}
+	return v, nil
 }
 
 func (r *Reconciler) seal(ctx context.Context, wl *v1alpha1.Workload, channel string) error {
-	req, _ := http.NewRequestWithContext(ctx, "POST", r.exchangeURL(wl)+"/channels/"+channel+"/seal", nil)
+	url := r.coordinatorURL(wl) + coordinator.PathChannels + "/" + channel + coordinator.SuffixSeal
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, nil)
 	resp, err := r.HTTP.Do(req)
 	if err != nil {
 		return err
@@ -327,8 +388,23 @@ func (r *Reconciler) seal(ctx context.Context, wl *v1alpha1.Workload, channel st
 
 func opName(wl *v1alpha1.Workload, op *v1alpha1.Operation) string { return wl.Name + "-" + op.Name }
 
-// desiredReplicas computes the replica count from backlog and bounds.
-func desiredReplicas(op *v1alpha1.Operation, current int32, backlog int64) int32 {
+func opLabels(wl *v1alpha1.Workload, op *v1alpha1.Operation) map[string]string {
+	return map[string]string{LabelWorkload: wl.Name, LabelOperation: op.Name, LabelRole: RoleOperation}
+}
+
+func slots(op *v1alpha1.Operation) int32 {
+	if op.Slots < 1 {
+		return 1
+	}
+	return op.Slots
+}
+
+// desiredReplicas sizes an operation from the number of runnable tasks:
+// clamp(ceil(runnable / slots), min, max). With no runnable tasks the count
+// is min, raised to one when the operation must run to make progress on its
+// own: a source, or a consumer of a Pipelined channel that must be present
+// while its producer runs.
+func desiredReplicas(spec *v1alpha1.WorkloadSpec, op *v1alpha1.Operation, runnable int32) int32 {
 	h := op.Scaling.Horizontal
 	min, max := h.Min, h.Max
 	if max < 1 {
@@ -337,116 +413,66 @@ func desiredReplicas(op *v1alpha1.Operation, current int32, backlog int64) int32
 	if min > max {
 		min = max
 	}
-	want := current
+	if runnable <= 0 {
+		want := min
+		if want < 1 && mustRunIdle(spec, op) {
+			want = 1
+		}
+		return want
+	}
+	want := int32(math.Ceil(float64(runnable) / float64(slots(op))))
 	if want < min {
 		want = min
-	}
-	if h.TargetBacklogPerReplica > 0 {
-		need := int32(math.Ceil(float64(backlog) / float64(h.TargetBacklogPerReplica)))
-		if need > want {
-			want = need
-		}
 	}
 	if want > max {
 		want = max
 	}
-	if want < min {
-		want = min
-	}
 	return want
 }
 
-func (r *Reconciler) reconcileOperation(ctx context.Context, wl *v1alpha1.Workload, op *v1alpha1.Operation, metrics map[string]exchange.Metrics) (v1alpha1.OperationStatus, error) {
-	st := v1alpha1.OperationStatus{Name: op.Name, Phase: v1alpha1.OperationWaiting}
-	inbound := wl.Spec.Inbound(op.Name)
-
-	var backlog int64
-	ready := true
+// mustRunIdle reports whether an operation needs a pod even when the
+// coordinator reports nothing runnable: sources produce without input, and
+// consumers of Pipelined channels receive records as they are produced.
+func mustRunIdle(spec *v1alpha1.WorkloadSpec, op *v1alpha1.Operation) bool {
+	inbound := spec.Inbound(op.Name)
+	if len(inbound) == 0 {
+		return true
+	}
 	for _, c := range inbound {
-		m := metrics[c.Name]
-		backlog += m.Pending
-		if c.Delivery == v1alpha1.DeliveryMaterialized && c.Feedback == nil && !m.Sealed {
-			ready = false
+		if c.Delivery != v1alpha1.DeliveryMaterialized {
+			return true
 		}
 	}
-	if !ready {
-		return st, nil
-	}
-
-	if op.Completion == v1alpha1.CompletionNever {
-		return r.reconcileStreaming(ctx, wl, op, backlog)
-	}
-	return r.reconcileBatch(ctx, wl, op, backlog)
+	return false
 }
 
-func (r *Reconciler) reconcileBatch(ctx context.Context, wl *v1alpha1.Workload, op *v1alpha1.Operation, backlog int64) (v1alpha1.OperationStatus, error) {
-	st := v1alpha1.OperationStatus{Name: op.Name, Phase: v1alpha1.OperationRunning}
-	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: opName(wl, op), Namespace: wl.Namespace}}
-	err := r.Get(ctx, client.ObjectKeyFromObject(job), job)
-	if apierrors.IsNotFound(err) {
-		parallelism := desiredReplicas(op, 0, backlog)
-		if parallelism < 1 {
-			parallelism = 1
+func (r *Reconciler) reconcileOperation(ctx context.Context, wl *v1alpha1.Workload, op *v1alpha1.Operation, metrics metricsView) (v1alpha1.OperationStatus, error) {
+	st := v1alpha1.OperationStatus{Name: op.Name, Phase: v1alpha1.OperationWaiting}
+	om, hasMetrics := metrics.operations[op.Name]
+	st.RunnableTasks, st.HoldsUnconsumed = om.RunnableTasks, om.HoldsUnconsumed
+
+	// Stage barrier: a consumer of a Materialized channel is not started
+	// until that channel is sealed. Feedback channels are excluded because
+	// they seal only when the loop terminates.
+	for _, c := range wl.Spec.Inbound(op.Name) {
+		if c.Delivery == v1alpha1.DeliveryMaterialized && c.Feedback == nil && !metrics.channels[c.Name].Sealed {
+			return st, nil
 		}
-		job.Labels = opLabels(wl, op)
-		job.Spec.Parallelism = &parallelism
-		backoff := int32(3)
-		job.Spec.BackoffLimit = &backoff
-		job.Spec.Template = r.podTemplate(wl, op)
-		if job.Spec.Template.Spec.RestartPolicy == "" || job.Spec.Template.Spec.RestartPolicy == corev1.RestartPolicyAlways {
-			job.Spec.Template.Spec.RestartPolicy = corev1.RestartPolicyOnFailure
-		}
-		if err := controllerutil.SetControllerReference(wl, job, r.Scheme()); err != nil {
-			return st, err
-		}
-		if err := r.Create(ctx, job); err != nil {
-			return st, err
-		}
-		st.Replicas = parallelism
-		return st, nil
 	}
-	if err != nil {
-		return st, err
-	}
-	st.Replicas = *job.Spec.Parallelism
-	st.Ready = job.Status.Active
-	for _, c := range job.Status.Conditions {
-		if c.Status != corev1.ConditionTrue {
-			continue
-		}
-		switch c.Type {
-		case batchv1.JobComplete:
-			st.Phase = v1alpha1.OperationSucceeded
-			for _, ch := range wl.Spec.Outbound(op.Name) {
-				if ch.Feedback == nil {
-					if err := r.seal(ctx, wl, ch.Name); err != nil {
-						return st, err
-					}
+
+	drainComplete := hasMetrics && om.Complete && op.Completion != v1alpha1.CompletionNever
+	if drainComplete {
+		for _, ch := range wl.Spec.Outbound(op.Name) {
+			if ch.Feedback == nil && !metrics.channels[ch.Name].Sealed {
+				if err := r.seal(ctx, wl, ch.Name); err != nil {
+					return st, err
 				}
 			}
-			return st, nil
-		case batchv1.JobFailed:
-			st.Phase = v1alpha1.OperationFailed
-			return st, nil
 		}
 	}
-	// Scale up on backlog while no pod has succeeded yet (a Job stops
-	// creating pods once one succeeds).
-	if job.Status.Succeeded == 0 {
-		want := desiredReplicas(op, *job.Spec.Parallelism, backlog)
-		if want > *job.Spec.Parallelism {
-			job.Spec.Parallelism = &want
-			if err := r.Update(ctx, job); err != nil {
-				return st, client.IgnoreNotFound(err)
-			}
-			st.Replicas = want
-		}
-	}
-	return st, nil
-}
 
-func (r *Reconciler) reconcileStreaming(ctx context.Context, wl *v1alpha1.Workload, op *v1alpha1.Operation, backlog int64) (v1alpha1.OperationStatus, error) {
-	st := v1alpha1.OperationStatus{Name: op.Name, Phase: v1alpha1.OperationRunning}
+	streaming := op.Completion == v1alpha1.CompletionNever
+	useHPA := streaming && op.Scaling.Horizontal.CPUUtilizationPercent > 0
 	labels := opLabels(wl, op)
 	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: opName(wl, op), Namespace: wl.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dep, func() error {
@@ -455,14 +481,22 @@ func (r *Reconciler) reconcileStreaming(ctx context.Context, wl *v1alpha1.Worklo
 		if dep.Spec.Replicas != nil {
 			current = *dep.Spec.Replicas
 		}
-		if op.Scaling.Horizontal.CPUUtilizationPercent == 0 || dep.Spec.Replicas == nil {
-			want := desiredReplicas(op, current, backlog)
-			// Backlog scaling for streaming operations scales both ways.
-			if op.Scaling.Horizontal.TargetBacklogPerReplica > 0 {
-				want = desiredReplicas(op, 0, backlog)
+		var want int32
+		switch {
+		case drainComplete && om.HoldsUnconsumed:
+			// Pods hold Ephemeral segments a consumer has not fetched.
+			want = current
+			if want < 1 {
+				want = 1
 			}
-			dep.Spec.Replicas = &want
+		case drainComplete:
+			want = 0
+		case useHPA && dep.Spec.Replicas != nil:
+			want = current
+		default:
+			want = desiredReplicas(&wl.Spec, op, om.RunnableTasks)
 		}
+		dep.Spec.Replicas = &want
 		dep.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
 		dep.Spec.Template = r.podTemplate(wl, op)
 		return controllerutil.SetControllerReference(wl, dep, r.Scheme())
@@ -472,17 +506,21 @@ func (r *Reconciler) reconcileStreaming(ctx context.Context, wl *v1alpha1.Worklo
 	}
 	st.Replicas = *dep.Spec.Replicas
 	st.Ready = dep.Status.ReadyReplicas
+	st.Phase = v1alpha1.OperationRunning
+	if drainComplete && st.Replicas == 0 && dep.Status.Replicas == 0 {
+		st.Phase = v1alpha1.OperationSucceeded
+	}
+	if !streaming {
+		return st, nil
+	}
 	if err := r.ensureHPA(ctx, wl, op); err != nil {
 		return st, err
 	}
-	return st, r.ensureVPA(ctx, wl, op, "Deployment")
+	return st, r.ensureVPA(ctx, wl, op)
 }
 
-func opLabels(wl *v1alpha1.Workload, op *v1alpha1.Operation) map[string]string {
-	return map[string]string{LabelWorkload: wl.Name, LabelOperation: op.Name, LabelRole: "operation"}
-}
-
-// podTemplate returns the operation's template with graph discovery injected.
+// podTemplate returns the operation's template with graph discovery, the
+// segment volume, the segment port, and the service account injected.
 func (r *Reconciler) podTemplate(wl *v1alpha1.Workload, op *v1alpha1.Operation) corev1.PodTemplateSpec {
 	tpl := *op.Template.DeepCopy()
 	if tpl.Labels == nil {
@@ -491,6 +529,7 @@ func (r *Reconciler) podTemplate(wl *v1alpha1.Workload, op *v1alpha1.Operation) 
 	for k, v := range opLabels(wl, op) {
 		tpl.Labels[k] = v
 	}
+	tpl.Spec.ServiceAccountName = opName(wl, op)
 	var in, out, fb, fbOut []string
 	for _, c := range wl.Spec.Inbound(op.Name) {
 		in = append(in, c.Name)
@@ -505,19 +544,71 @@ func (r *Reconciler) podTemplate(wl *v1alpha1.Workload, op *v1alpha1.Operation) 
 		}
 	}
 	env := []corev1.EnvVar{
-		{Name: "STARK8S_EXCHANGE", Value: fmt.Sprintf("http://%s:%d", exchangeName(wl), exchangePort)},
-		{Name: "STARK8S_WORKLOAD", Value: wl.Name},
-		{Name: "STARK8S_OPERATION", Value: op.Name},
-		{Name: "STARK8S_INSTANCE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
-		{Name: "STARK8S_INBOUND", Value: strings.Join(in, ",")},
-		{Name: "STARK8S_OUTBOUND", Value: strings.Join(out, ",")},
-		{Name: "STARK8S_FEEDBACK", Value: strings.Join(fb, ",")},
-		{Name: "STARK8S_FEEDBACK_OUT", Value: strings.Join(fbOut, ",")},
+		{Name: coordinator.EnvCoordinator, Value: fmt.Sprintf("http://%s:%d", coordinatorName(wl), coordinator.ControlPort)},
+		{Name: coordinator.EnvWorkload, Value: wl.Name},
+		{Name: coordinator.EnvOperation, Value: op.Name},
+		{Name: coordinator.EnvInstance, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
+		{Name: coordinator.EnvPodIP, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}},
+		{Name: coordinator.EnvSlots, Value: strconv.Itoa(int(slots(op)))},
+		{Name: coordinator.EnvInbound, Value: strings.Join(in, ",")},
+		{Name: coordinator.EnvOutbound, Value: strings.Join(out, ",")},
+		{Name: coordinator.EnvFeedback, Value: strings.Join(fb, ",")},
+		{Name: coordinator.EnvFeedbackOut, Value: strings.Join(fbOut, ",")},
+		{Name: coordinator.EnvSegmentDir, Value: SegmentDir},
+	}
+	hasVolume := false
+	for _, v := range tpl.Spec.Volumes {
+		if v.Name == segmentVolumeName {
+			hasVolume = true
+		}
+	}
+	if !hasVolume {
+		tpl.Spec.Volumes = append(tpl.Spec.Volumes, corev1.Volume{
+			Name:         segmentVolumeName,
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		})
 	}
 	for i := range tpl.Spec.Containers {
-		tpl.Spec.Containers[i].Env = append(env, tpl.Spec.Containers[i].Env...)
+		c := &tpl.Spec.Containers[i]
+		c.Env = append(env, c.Env...)
+		mounted := false
+		for _, m := range c.VolumeMounts {
+			if m.Name == segmentVolumeName {
+				mounted = true
+			}
+		}
+		if !mounted {
+			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: segmentVolumeName, MountPath: SegmentDir})
+		}
+		if i == 0 {
+			hasPort := false
+			for _, p := range c.Ports {
+				if p.ContainerPort == coordinator.SegmentPort {
+					hasPort = true
+				}
+			}
+			if !hasPort {
+				c.Ports = append(c.Ports, corev1.ContainerPort{ContainerPort: coordinator.SegmentPort, Name: "segments"})
+			}
+		}
 	}
 	return tpl
+}
+
+// ensureServiceAccounts creates one ServiceAccount per operation. The
+// coordinator can bind a pod's token to its operation through it.
+func (r *Reconciler) ensureServiceAccounts(ctx context.Context, wl *v1alpha1.Workload) error {
+	for i := range wl.Spec.Operations {
+		op := &wl.Spec.Operations[i]
+		sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: opName(wl, op), Namespace: wl.Namespace}}
+		if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, sa, func() error {
+			sa.Labels = opLabels(wl, op)
+			return controllerutil.SetControllerReference(wl, sa, r.Scheme())
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *Reconciler) ensureHPA(ctx context.Context, wl *v1alpha1.Workload, op *v1alpha1.Operation) error {
@@ -533,8 +624,12 @@ func (r *Reconciler) ensureHPA(ctx context.Context, wl *v1alpha1.Workload, op *v
 		if min < 1 {
 			min = 1
 		}
+		max := op.Scaling.Horizontal.Max
+		if max < min {
+			max = min
+		}
 		hpa.Spec.MinReplicas = &min
-		hpa.Spec.MaxReplicas = op.Scaling.Horizontal.Max
+		hpa.Spec.MaxReplicas = max
 		hpa.Spec.ScaleTargetRef = autoscalingv2.CrossVersionObjectReference{APIVersion: "apps/v1", Kind: "Deployment", Name: opName(wl, op)}
 		hpa.Spec.Metrics = []autoscalingv2.MetricSpec{{
 			Type: autoscalingv2.ResourceMetricSourceType,
@@ -548,8 +643,10 @@ func (r *Reconciler) ensureHPA(ctx context.Context, wl *v1alpha1.Workload, op *v
 
 var vpaGVK = schema.GroupVersionKind{Group: "autoscaling.k8s.io", Version: "v1", Kind: "VerticalPodAutoscaler"}
 
-// ensureVPA creates a VerticalPodAutoscaler when requested and the API exists.
-func (r *Reconciler) ensureVPA(ctx context.Context, wl *v1alpha1.Workload, op *v1alpha1.Operation, kind string) error {
+// ensureVPA creates a VerticalPodAutoscaler when requested and the API
+// exists. Only streaming operations receive one: the VPA updater evicts
+// pods, and a batch pod's local segments would be lost with it.
+func (r *Reconciler) ensureVPA(ctx context.Context, wl *v1alpha1.Workload, op *v1alpha1.Operation) error {
 	if op.Scaling.Vertical == nil || op.Scaling.Vertical.Mode == "" || op.Scaling.Vertical.Mode == v1alpha1.VerticalOff {
 		return nil
 	}
@@ -567,7 +664,7 @@ func (r *Reconciler) ensureVPA(ctx context.Context, wl *v1alpha1.Workload, op *v
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, vpa, func() error {
 		vpa.SetLabels(opLabels(wl, op))
 		_ = unstructured.SetNestedMap(vpa.Object, map[string]any{
-			"apiVersion": "apps/v1", "kind": kind, "name": opName(wl, op),
+			"apiVersion": "apps/v1", "kind": "Deployment", "name": opName(wl, op),
 		}, "spec", "targetRef")
 		_ = unstructured.SetNestedField(vpa.Object, string(op.Scaling.Vertical.Mode), "spec", "updatePolicy", "updateMode")
 		return controllerutil.SetControllerReference(wl, vpa, r.Scheme())
@@ -577,15 +674,24 @@ func (r *Reconciler) ensureVPA(ctx context.Context, wl *v1alpha1.Workload, op *v
 
 // --- network --------------------------------------------------------------
 
+func edgePolicyName(wl *v1alpha1.Workload, channel string) string {
+	return wl.Name + "-edge-" + channel
+}
+
 func (r *Reconciler) ensureNetworkPolicies(ctx context.Context, wl *v1alpha1.Workload) error {
-	workloadPods := metav1.LabelSelector{MatchLabels: map[string]string{LabelWorkload: wl.Name, LabelRole: "operation"}}
-	exchangePods := metav1.LabelSelector{MatchLabels: map[string]string{LabelWorkload: wl.Name, LabelRole: "exchange"}}
+	workloadPods := metav1.LabelSelector{MatchLabels: map[string]string{LabelWorkload: wl.Name, LabelRole: RoleOperation}}
+	coordinatorPods := metav1.LabelSelector{MatchLabels: coordinatorLabels(wl)}
 	tcp := corev1.ProtocolTCP
 	udp := corev1.ProtocolUDP
 	dns := intstr.FromInt(53)
-	xport := intstr.FromInt(exchangePort)
+	control := intstr.FromInt(coordinator.ControlPort)
+	segment := intstr.FromInt(coordinator.SegmentPort)
+	dnsRule := networkingv1.NetworkPolicyEgressRule{Ports: []networkingv1.NetworkPolicyPort{{Protocol: &udp, Port: &dns}, {Protocol: &tcp, Port: &dns}}}
+	bothPorts := []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &control}, {Protocol: &tcp, Port: &segment}}
 
-	// Operation pods: no ingress; egress only to the exchange and to DNS.
+	// Operation pods: egress to the coordinator, to DNS, and to the segment
+	// port of any pod of the same workload. Ingress is granted only by the
+	// per-edge policies below.
 	ops := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: wl.Name + "-operations", Namespace: wl.Namespace}}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, ops, func() error {
 		ops.Labels = map[string]string{LabelWorkload: wl.Name}
@@ -593,8 +699,9 @@ func (r *Reconciler) ensureNetworkPolicies(ctx context.Context, wl *v1alpha1.Wor
 			PodSelector: workloadPods,
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
 			Egress: []networkingv1.NetworkPolicyEgressRule{
-				{To: []networkingv1.NetworkPolicyPeer{{PodSelector: &exchangePods}}, Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &xport}}},
-				{Ports: []networkingv1.NetworkPolicyPort{{Protocol: &udp, Port: &dns}, {Protocol: &tcp, Port: &dns}}},
+				{To: []networkingv1.NetworkPolicyPeer{{PodSelector: &coordinatorPods}}, Ports: bothPorts},
+				{To: []networkingv1.NetworkPolicyPeer{{PodSelector: &workloadPods}}, Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &segment}}},
+				dnsRule,
 			},
 		}
 		return controllerutil.SetControllerReference(wl, ops, r.Scheme())
@@ -602,26 +709,71 @@ func (r *Reconciler) ensureNetworkPolicies(ctx context.Context, wl *v1alpha1.Wor
 		return err
 	}
 
-	// Exchange: ingress only from this workload's operation pods and the
-	// controller's namespace; egress only DNS.
-	ex := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: wl.Name + "-exchange", Namespace: wl.Namespace}}
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, ex, func() error {
-		ex.Labels = map[string]string{LabelWorkload: wl.Name}
+	// Coordinator: ingress from this workload's operation pods and the
+	// controller's namespace on both ports; egress only DNS.
+	co := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: coordinatorName(wl), Namespace: wl.Namespace}}
+	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, co, func() error {
+		co.Labels = map[string]string{LabelWorkload: wl.Name}
 		from := []networkingv1.NetworkPolicyPeer{{PodSelector: &workloadPods}}
 		if r.ControllerNamespace != "" {
 			from = append(from, networkingv1.NetworkPolicyPeer{
 				NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": r.ControllerNamespace}},
 			})
 		}
-		ex.Spec = networkingv1.NetworkPolicySpec{
-			PodSelector: exchangePods,
+		co.Spec = networkingv1.NetworkPolicySpec{
+			PodSelector: coordinatorPods,
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
-			Ingress:     []networkingv1.NetworkPolicyIngressRule{{From: from, Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &xport}}}},
-			Egress:      []networkingv1.NetworkPolicyEgressRule{{Ports: []networkingv1.NetworkPolicyPort{{Protocol: &udp, Port: &dns}, {Protocol: &tcp, Port: &dns}}}},
+			Ingress:     []networkingv1.NetworkPolicyIngressRule{{From: from, Ports: bothPorts}},
+			Egress:      []networkingv1.NetworkPolicyEgressRule{dnsRule},
 		}
-		return controllerutil.SetControllerReference(wl, ex, r.Scheme())
-	})
-	return err
+		return controllerutil.SetControllerReference(wl, co, r.Scheme())
+	}); err != nil {
+		return err
+	}
+
+	// One policy per edge: the consumer's pods may open the producer's
+	// segment port.
+	wanted := map[string]bool{}
+	for _, c := range wl.Spec.Channels {
+		if c.From == "" || c.To == "" {
+			continue
+		}
+		wanted[c.Name] = true
+		producer := metav1.LabelSelector{MatchLabels: map[string]string{LabelWorkload: wl.Name, LabelRole: RoleOperation, LabelOperation: c.From}}
+		consumer := metav1.LabelSelector{MatchLabels: map[string]string{LabelWorkload: wl.Name, LabelRole: RoleOperation, LabelOperation: c.To}}
+		np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: edgePolicyName(wl, c.Name), Namespace: wl.Namespace}}
+		if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, np, func() error {
+			np.Labels = map[string]string{LabelWorkload: wl.Name, LabelChannel: c.Name}
+			np.Spec = networkingv1.NetworkPolicySpec{
+				PodSelector: producer,
+				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+				Ingress: []networkingv1.NetworkPolicyIngressRule{{
+					From:  []networkingv1.NetworkPolicyPeer{{PodSelector: &consumer}},
+					Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &segment}},
+				}},
+			}
+			return controllerutil.SetControllerReference(wl, np, r.Scheme())
+		}); err != nil {
+			return err
+		}
+	}
+
+	// Delete edge policies for channels no longer in the spec.
+	var list networkingv1.NetworkPolicyList
+	if err := r.List(ctx, &list, client.InNamespace(wl.Namespace), client.MatchingLabels{LabelWorkload: wl.Name}); err != nil {
+		return err
+	}
+	for i := range list.Items {
+		np := &list.Items[i]
+		ch, isEdge := np.Labels[LabelChannel]
+		if !isEdge || wanted[ch] {
+			continue
+		}
+		if err := r.Delete(ctx, np); client.IgnoreNotFound(err) != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Namespace returns the namespace the controller runs in, from the
