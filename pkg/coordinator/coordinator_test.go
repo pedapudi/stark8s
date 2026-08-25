@@ -220,6 +220,10 @@ func TestExpiredHolderLosesSegmentsWithoutBlocking(t *testing.T) {
 	if m.Lost != 10 || m.Pending != 0 || m.InFlight != 0 {
 		t.Fatalf("loss not reported: %+v", m)
 	}
+	if om := operationMetrics(co, "b"); om.Complete {
+		t.Fatalf("complete before the pod reported done: %+v", om)
+	}
+	_ = co.SourceDone(PodRegistration{Operation: "b", Pod: "b-0"})
 	if om := operationMetrics(co, "b"); !om.Complete {
 		t.Fatalf("consumer not complete after loss: %+v", om)
 	}
@@ -263,6 +267,7 @@ func TestSynchronousBarrierAndTermination(t *testing.T) {
 	if !resp.Sealed || !resp.Drained {
 		t.Fatalf("loop did not terminate: %+v", resp)
 	}
+	_ = co.SourceDone(PodRegistration{Operation: "r", Pod: "r-0"})
 	if om := operationMetrics(co, "r"); !om.Complete || om.HoldsUnconsumed {
 		t.Fatalf("loop operation after termination: %+v", om)
 	}
@@ -338,6 +343,7 @@ func TestAsynchronousLoopDeliversImmediatelyAndTerminates(t *testing.T) {
 	if !resp.Sealed || !resp.Drained {
 		t.Fatalf("async loop did not terminate: %+v", resp)
 	}
+	_ = co.SourceDone(PodRegistration{Operation: "agent", Pod: "ag-0"})
 	if om := operationMetrics(co, "agent"); !om.Complete {
 		t.Fatalf("agent not complete: %+v", om)
 	}
@@ -477,8 +483,12 @@ func TestHoldsUnconsumedAndCompleteTransitions(t *testing.T) {
 	register(t, co, "b", "b-0")
 	register(t, co, "c", "c-0")
 	drain(t, co, "s", "b", "b-0")
-	if om := operationMetrics(co, "b"); !om.Complete || om.RunnableTasks != 0 {
-		t.Fatalf("consumer after drain: %+v", om)
+	if om := operationMetrics(co, "b"); om.Complete || om.RunnableTasks != 0 {
+		t.Fatalf("consumer drained but not yet done: %+v", om)
+	}
+	_ = co.SourceDone(PodRegistration{Operation: "b", Pod: "b-0"})
+	if om := operationMetrics(co, "b"); !om.Complete {
+		t.Fatalf("consumer after drain and done: %+v", om)
 	}
 	if om := operationMetrics(co, "src"); om.HoldsUnconsumed {
 		t.Fatalf("Retained segment counted as unconsumed hold: %+v", om)

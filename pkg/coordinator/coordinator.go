@@ -30,12 +30,12 @@ func errf(status int, format string, a ...any) error {
 
 // pod is one registered worker pod.
 type pod struct {
-	name       string
-	op         string
-	addr       string
-	slots      int32
-	lastSeen   time.Time
-	sourceDone bool
+	name     string
+	op       string
+	addr     string
+	slots    int32
+	lastSeen time.Time
+	done     bool
 }
 
 // operation is the per-operation state: its pods and, for its consumers,
@@ -282,14 +282,15 @@ func (co *Coordinator) touch(opName, podName, addr string, slots int32) *pod {
 	return p
 }
 
-// SourceDone records that a source pod has emitted everything.
+// SourceDone records that a pod has emitted everything it will emit: a
+// source pod after its source ran, a consumer pod after it drained.
 func (co *Coordinator) SourceDone(reg PodRegistration) error {
 	if reg.Operation == "" || reg.Pod == "" {
 		return errf(400, "operation and pod are required")
 	}
 	co.mu.Lock()
 	defer co.mu.Unlock()
-	co.touch(reg.Operation, reg.Pod, reg.Addr, reg.Slots).sourceDone = true
+	co.touch(reg.Operation, reg.Pod, reg.Addr, reg.Slots).done = true
 	return nil
 }
 
@@ -1050,12 +1051,10 @@ func (co *Coordinator) Metrics() Metrics {
 func (co *Coordinator) operationMetrics(name string) OperationMetrics {
 	o := co.op(name)
 	om := OperationMetrics{Name: name, LivePods: int32(len(o.pods))}
-	inbound := 0
 	complete := true
 	runnable := map[string]bool{}
 	for _, c := range co.channels {
 		if c.spec.To == name {
-			inbound++
 			if !(c.sealed && c.quiet() && c.heldRecords() == 0) {
 				complete = false
 			}
@@ -1081,12 +1080,12 @@ func (co *Coordinator) operationMetrics(name string) OperationMetrics {
 		}
 	}
 	om.RunnableTasks = int32(len(runnable))
-	if inbound == 0 {
-		complete = len(o.pods) > 0
-		for _, p := range o.pods {
-			if !p.sourceDone {
-				complete = false
-			}
+	if len(o.pods) == 0 {
+		complete = false
+	}
+	for _, p := range o.pods {
+		if !p.done {
+			complete = false
 		}
 	}
 	om.Complete = complete

@@ -35,11 +35,15 @@ const (
 	// the last record scanned, to pass as `after` on the next call.
 	RecordsNextHeader = "X-Stark8s-Next"
 
-	PathTopology   = "/topology"         // PUT  []v1alpha1.Channel; GET -> []v1alpha1.Channel (pods read partitioning and feedback settings)
-	PathMetrics    = "/metrics"          // GET  Metrics
-	PathHealth     = "/healthz"          // GET
-	PathRegister   = "/pods/register"    // POST PodRegistration (also the heartbeat; repeat every 5s)
-	PathSourceDone = "/pods/source-done" // POST PodRegistration: a source pod has emitted everything
+	PathTopology = "/topology"      // PUT  []v1alpha1.Channel; GET -> []v1alpha1.Channel (pods read partitioning and feedback settings)
+	PathMetrics  = "/metrics"       // GET  Metrics
+	PathHealth   = "/healthz"       // GET
+	PathRegister = "/pods/register" // POST PodRegistration (also the heartbeat; repeat every 5s)
+	// PathSourceDone: the pod has emitted everything it will emit. Source
+	// pods post it after their Source handler; Drain pods post it after
+	// their inbound channels drained and their final flush completed. An
+	// operation is Complete only when every live pod has posted it.
+	PathSourceDone = "/pods/source-done" // POST PodRegistration
 	// PathReleased lists segments a holder pod may delete: Ephemeral segments
 	// it announced that every consumer has acknowledged. The coordinator
 	// forgets each segment once it has been listed.
@@ -165,8 +169,9 @@ type OperationMetrics struct {
 	// RunnableTasks is the number of owned-or-unowned partitions with pending
 	// segments (per current epoch for Synchronous loops).
 	RunnableTasks int32 `json:"runnableTasks"`
-	// Complete: every inbound channel is sealed and drained (for sources:
-	// every registered pod reported source-done), and nothing is in flight.
+	// Complete: every inbound channel is sealed and drained, nothing is in
+	// flight, and every live registered pod (at least one) has reported
+	// done on PathSourceDone.
 	Complete bool `json:"complete"`
 	// HoldsUnconsumed: pods of this operation hold Ephemeral segments that
 	// consumers have not acknowledged. The controller must keep the pods.
