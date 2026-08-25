@@ -84,6 +84,9 @@ the generated policies are enforced.
   plan maps onto a Workload, and what the mapping exposes.
 - [docs/precedent.md](docs/precedent.md) — prior systems and papers, and
   what this design takes from each.
+- [web/editor.html](web/editor.html) — a single-file graph editor and
+  viewer for Workloads that converts to and from the YAML;
+  [web/README.md](web/README.md) describes it.
 
 ## Layout
 
@@ -98,6 +101,7 @@ the generated policies are enforced.
 | `examples/wordcount`, `examples/pagerank` | acyclic and cyclic examples |
 | `config/crd`, `config/manager` | install manifests |
 | `hack` | local cluster scripts |
+| `web` | single-file Workload graph editor and its round-trip test |
 
 ## Limitations
 
