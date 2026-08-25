@@ -158,3 +158,17 @@ check('layout: feedback edges do not affect rank', Core.layout(pr, {}).get('rank
 
 console.log(failures ? `\n${failures} failure(s)` : '\nall checks passed');
 process.exit(failures ? 1 : 0);
+
+// Capacity planning: replicas = clamp(ceil(runnableTasks / slots), min, max).
+{
+  const doc = Core.fromYAML(readFileSync(join(root, 'examples', 'wordcount', 'workload.yaml'), 'utf8'));
+  const at = (load) => (name) => Core.expectedShape(doc, name, () => load);
+  const heavy = at(1000);
+  check('capacity: map saturates its bound at high load', heavy('map').replicas === 4 && heavy('map').runnable === 8);
+  check('capacity: reduce sizes from ceil(partitions/slots)', heavy('reduce').replicas === 3 && heavy('reduce').raw === 3);
+  check('capacity: source runs at its floor', heavy('read').source === true && heavy('read').replicas === 1);
+  const light = at(3);
+  check('capacity: low load lowers the count', light('map').replicas === 2 && light('reduce').replicas === 2);
+  const idle = at(0);
+  check('capacity: no load holds map at its min of 1', idle('map').replicas === 1 && idle('map').runnable === 0);
+}

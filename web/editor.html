@@ -881,6 +881,14 @@ svg.canvas.connecting { cursor: crosshair; }
   paint-order: stroke; stroke: var(--v2-paper); stroke-width: 3px; stroke-linejoin: round;
 }
 
+
+/* capacity-planning readout on a node, and its toolbar load control */
+.node-pods { fill: var(--v2-ink); }
+.node-pods.saturated { fill: var(--v2-caution); }
+button[aria-pressed="true"] { background: var(--v2-rule-soft); color: var(--v2-ink); border-color: var(--v2-ink-faint); }
+.cap-load { display: inline-flex; align-items: center; gap: 5px; font-family: var(--v2-mono); font-size: calc(10px * var(--dt-font-scale, 1)); color: var(--v2-ink-faint); }
+.cap-load input { width: 8ch; }
+
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
@@ -990,6 +998,12 @@ svg.canvas.connecting { cursor: crosshair; }
         <button id="btn-add">add operation</button>
         <button id="btn-layout">auto layout</button>
         <button id="btn-fit">fit</button>
+        <button id="btn-capacity" aria-pressed="false" title="show the pods each operation would run at for an assumed load">capacity</button>
+        <span class="cap-load" id="cap-load" hidden>
+          <label class="mono" for="cap-load-input">load</label>
+          <input type="number" id="cap-load-input" min="0" step="100" value="1000" aria-label="assumed records per channel">
+          <span>rec/channel</span>
+        </span>
         <span class="hint">double-click to add · drag a port to connect · l layout · f fit · / yaml</span>
       </div>
       <div class="canvas-host" id="canvas-host">
@@ -1610,8 +1624,45 @@ function roundTrip(text) {
   return { ok: deepEqual(a, b), yaml: out, first: a, second: b };
 }
 
+// ---------- capacity planning ----------
+//
+// The controller sizes an operation as
+//   replicas = clamp(ceil(runnableTasks / slots), min, max),
+// where runnableTasks is the number of inbound partitions that hold work.
+// Given an assumed record count per channel, busyPartitions estimates how
+// many partitions of a channel would hold records, and expectedShape turns
+// that into the replica count each operation would run at. A source has no
+// inbound channels and runs at its floor.
+
+function busyPartitions(ch, records) {
+  const e = chEffective(ch);
+  if (!(records > 0)) return 0;
+  if (e.mode === 'Broadcast') return 1;
+  return Math.min(e.partitions, Math.floor(records));
+}
+
+function expectedShape(doc, opName, recordsOf) {
+  const op = doc.spec.operations.find((o) => o.name === opName);
+  if (!op) return null;
+  const e = opEffective(op);
+  const inbound = doc.spec.channels.filter((c) => c.to === opName);
+  if (inbound.length === 0) {
+    const replicas = Math.max(1, Math.min(e.max, Math.max(e.min, 1)));
+    return { source: true, runnable: null, raw: replicas, replicas, clamp: 'source', slots: e.slots, min: e.min, max: e.max };
+  }
+  const maxP = Math.max(...inbound.map((c) => chEffective(c).partitions));
+  let sum = 0;
+  for (const c of inbound) sum += busyPartitions(c, recordsOf(c.name));
+  const runnable = Math.min(maxP, sum);
+  const raw = Math.ceil(runnable / e.slots);
+  let replicas = Math.max(e.min, Math.min(e.max, raw));
+  if (raw <= 0 && e.min === 0) replicas = 0;
+  const clamp = raw > e.max ? 'max' : (raw < e.min ? 'min' : 'none');
+  return { source: false, runnable, raw, replicas, clamp, slots: e.slots, min: e.min, max: e.max };
+}
+
 return { YAMLError, parseYAML, emitYAML, toYAML, fromYAML, blankWorkload, normalize, validate, layout,
-  opEffective, chEffective, subLine, nodeWidth, deepEqual, clone, roundTrip, DEFAULTS, NODE_H };
+  opEffective, chEffective, subLine, nodeWidth, deepEqual, clone, roundTrip, expectedShape, busyPartitions, DEFAULTS, NODE_H };
 })();
 </script>
 
@@ -2028,7 +2079,15 @@ const state = {
   propsDigest: '',
   errors: [],
   notes: [],            // transient lines for the status strip
+  capacity: { on: false, load: 1000, records: {} },  // planning input; never written to the workload
 };
+
+// Assumed records pending on a channel: an explicit override, else the load.
+function recordsOf(name) {
+  const o = state.capacity.records[name];
+  return o == null || o === '' ? state.capacity.load : Number(o);
+}
+function persistCapacity() { store('capacity', state.capacity); }
 
 const svg = $('canvas');
 const host = $('canvas-host');
@@ -2189,7 +2248,7 @@ function renderCanvas() {
   state.errors = errors;
   const badOps = new Set(errors.filter((e) => e.op).map((e) => e.op));
   const badChs = new Set(errors.filter((e) => e.channel).map((e) => e.channel));
-  const digest = JSON.stringify([doc, state.pinned, state.selection, state.status]);
+  const digest = JSON.stringify([doc, state.pinned, state.selection, state.status, state.capacity.on ? state.capacity : 0]);
   if (digest === state.digest && svg.firstChild) return;
   state.digest = digest;
 
@@ -2262,6 +2321,10 @@ function renderCanvas() {
     const above = e.kind === 'self' || e.kind === 'feedback' ? -12 : -14;
     const meta = [];
     if (eff.feedback) meta.push(`${eff.feedback.maxEpochs} epochs · ${eff.feedback.mode}`);
+    if (state.capacity.on) {
+      const overridden = state.capacity.records[c.name] != null && state.capacity.records[c.name] !== '';
+      meta.push(`≈ ${recordsOf(c.name)} rec${overridden ? ' (set)' : ''}`);
+    }
     if (st) {
       const bits = [];
       if (st.pending != null) bits.push(`pending ${st.pending}`);
@@ -2328,13 +2391,28 @@ function renderCanvas() {
     const selected = sel && sel.kind === 'op' && sel.name === o.name;
     const g = el('g', { class: 'node' + (selected ? ' selected' : '') + (badOps.has(o.name) ? ' invalid' : ''), transform: `translate(${n.x},${n.y})`, 'data-node': o.name, tabindex: 0, role: 'button', 'aria-label': `operation ${o.name}` });
     const image = (((o.template || {}).spec || {}).containers || [])[0];
-    hov(g, o.name, Core.subLine(eff) + (eff.vertical !== 'Off' ? ` · vertical ${eff.vertical}` : ''), image && image.image ? `image ${image.image}` + (Array.isArray(image.command) ? ' · ' + image.command.join(' ') : '') : 'no container image');
+    const cap = state.capacity.on ? Core.expectedShape(doc, o.name, recordsOf) : null;
+    // In capacity mode the node hovercard explains how the pod count is derived.
+    const nodeContext = cap
+      ? (cap.source
+          ? `source · runs at its floor of ${cap.replicas} pod${cap.replicas === 1 ? '' : 's'} (min ${cap.min}, max ${cap.max})`
+          : `runnable ${cap.runnable} · ceil(${cap.runnable} / ${cap.slots} slots) = ${cap.raw} · clamped to [${cap.min}, ${cap.max}]${cap.clamp === 'max' ? ' — at the ceiling' : ''} → ${cap.replicas} pod${cap.replicas === 1 ? '' : 's'}`)
+      : Core.subLine(eff) + (eff.vertical !== 'Off' ? ` · vertical ${eff.vertical}` : '');
+    hov(g, o.name, nodeContext, image && image.image ? `image ${image.image}` + (Array.isArray(image.command) ? ' · ' + image.command.join(' ') : '') : 'no container image');
     g.appendChild(el('rect', { width: n.w, height: n.h, rx: 4, class: 'node-body' }));
     g.appendChild(el('line', { x1: 0, y1: 6, x2: 0, y2: n.h - 6, class: 'node-spine' }));
     g.appendChild(el('text', { x: 12, y: 19, class: 'node-name' }, [o.name]));
-    let subText = Core.subLine(eff);
-    if (st && st.replicas != null) subText += ` · ${st.ready == null ? st.replicas : st.ready}/${st.replicas}`;
-    g.appendChild(el('text', { x: 12, y: 35, class: 'node-sub' }, [subText]));
+    const subEl = el('text', { x: 12, y: 35, class: 'node-sub' });
+    if (cap) {
+      subEl.appendChild(document.createTextNode(`${eff.completion} · slots ${eff.slots} · `));
+      subEl.appendChild(el('tspan', { class: 'node-pods' + (cap.clamp === 'max' ? ' saturated' : '') }, [`≈ ${cap.replicas} pod${cap.replicas === 1 ? '' : 's'}`]));
+      if (cap.source) subEl.appendChild(document.createTextNode(' · source'));
+    } else {
+      let subText = Core.subLine(eff);
+      if (st && st.replicas != null) subText += ` · ${st.ready == null ? st.replicas : st.ready}/${st.replicas}`;
+      subEl.appendChild(document.createTextNode(subText));
+    }
+    g.appendChild(subEl);
     // Completion glyph at the top right: a tick for Drain, a ring for Never.
     const cg = hov(el('g', { class: 'mark-hit', transform: `translate(${n.w - 14},14)`, tabindex: 0, role: 'img', 'aria-label': MARK_TEXT[eff.completion][0] }), MARK_TEXT[eff.completion][0], o.name, MARK_TEXT[eff.completion][1]);
     cg.appendChild(el('circle', { r: 8, fill: 'transparent', stroke: 'none' }));
@@ -2749,7 +2827,7 @@ function prune(obj, key) {
 function renderProps() {
   const pane = $('props');
   const sel = state.selection;
-  const digest = JSON.stringify([sel, sel && (sel.kind === 'op' ? opByName(sel.name) : chByName(sel.name)), state.doc.spec.operations.map((o) => o.name), state.doc.spec.channels.map((c) => c.name)]);
+  const digest = JSON.stringify([sel, sel && (sel.kind === 'op' ? opByName(sel.name) : chByName(sel.name)), state.doc.spec.operations.map((o) => o.name), state.doc.spec.channels.map((c) => c.name), state.capacity.on, sel ? state.capacity.records[sel.name] : 0, state.capacity.load]);
   if (digest === state.propsDigest && pane.firstChild) return;
   state.propsDigest = digest;
   pane.textContent = '';
@@ -2872,6 +2950,19 @@ function renderChProps(pane, c) {
     c.feedback ? field('max epochs', textInput(fb.maxEpochs, (v) => { const n = Number(v); if (Number.isFinite(n) && n >= 1) c.feedback.maxEpochs = n; change(); }, { number: true, min: 1 }), 'p-ch-epochs') : null,
     c.feedback ? field('overflow', selectInput([['', 'none'], ...others], fb.overflow || '', (v) => { if (v) c.feedback.overflow = v; else delete c.feedback.overflow; change(); }), 'p-ch-overflow') : null,
   ]));
+
+  if (state.capacity.on) {
+    const rec = state.capacity.records[c.name];
+    pane.appendChild(group('capacity (planning)', [
+      field('records', textInput(rec == null ? '' : rec, (v) => {
+        if (v.trim() === '') delete state.capacity.records[c.name];
+        else state.capacity.records[c.name] = Math.max(0, Math.floor(Number(v)) || 0);
+        persistCapacity();
+        state.digest = '';
+        afterModelChange('canvas');
+      }, { number: true, min: 0, placeholder: `default ${state.capacity.load}` }), 'p-ch-records'),
+    ]));
+  }
 
   const actions = document.createElement('div');
   actions.className = 'group actions';
@@ -3009,6 +3100,23 @@ $('wl-ns').addEventListener('change', () => { const v = $('wl-ns').value.trim();
 $('btn-add').addEventListener('click', () => { addOperation(null); });
 $('btn-layout').addEventListener('click', autoLayout);
 $('btn-fit').addEventListener('click', () => { state.userView = false; fitView(); });
+
+$('btn-capacity').addEventListener('click', () => {
+  state.capacity.on = !state.capacity.on;
+  $('btn-capacity').setAttribute('aria-pressed', state.capacity.on ? 'true' : 'false');
+  $('cap-load').hidden = !state.capacity.on;
+  persistCapacity();
+  state.digest = ''; state.propsDigest = '';
+  renderCanvas();
+  renderProps();
+});
+$('cap-load-input').addEventListener('input', () => {
+  state.capacity.load = Math.max(0, Math.floor(Number($('cap-load-input').value) || 0));
+  persistCapacity();
+  state.digest = ''; state.propsDigest = '';
+  renderCanvas();
+  renderProps();
+});
 
 function autoLayout() { state.pinned = {}; state.userView = false; afterModelChange('canvas'); }
 
@@ -3153,6 +3261,18 @@ setupPicker($('type-cd'), $('type-trigger'), $('type-list'), applyTypeface);
 applyTypeface(load('typeface', 'inconsolata'));
 for (const b of document.querySelectorAll('.size-seg button')) b.addEventListener('click', () => applySize(b.dataset.size));
 applySize(load('fontsize', 'm'));
+
+const savedCap = load('capacity', null);
+if (savedCap && typeof savedCap === 'object') {
+  state.capacity = {
+    on: !!savedCap.on,
+    load: Number.isFinite(Number(savedCap.load)) ? Number(savedCap.load) : 1000,
+    records: savedCap.records && typeof savedCap.records === 'object' ? savedCap.records : {},
+  };
+}
+$('btn-capacity').setAttribute('aria-pressed', state.capacity.on ? 'true' : 'false');
+$('cap-load').hidden = !state.capacity.on;
+$('cap-load-input').value = String(state.capacity.load);
 
 
 // A host that stamps data-theme="dark" or "light" on the root before this
