@@ -300,6 +300,14 @@ func (r *Reconciler) ensureCoordinator(ctx context.Context, wl *v1alpha1.Workloa
 			Name:    "coordinator",
 			Image:   image,
 			Command: []string{"/coordinator"},
+			// The coordinator serves the segments of external channels. It
+			// announces the coordinator Service's DNS name so worker pods
+			// reach it the same way they reach the control API, rather than
+			// its own pod hostname, which cluster DNS does not resolve.
+			Env: []corev1.EnvVar{{
+				Name:  "STARK8S_SEGMENT_ADDR",
+				Value: fmt.Sprintf("%s.%s.svc:%d", coordinatorName(wl), wl.Namespace, coordinator.SegmentPort),
+			}},
 			Ports: []corev1.ContainerPort{
 				{ContainerPort: coordinator.ControlPort, Name: "control"},
 				{ContainerPort: coordinator.SegmentPort, Name: "segments"},
