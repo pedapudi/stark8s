@@ -1,0 +1,85 @@
+# An agent graph. Each operation is one agent or tool with its own pod pool;
+# each channel is one edge of the graph. The two tool-call loops close on
+# Asynchronous feedback channels, so every thread (record key) iterates on
+# its own schedule and a thread whose loop count reaches maxEpochs is
+# diverted to an overflow channel. Channels with only one end are the
+# interface to the outside: prompts and human replies enter; answers,
+# questions for a human, and stuck threads leave.
+apiVersion: stark8s.io/v1alpha1
+kind: Workload
+metadata:
+  name: agent-loop
+spec:
+  operations:
+    - name: agent
+      completion: Never
+      scaling:
+        horizontal: {min: 1, max: 8, targetBacklogPerReplica: 4}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/agent-loop", "agent"]
+    - name: search
+      completion: Never
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/agent-loop", "search"]
+    - name: calc
+      completion: Never
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/agent-loop", "calc"]
+  channels:
+    # Every channel is hash-partitioned on the thread key with the same
+    # partition count, so all records of one thread reach one agent replica.
+    - name: prompts                      # external ingress: new threads
+      to: agent
+      partitioning: {mode: Hash, partitions: 16}
+    - name: to-search                    # agent asks the search tool
+      from: agent
+      to: search
+      partitioning: {mode: Hash, partitions: 16}
+    - name: to-calc                      # agent asks the calculator tool
+      from: agent
+      to: calc
+      partitioning: {mode: Hash, partitions: 16}
+    - name: search-results               # tool result closes the loop
+      from: search
+      to: agent
+      partitioning: {mode: Hash, partitions: 16}
+      feedback: {mode: Asynchronous, maxEpochs: 12, overflow: stuck-search}
+    - name: calc-results                 # tool result closes the loop
+      from: calc
+      to: agent
+      partitioning: {mode: Hash, partitions: 16}
+      feedback: {mode: Asynchronous, maxEpochs: 12, overflow: stuck-calc}
+    - name: ask-human                    # interrupt: the thread waits outside
+      from: agent
+      partitioning: {mode: Hash, partitions: 16}
+      durability: Retained
+    - name: human                        # resume: a human reply re-enters
+      to: agent
+      partitioning: {mode: Hash, partitions: 16}
+    - name: answers                      # final answers, read from outside
+      from: agent
+      partitioning: {mode: Hash, partitions: 16}
+      durability: Retained
+    - name: stuck-search                 # threads that hit the search loop bound
+      from: search
+      partitioning: {mode: Hash, partitions: 16}
+      durability: Retained
+    - name: stuck-calc                   # threads that hit the calc loop bound
+      from: calc
+      partitioning: {mode: Hash, partitions: 16}
+      durability: Retained
