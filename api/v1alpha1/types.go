@@ -135,10 +135,6 @@ type HorizontalScaling struct {
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
 	Max int32 `json:"max,omitempty"`
-	// TargetBacklogPerReplica scales the operation so that the sum of pending
-	// records on its inbound channels divided by replicas stays near this
-	// value. Zero disables backlog scaling.
-	TargetBacklogPerReplica int32 `json:"targetBacklogPerReplica,omitempty"`
 	// CPUUtilizationPercent creates a HorizontalPodAutoscaler on CPU. Only
 	// applies to operations with completion Never. Zero disables it.
 	CPUUtilizationPercent int32 `json:"cpuUtilizationPercent,omitempty"`

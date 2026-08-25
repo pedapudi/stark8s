@@ -139,8 +139,7 @@ runnable tasks, the count is `min`, raised to one for operations that must
 be present to make progress on their own: sources (no inbound channels) and
 consumers of at least one Pipelined channel. A consumer whose inbound
 channels are all Materialized may sit at zero replicas until work is
-pending. `scaling.horizontal.targetBacklogPerReplica` has no effect under
-this mapping.
+pending.
 
 The same formula chooses the initial replica count when a gated operation
 is first created, so a stage consuming a sealed shuffle starts with

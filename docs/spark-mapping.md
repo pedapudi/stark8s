@@ -21,7 +21,7 @@ something Spark's own execution model handles differently.
 | `coalesce` without shuffle | fewer consumer replicas on a round-robin channel |
 | task | one record batch delivered to one replica |
 | executor pool | one pool per operation instead of one per job |
-| dynamic allocation | `scaling.horizontal` with `targetBacklogPerReplica` |
+| dynamic allocation | `scaling.horizontal` bounds with replicas sized from runnable partitions per `slots` |
 | executor memory and cores | the operation's pod template resources, per stage |
 | action (`collect`, `save`) | a sink operation, or a channel with no consumer read from outside |
 | iterative algorithm (MLlib, GraphX Pregel) | a feedback channel with `maxEpochs` |
@@ -37,10 +37,10 @@ scan B ──┘
 
 ```yaml
 operations:
-  - {name: scan-a,    scaling: {horizontal: {min: 4, max: 64, targetBacklogPerReplica: 1000}}, template: ...}
-  - {name: scan-b,    scaling: {horizontal: {min: 4, max: 64, targetBacklogPerReplica: 1000}}, template: ...}
-  - {name: join,      scaling: {horizontal: {min: 8, max: 200, targetBacklogPerReplica: 5000}}, template: ...}   # memory-heavy template
-  - {name: aggregate, scaling: {horizontal: {min: 2, max: 50,  targetBacklogPerReplica: 20000}}, template: ...}
+  - {name: scan-a,    scaling: {horizontal: {min: 4, max: 64}}, template: ...}
+  - {name: scan-b,    scaling: {horizontal: {min: 4, max: 64}}, template: ...}
+  - {name: join,      scaling: {horizontal: {min: 8, max: 200}}, template: ...}   # memory-heavy template
+  - {name: aggregate, scaling: {horizontal: {min: 2, max: 50}}, template: ...}
   - {name: write,     scaling: {horizontal: {min: 1, max: 8}}, template: ...}
 channels:
   - {name: a-by-k, from: scan-a, to: join,      partitioning: {mode: Hash, partitions: 200}, delivery: Materialized}
