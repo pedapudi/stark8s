@@ -14,9 +14,12 @@ directly: a Spark stage becomes an operation, a shuffle becomes a
 materialized hash-partitioned channel, and an iterative algorithm becomes a
 feedback channel instead of a loop unrolled in a driver program.
 
-Status: a working local runtime. The controller, the channel runtime (the
-"exchange"), the worker SDK, and two example workloads run end to end on a
-kind cluster. The exchange keeps state in memory only; see
+Status: a working local runtime. Records move pod to pod: a producer pod
+writes segments locally and serves them over HTTP, and a consumer pod
+fetches them directly; a per-workload coordinator holds only metadata
+(topology, pod registry, partition ownership, segment index, seals, loop
+epochs). The controller, the coordinator, the worker SDK, and two example
+workloads run end to end on a kind cluster. See
 [Limitations](#limitations).
 
 ## The model in one example
@@ -88,19 +91,22 @@ the generated policies are enforced.
 |---|---|
 | `api/v1alpha1` | the Workload type and generated CRD schema |
 | `pkg/controller` | reconciler: Workload to Kubernetes resources |
-| `pkg/exchange` | the channel runtime and its HTTP API |
-| `pkg/sdk` | worker library: poll, process, acknowledge, supersteps |
-| `cmd/controller`, `cmd/exchange` | binaries |
+| `pkg/coordinator` | the control-plane protocol (`api.go`) and the coordinator server |
+| `pkg/exchange` | the earlier brokered in-memory channel runtime, kept only while `pkg/controller` still imports it |
+| `pkg/sdk` | worker library: local segments, fetch, process, acknowledge, supersteps |
+| `cmd/controller`, `cmd/coordinator` | binaries |
 | `examples/wordcount`, `examples/pagerank` | acyclic and cyclic examples |
 | `config/crd`, `config/manager` | install manifests |
 | `hack` | local cluster scripts |
 
 ## Limitations
 
-- The exchange holds records in memory on one pod. Restarting it loses all
-  unconsumed records and the workload must be resubmitted. Durable channel
-  transports (a remote shuffle service, object storage, a log broker) are
-  the intended replacement and are the first production gap.
+- Segments live on the pod that produced them. When that pod expires before
+  a consumer acknowledged them, the segments are marked lost and counted in
+  the channel's `lost` metric; the consumer is not blocked, but the
+  producing task is not re-executed, so the records are gone. The
+  coordinator keeps its index in memory only; restarting it loses the
+  segment index and the workload must be resubmitted.
 - Delivery is at-least-once. A consumer that expires has its unacknowledged
   records redelivered to another replica; application state on the expired
   replica is lost. There is no state checkpointing.

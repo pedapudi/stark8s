@@ -31,19 +31,34 @@ const (
 	// is enabled the coordinator derives the operation from the bearer
 	// token's ServiceAccount instead and rejects a mismatching header.
 	OperationHeader = "X-Stark8s-Operation"
+	// RecordsNextHeader on a GET records response is the log offset following
+	// the last record scanned, to pass as `after` on the next call.
+	RecordsNextHeader = "X-Stark8s-Next"
 
-	PathTopology   = "/topology"         // PUT  []v1alpha1.Channel
-	PathMetrics    = "/metrics"          // GET  Metrics
-	PathHealth     = "/healthz"          // GET
-	PathRegister   = "/pods/register"    // POST PodRegistration (also the heartbeat; repeat every 5s)
-	PathSourceDone = "/pods/source-done" // POST PodRegistration: a source pod has emitted everything
+	PathTopology = "/topology"      // PUT  []v1alpha1.Channel; GET -> []v1alpha1.Channel (pods read partitioning and feedback settings)
+	PathMetrics  = "/metrics"       // GET  Metrics
+	PathHealth   = "/healthz"       // GET
+	PathRegister = "/pods/register" // POST PodRegistration (also the heartbeat; repeat every 5s)
+	// PathSourceDone: the pod has emitted everything it will emit. Source
+	// pods post it after their Source handler; Drain pods post it after
+	// their inbound channels drained and their final flush completed. An
+	// operation is Complete only when every live pod has posted it.
+	PathSourceDone = "/pods/source-done" // POST PodRegistration
+	// PathReleased lists segments a holder pod may delete: Ephemeral segments
+	// it announced that every consumer has acknowledged. The coordinator
+	// forgets each segment once it has been listed.
+	PathReleased = "/pods/released" // GET ?pod= -> []string (segment IDs)
 	// Channel-scoped paths are PathChannels + "/" + name + suffix.
-	PathChannels      = "/channels"
-	SuffixSegments    = "/segments"   // POST []SegmentAnnouncement (producer)
-	SuffixConsume     = "/consume"    // GET ?pod=&max= -> ConsumeResponse
-	SuffixAck         = "/ack"        // POST []SegmentAck
-	SuffixSeal        = "/seal"       // POST
-	SuffixEpochDone   = "/epoch-done" // POST ?pod=&epoch=  (Synchronous feedback)
+	PathChannels    = "/channels"
+	SuffixSegments  = "/segments"   // POST []SegmentAnnouncement (producer)
+	SuffixConsume   = "/consume"    // GET ?pod=&max= -> ConsumeResponse
+	SuffixAck       = "/ack"        // POST []SegmentAck
+	SuffixSeal      = "/seal"       // POST
+	SuffixEpochDone = "/epoch-done" // POST ?pod=&epoch=  (Synchronous feedback)
+	// GET records returns []Record from offset `after` in the channel's retained
+	// log (filtered by key when given), long-polling up to `wait` for new
+	// records; the response header RecordsNextHeader carries the offset to
+	// pass as `after` on the next call.
 	SuffixRecords     = "/records"    // POST []Record (external producer); GET ?key=&after=&wait= (external consumer)
 	SuffixOperationsD = "/operations" // reserved
 )
@@ -89,6 +104,10 @@ type SegmentAnnouncement struct {
 	Holder    string `json:"holder"` // host:port of the segment server
 	Producer  string `json:"producer"`
 	Task      TaskID `json:"task"`
+	// Overflowed counts records the producer dropped at the loop bound of
+	// an Asynchronous feedback channel (no Overflow channel declared). An
+	// announcement with an empty ID and Overflowed > 0 reports drops only.
+	Overflowed int64 `json:"overflowed,omitempty"`
 }
 
 // SegmentRef is a segment a consumer should fetch.
@@ -150,8 +169,9 @@ type OperationMetrics struct {
 	// RunnableTasks is the number of owned-or-unowned partitions with pending
 	// segments (per current epoch for Synchronous loops).
 	RunnableTasks int32 `json:"runnableTasks"`
-	// Complete: every inbound channel is sealed and drained (for sources:
-	// every registered pod reported source-done), and nothing is in flight.
+	// Complete: every inbound channel is sealed and drained, nothing is in
+	// flight, and every live registered pod (at least one) has reported
+	// done on PathSourceDone.
 	Complete bool `json:"complete"`
 	// HoldsUnconsumed: pods of this operation hold Ephemeral segments that
 	// consumers have not acknowledged. The controller must keep the pods.
