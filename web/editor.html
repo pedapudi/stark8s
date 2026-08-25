@@ -1371,7 +1371,6 @@ function opEffective(o) {
     slots: o.slots == null ? DEFAULTS.slots : o.slots,
     min: h.min == null ? DEFAULTS.hmin : h.min,
     max: h.max == null ? DEFAULTS.hmax : h.max,
-    backlog: h.targetBacklogPerReplica || 0,
     cpu: h.cpuUtilizationPercent || 0,
     vertical: (o.scaling && o.scaling.vertical && o.scaling.vertical.mode) || 'Off',
   };
@@ -1542,6 +1541,9 @@ return { YAMLError, parseYAML, emitYAML, toYAML, fromYAML, blankWorkload, normal
 # Map/shuffle/reduce. "shuffle" is a Materialized Hash channel: reduce is not
 # started until map has completed, and each reduce replica owns a fixed set of
 # key partitions — the stage barrier and exchange of a Spark shuffle.
+#
+# Replica counts follow the coordinator's count of runnable partitions:
+# replicas = clamp(ceil(runnableTasks / slots), min, max).
 apiVersion: stark8s.io/v1alpha1
 kind: Workload
 metadata:
@@ -1557,8 +1559,9 @@ spec:
               imagePullPolicy: IfNotPresent
               command: ["/wordcount", "read"]
     - name: map
+      slots: 2
       scaling:
-        horizontal: {min: 1, max: 4, targetBacklogPerReplica: 300}
+        horizontal: {min: 1, max: 4}
       template:
         spec:
           containers:
@@ -1567,8 +1570,9 @@ spec:
               imagePullPolicy: IfNotPresent
               command: ["/wordcount", "map"]
     - name: reduce
+      slots: 2
       scaling:
-        horizontal: {min: 1, max: 3, targetBacklogPerReplica: 4000}
+        horizontal: {min: 1, max: 3}
       template:
         spec:
           containers:
@@ -1589,12 +1593,13 @@ spec:
       delivery: Materialized
     - name: totals
       from: reduce
-      # No consumer: results are read from outside through the exchange API.
+      # No consumer: results are read from outside through the coordinator API.
 </script>
 <script class="example" type="text/plain" data-name="pagerank">
 # PageRank as a cyclic graph. "contrib" is a feedback channel: it loops from
 # rank back into rank, records carry an epoch, and epoch e+1 is released only
 # after every rank replica has finished epoch e (bulk-synchronous supersteps).
+# rank runs two replicas over four hash partitions, two partitions each.
 apiVersion: stark8s.io/v1alpha1
 kind: Workload
 metadata:
@@ -1612,6 +1617,7 @@ spec:
     - name: rank
       scaling:
         horizontal: {min: 2, max: 2}
+      slots: 2
       template:
         spec:
           containers:
@@ -1632,6 +1638,93 @@ spec:
       feedback: {maxEpochs: 20}
     - name: ranks
       from: rank
+</script>
+<script class="example" type="text/plain" data-name="agent-loop">
+# An agent graph. Each operation is one agent or tool with its own pod pool;
+# each channel is one edge of the graph. The two tool-call loops close on
+# Asynchronous feedback channels, so every thread (record key) iterates on
+# its own schedule and a thread whose loop count reaches maxEpochs is
+# diverted to an overflow channel. Channels with only one end are the
+# interface to the outside: prompts and human replies enter; answers,
+# questions for a human, and stuck threads leave.
+apiVersion: stark8s.io/v1alpha1
+kind: Workload
+metadata:
+  name: agent-loop
+spec:
+  operations:
+    - name: agent
+      completion: Never
+      scaling:
+        horizontal: {min: 1, max: 8}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/agent-loop", "agent"]
+    - name: search
+      completion: Never
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/agent-loop", "search"]
+    - name: calc
+      completion: Never
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/agent-loop", "calc"]
+  channels:
+    # Every channel is hash-partitioned on the thread key with the same
+    # partition count, so all records of one thread reach one agent replica.
+    - name: prompts                      # external ingress: new threads
+      to: agent
+      partitioning: {mode: Hash, partitions: 16}
+    - name: to-search                    # agent asks the search tool
+      from: agent
+      to: search
+      partitioning: {mode: Hash, partitions: 16}
+    - name: to-calc                      # agent asks the calculator tool
+      from: agent
+      to: calc
+      partitioning: {mode: Hash, partitions: 16}
+    - name: search-results               # tool result closes the loop
+      from: search
+      to: agent
+      partitioning: {mode: Hash, partitions: 16}
+      feedback: {mode: Asynchronous, maxEpochs: 12, overflow: stuck-search}
+    - name: calc-results                 # tool result closes the loop
+      from: calc
+      to: agent
+      partitioning: {mode: Hash, partitions: 16}
+      feedback: {mode: Asynchronous, maxEpochs: 12, overflow: stuck-calc}
+    - name: ask-human                    # interrupt: the thread waits outside
+      from: agent
+      partitioning: {mode: Hash, partitions: 16}
+      durability: Retained
+    - name: human                        # resume: a human reply re-enters
+      to: agent
+      partitioning: {mode: Hash, partitions: 16}
+    - name: answers                      # final answers, read from outside
+      from: agent
+      partitioning: {mode: Hash, partitions: 16}
+      durability: Retained
+    - name: stuck-search                 # threads that hit the search loop bound
+      from: search
+      partitioning: {mode: Hash, partitions: 16}
+      durability: Retained
+    - name: stuck-calc                   # threads that hit the calc loop bound
+      from: calc
+      partitioning: {mode: Hash, partitions: 16}
+      durability: Retained
 </script>
 
 <script>
@@ -1874,8 +1967,8 @@ const MARK_TEXT = {
   Broadcast: ['Broadcast partitioning', 'every consumer replica receives every record'],
   Materialized: ['Materialized delivery', 'a stage barrier: nothing is delivered until the producer has completed, and the consumer is not started before then'],
   Retained: ['Retained durability', 'records are kept after acknowledgement, so the channel can be replayed or read from outside'],
-  Drain: ['Drain completion', 'finishes once every inbound channel is sealed and consumed; realised as a Job'],
-  Never: ['Never completes', 'runs until the workload is deleted; realised as a Deployment'],
+  Drain: ['Drain completion', 'finishes once every inbound channel is sealed and consumed; its Deployment is then scaled to zero'],
+  Never: ['Never completes', 'runs until the workload is deleted'],
 };
 
 function phaseGlyph(phase) {
@@ -1986,7 +2079,7 @@ function renderCanvas() {
     if (e.kind === 'source') {
       const s = e.unknownFrom
         ? hov(el('g', { class: 'mark-hit', transform: `translate(${e.glyph.x},${e.glyph.y})`, tabindex: 0, role: 'img', 'aria-label': 'unknown producer' }), `unknown producer "${c.from}"`, c.name, 'no operation of this name is declared')
-        : hov(el('g', { class: 'mark-hit', transform: `translate(${e.glyph.x},${e.glyph.y})`, tabindex: 0, role: 'img', 'aria-label': 'external producer' }), 'external producer', c.name, 'records are produced from outside the workload through the exchange API');
+        : hov(el('g', { class: 'mark-hit', transform: `translate(${e.glyph.x},${e.glyph.y})`, tabindex: 0, role: 'img', 'aria-label': 'external producer' }), 'external producer', c.name, 'records are produced from outside the workload through the coordinator API');
       s.appendChild(el('circle', { r: 6, class: 'glyph filled' }));
       s.appendChild(el('circle', { r: 1.6, class: 'glyph', fill: 'currentColor' }));
       g.appendChild(s);
@@ -1995,7 +2088,7 @@ function renderCanvas() {
     if (e.kind === 'sink') {
       const s = e.unknownTo
         ? hov(el('g', { class: 'mark-hit', transform: `translate(${e.glyph.x},${e.glyph.y})`, tabindex: 0, role: 'img', 'aria-label': 'unknown consumer' }), `unknown consumer "${c.to}"`, c.name, 'no operation of this name is declared')
-        : hov(el('g', { class: 'mark-hit', transform: `translate(${e.glyph.x},${e.glyph.y})`, tabindex: 0, role: 'img', 'aria-label': 'external consumer' }), 'external consumer', c.name, 'records are read from outside the workload through the exchange API; such channels are always retained');
+        : hov(el('g', { class: 'mark-hit', transform: `translate(${e.glyph.x},${e.glyph.y})`, tabindex: 0, role: 'img', 'aria-label': 'external consumer' }), 'external consumer', c.name, 'records are read from outside the workload through the coordinator API; such channels are always retained');
       s.appendChild(el('circle', { r: 6, class: 'glyph filled' }));
       s.appendChild(el('line', { x1: -3, y1: 0, x2: 3, y2: 0, class: 'glyph' }));
       g.appendChild(s);
@@ -2483,7 +2576,6 @@ function renderOpProps(pane, o) {
       r.appendChild(textInput(h.min, (v) => { numOrDelete(scaling(), 'min', v); tidyScaling(); change(); }, { number: true, min: 0, placeholder: 'min 1' }));
       r.appendChild(textInput(h.max, (v) => { numOrDelete(scaling(), 'max', v); tidyScaling(); change(); }, { number: true, min: 1, placeholder: 'max 1' }));
       return r; })()),
-    field('backlog', textInput(h.targetBacklogPerReplica, (v) => { numOrDelete(scaling(), 'targetBacklogPerReplica', v, { zeroDeletes: true }); tidyScaling(); change(); }, { number: true, min: 0, placeholder: 'per replica · 0 off' }), 'p-op-backlog'),
     field('cpu %', textInput(h.cpuUtilizationPercent, (v) => { numOrDelete(scaling(), 'cpuUtilizationPercent', v, { zeroDeletes: true }); tidyScaling(); change(); }, { number: true, min: 0, placeholder: 'Never only · 0 off' }), 'p-op-cpu'),
     field('vertical', selectInput([['', 'default (Off)'], ['Off', 'Off'], ['Initial', 'Initial'], ['Auto', 'Auto']], (o.scaling && o.scaling.vertical && o.scaling.vertical.mode) || '', (v) => { o.scaling = o.scaling || {}; if (v) o.scaling.vertical = { mode: v }; else delete o.scaling.vertical; tidyScaling(); change(); }), 'p-op-vertical'),
   ]));
@@ -2804,8 +2896,13 @@ for (const t of THEMES) {
 }
 setupPicker($('theme-cd'), $('theme-trigger'), $('theme-list'), applyTheme);
 
+// A host that stamps data-theme="dark" or "light" on the root before this
+// runs names a mode rather than a zicato theme; it selects the matching
+// default until the viewer picks one.
 const storedTheme = load('theme', null);
-applyTheme(storedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'google-dark' : 'google-light'));
+const hostStamp = document.documentElement.getAttribute('data-theme');
+const wantsDark = hostStamp === 'dark' || (hostStamp !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
+applyTheme(storedTheme || (wantsDark ? 'google-dark' : 'google-light'));
 applyScale(load('scale', 100));
 $('scale-range').addEventListener('input', () => applyScale(Number($('scale-range').value)));
 $('scale-reset').addEventListener('click', () => applyScale(100));

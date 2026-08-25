@@ -37,8 +37,8 @@ const expected = {
     spec: {
       operations: [
         { name: 'read', template: { spec: { containers: [container(['/wordcount', 'read'])] } } },
-        { name: 'map', scaling: { horizontal: { min: 1, max: 4, targetBacklogPerReplica: 300 } }, template: { spec: { containers: [container(['/wordcount', 'map'])] } } },
-        { name: 'reduce', scaling: { horizontal: { min: 1, max: 3, targetBacklogPerReplica: 4000 } }, template: { spec: { containers: [container(['/wordcount', 'reduce'])] } } },
+        { name: 'map', scaling: { horizontal: { min: 1, max: 4 } }, template: { spec: { containers: [container(['/wordcount', 'map'])] } } },
+        { name: 'reduce', scaling: { horizontal: { min: 1, max: 3 } }, template: { spec: { containers: [container(['/wordcount', 'reduce'])] } } },
       ],
       channels: [
         { name: 'lines', from: 'read', to: 'map', partitioning: { mode: 'RoundRobin', partitions: 8 }, delivery: 'Pipelined' },
