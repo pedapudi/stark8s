@@ -1,0 +1,115 @@
+# stark8s
+
+stark8s is a Kubernetes extension for workloads that are graphs. A workload
+is a set of operations connected by channels. Each operation is one logical
+computation backed by its own pool of pods, scaled horizontally and
+vertically on its own. Each channel is a directed flow of records between
+two operations and states how those records are partitioned, when they are
+delivered, and whether they are kept. Cycles are allowed: a channel that
+closes a cycle is marked as feedback and is executed as a sequence of
+bulk-synchronous supersteps.
+
+The target is to express shuffle-based engines such as Apache Spark
+directly: a Spark stage becomes an operation, a shuffle becomes a
+materialized hash-partitioned channel, and an iterative algorithm becomes a
+feedback channel instead of a loop unrolled in a driver program.
+
+Status: a working local runtime. The controller, the channel runtime (the
+"exchange"), the worker SDK, and two example workloads run end to end on a
+kind cluster. The exchange keeps state in memory only; see
+[Limitations](#limitations).
+
+## The model in one example
+
+```yaml
+apiVersion: stark8s.io/v1alpha1
+kind: Workload
+metadata:
+  name: wordcount
+spec:
+  operations:
+    - name: read                       # source: no inbound channels
+      template: {spec: {containers: [{name: main, image: stark8s:dev, command: ["/wordcount", "read"]}]}}
+    - name: map
+      scaling: {horizontal: {min: 1, max: 4, targetBacklogPerReplica: 300}}
+      template: {spec: {containers: [{name: main, image: stark8s:dev, command: ["/wordcount", "map"]}]}}
+    - name: reduce
+      scaling: {horizontal: {min: 1, max: 3, targetBacklogPerReplica: 4000}}
+      template: {spec: {containers: [{name: main, image: stark8s:dev, command: ["/wordcount", "reduce"]}]}}
+  channels:
+    - {name: lines,   from: read,   to: map,    partitioning: {mode: RoundRobin, partitions: 8}, delivery: Pipelined}
+    - {name: shuffle, from: map,    to: reduce, partitioning: {mode: Hash, partitions: 6},       delivery: Materialized}
+    - {name: totals,  from: reduce}                # no consumer: read from outside
+```
+
+`map` starts as soon as `read` produces lines and scales on the backlog of
+`lines`. `reduce` is not started until `map` has completed, because
+`shuffle` is Materialized; when it starts, its parallelism is chosen from
+the size of the sealed shuffle, and each replica owns a fixed set of hash
+partitions, so every count for a word lands on one replica.
+
+A cyclic example, PageRank with a feedback channel from `rank` to itself, is
+in [examples/pagerank](examples/pagerank/workload.yaml).
+
+## Running locally
+
+Requirements: docker, kind, kubectl, Go 1.23.
+
+```sh
+hack/local-up.sh
+```
+
+This creates a kind cluster, builds one image containing the controller,
+the exchange, and the examples, installs the CRD and controller, runs both
+example workloads to completion, and prints their results. `hack/local-up.sh
+--no-examples` installs without running the examples;
+`hack/results.sh <workload> <channel>` prints the retained records of a
+channel; `hack/local-down.sh` deletes the cluster.
+
+Kind's default network plugin does not enforce NetworkPolicy. Run with
+`STARK8S_CNI=calico hack/local-up.sh` to create the cluster with Calico so
+the generated policies are enforced.
+
+## Documents
+
+- [docs/design.md](docs/design.md) — the model, its three primitives, and
+  the review that reduced the edge vocabulary to one kind of edge.
+- [docs/kubernetes-mapping.md](docs/kubernetes-mapping.md) — how a Workload
+  becomes Deployments, Jobs, Services, NetworkPolicies, and autoscalers,
+  and how the pieces find each other.
+- [docs/spark-mapping.md](docs/spark-mapping.md) — how a Spark physical
+  plan maps onto a Workload, and what the mapping exposes.
+- [docs/precedent.md](docs/precedent.md) — prior systems and papers, and
+  what this design takes from each.
+
+## Layout
+
+| path | contents |
+|---|---|
+| `api/v1alpha1` | the Workload type and generated CRD schema |
+| `pkg/controller` | reconciler: Workload to Kubernetes resources |
+| `pkg/exchange` | the channel runtime and its HTTP API |
+| `pkg/sdk` | worker library: poll, process, acknowledge, supersteps |
+| `cmd/controller`, `cmd/exchange` | binaries |
+| `examples/wordcount`, `examples/pagerank` | acyclic and cyclic examples |
+| `config/crd`, `config/manager` | install manifests |
+| `hack` | local cluster scripts |
+
+## Limitations
+
+- The exchange holds records in memory on one pod. Restarting it loses all
+  unconsumed records and the workload must be resubmitted. Durable channel
+  transports (a remote shuffle service, object storage, a log broker) are
+  the intended replacement and are the first production gap.
+- Delivery is at-least-once. A consumer that expires has its unacknowledged
+  records redelivered to another replica; application state on the expired
+  replica is lost. There is no state checkpointing.
+- Hash partitions are assigned to consumer replicas on first contact and
+  stay there. Adding replicas to a hash-partitioned consumer after all
+  partitions are owned has no effect, so `partitions` should be at least
+  the maximum replica count.
+- The graph can be edited while a workload runs (the controller pushes the
+  channel list on every pass and creates operations on demand), but
+  removing an operation or channel from a running workload is not handled.
+- Vertical scaling emits a VerticalPodAutoscaler only when that API is
+  installed; the local scripts do not install it.
