@@ -75,11 +75,26 @@ spec:
                       properties:
                         maxEpochs:
                           description: |-
-                            MaxEpochs bounds the loop. When the consuming operation finishes epoch
-                            MaxEpochs-1 the channel is sealed and held records are discarded.
+                            MaxEpochs bounds the loop. Synchronous: when the consuming operation
+                            finishes epoch MaxEpochs-1 the channel is sealed. Asynchronous: a
+                            record whose epoch reaches MaxEpochs is diverted to Overflow, or
+                            dropped and counted when Overflow is empty.
                           format: int32
                           minimum: 1
                           type: integer
+                        mode:
+                          default: Synchronous
+                          description: FeedbackMode says how a loop is synchronised.
+                          enum:
+                          - Synchronous
+                          - Asynchronous
+                          type: string
+                        overflow:
+                          description: |-
+                            Overflow names a channel that receives records exceeding MaxEpochs on
+                            an Asynchronous loop. It must be a channel with no consumer or one
+                            consumed by another operation.
+                          type: string
                       required:
                       - maxEpochs
                       type: object
@@ -125,13 +140,14 @@ spec:
                   - name
                   type: object
                 type: array
-              exchange:
-                description: ExchangeSpec configures the per-workload exchange that
-                  hosts channels.
+              coordinator:
+                description: |-
+                  CoordinatorSpec configures the per-workload coordinator that tracks
+                  partition ownership, segment locations, seals, and epochs.
                 properties:
                   image:
-                    description: Image of the exchange server. Defaults to the controller's
-                      own image.
+                    description: Image of the coordinator server. Defaults to the
+                      controller's own image.
                     type: string
                 type: object
               operations:
@@ -204,6 +220,14 @@ spec:
                               type: string
                           type: object
                       type: object
+                    slots:
+                      default: 1
+                      description: |-
+                        Slots is how many partitions one replica processes concurrently. The
+                        controller sizes the replica count as runnable tasks divided by slots.
+                      format: int32
+                      minimum: 1
+                      type: integer
                     template:
                       description: |-
                         Template is the pod template for this operation's replicas. The
@@ -8233,17 +8257,29 @@ spec:
             properties:
               channels:
                 items:
-                  description: ChannelStatus reports one channel, from exchange metrics.
+                  description: ChannelStatus reports one channel, from coordinator
+                    metrics.
                   properties:
                     epoch:
-                      description: Epoch is the current superstep of a feedback channel.
+                      description: Epoch is the current superstep of a Synchronous
+                        feedback channel.
                       format: int32
                       type: integer
                     inFlight:
                       format: int64
                       type: integer
+                    lost:
+                      description: Lost counts segments whose holder pod expired before
+                        consumption.
+                      format: int64
+                      type: integer
                     name:
                       type: string
+                    overflowed:
+                      description: Overflowed counts records diverted or dropped at
+                        the loop bound.
+                      format: int64
+                      type: integer
                     pending:
                       format: int64
                       type: integer
@@ -8266,6 +8302,11 @@ spec:
                 items:
                   description: OperationStatus reports one operation.
                   properties:
+                    holdsUnconsumed:
+                      description: |-
+                        HoldsUnconsumed: the operation's pods still hold segments that a
+                        consumer has not fetched, so they are kept after completion.
+                      type: boolean
                     name:
                       type: string
                     phase:
@@ -8275,6 +8316,11 @@ spec:
                       format: int32
                       type: integer
                     replicas:
+                      format: int32
+                      type: integer
+                    runnableTasks:
+                      description: RunnableTasks is the number of partitions with
+                        unconsumed input.
                       format: int32
                       type: integer
                   required:

@@ -249,7 +249,7 @@ func (r *Reconciler) exchangeURL(wl *v1alpha1.Workload) string {
 
 func (r *Reconciler) ensureExchange(ctx context.Context, wl *v1alpha1.Workload) error {
 	labels := map[string]string{LabelWorkload: wl.Name, LabelRole: "exchange"}
-	image := wl.Spec.Exchange.Image
+	image := wl.Spec.Coordinator.Image
 	if image == "" {
 		image = r.ExchangeImage
 	}

@@ -72,14 +72,37 @@ type Partitioning struct {
 	Partitions int32 `json:"partitions,omitempty"`
 }
 
+// FeedbackMode says how a loop is synchronised.
+type FeedbackMode string
+
+const (
+	// FeedbackSynchronous runs the loop as bulk-synchronous supersteps: one
+	// global epoch, and epoch e+1 is delivered only after every consumer has
+	// finished epoch e. Suited to iterative algorithms such as PageRank.
+	FeedbackSynchronous FeedbackMode = "Synchronous"
+	// FeedbackAsynchronous runs the loop without a barrier. The epoch is
+	// carried per record and incremented each time the record crosses the
+	// feedback channel, so each key iterates on its own schedule. Suited to
+	// agent loops where each conversation is an independent thread.
+	FeedbackAsynchronous FeedbackMode = "Asynchronous"
+)
+
 // Feedback marks a channel as closing a cycle and defines the loop it drives.
-// Records on a feedback channel carry an epoch. Epoch e+1 is delivered only
-// after every consumer has finished epoch e (bulk-synchronous supersteps).
+// Records on a feedback channel carry an epoch.
 type Feedback struct {
-	// MaxEpochs bounds the loop. When the consuming operation finishes epoch
-	// MaxEpochs-1 the channel is sealed and held records are discarded.
+	// +kubebuilder:default=Synchronous
+	// +kubebuilder:validation:Enum=Synchronous;Asynchronous
+	Mode FeedbackMode `json:"mode,omitempty"`
+	// MaxEpochs bounds the loop. Synchronous: when the consuming operation
+	// finishes epoch MaxEpochs-1 the channel is sealed. Asynchronous: a
+	// record whose epoch reaches MaxEpochs is diverted to Overflow, or
+	// dropped and counted when Overflow is empty.
 	// +kubebuilder:validation:Minimum=1
 	MaxEpochs int32 `json:"maxEpochs"`
+	// Overflow names a channel that receives records exceeding MaxEpochs on
+	// an Asynchronous loop. It must be a channel with no consumer or one
+	// consumed by another operation.
+	Overflow string `json:"overflow,omitempty"`
 }
 
 // Channel is a directed information flow between two operations. It is the
@@ -158,19 +181,25 @@ type Operation struct {
 	Template corev1.PodTemplateSpec `json:"template"`
 	// +kubebuilder:default={horizontal:{min:1,max:1}}
 	Scaling Scaling `json:"scaling,omitempty"`
+	// Slots is how many partitions one replica processes concurrently. The
+	// controller sizes the replica count as runnable tasks divided by slots.
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	Slots int32 `json:"slots,omitempty"`
 }
 
-// ExchangeSpec configures the per-workload exchange that hosts channels.
-type ExchangeSpec struct {
-	// Image of the exchange server. Defaults to the controller's own image.
+// CoordinatorSpec configures the per-workload coordinator that tracks
+// partition ownership, segment locations, seals, and epochs.
+type CoordinatorSpec struct {
+	// Image of the coordinator server. Defaults to the controller's own image.
 	Image string `json:"image,omitempty"`
 }
 
 // WorkloadSpec is the graph.
 type WorkloadSpec struct {
-	Operations []Operation  `json:"operations"`
-	Channels   []Channel    `json:"channels,omitempty"`
-	Exchange   ExchangeSpec `json:"exchange,omitempty"`
+	Operations  []Operation     `json:"operations"`
+	Channels    []Channel       `json:"channels,omitempty"`
+	Coordinator CoordinatorSpec `json:"coordinator,omitempty"`
 }
 
 // OperationPhase is the lifecycle state of one operation.
@@ -190,17 +219,26 @@ type OperationStatus struct {
 	Phase    OperationPhase `json:"phase"`
 	Replicas int32          `json:"replicas"`
 	Ready    int32          `json:"ready"`
+	// RunnableTasks is the number of partitions with unconsumed input.
+	RunnableTasks int32 `json:"runnableTasks,omitempty"`
+	// HoldsUnconsumed: the operation's pods still hold segments that a
+	// consumer has not fetched, so they are kept after completion.
+	HoldsUnconsumed bool `json:"holdsUnconsumed,omitempty"`
 }
 
-// ChannelStatus reports one channel, from exchange metrics.
+// ChannelStatus reports one channel, from coordinator metrics.
 type ChannelStatus struct {
 	Name     string `json:"name"`
 	Sealed   bool   `json:"sealed"`
 	Pending  int64  `json:"pending"`
 	InFlight int64  `json:"inFlight"`
 	Produced int64  `json:"produced"`
-	// Epoch is the current superstep of a feedback channel.
+	// Epoch is the current superstep of a Synchronous feedback channel.
 	Epoch int32 `json:"epoch,omitempty"`
+	// Overflowed counts records diverted or dropped at the loop bound.
+	Overflowed int64 `json:"overflowed,omitempty"`
+	// Lost counts segments whose holder pod expired before consumption.
+	Lost int64 `json:"lost,omitempty"`
 }
 
 // WorkloadPhase is the lifecycle state of the whole graph.
