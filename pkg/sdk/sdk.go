@@ -26,6 +26,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -461,6 +462,9 @@ func (w *Worker) do(method, path string, body []byte, out any) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		return errSealed
+	}
 	if resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(msg)))
@@ -585,8 +589,11 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 		if err := h.Source(ctx, w); err != nil {
 			return err
 		}
-		if err := w.retry(ctx, w.Flush); err != nil {
+		if err := w.retry(ctx, w.Flush); err != nil && !errors.Is(err, errSealed) {
 			return err
+		} else if err != nil {
+			log.Printf("%s: output channel already sealed; source output was produced by an earlier pod", w.Instance)
+			w.buffers = map[bufKey][]wireRecord{}
 		}
 		if err := w.retry(ctx, w.reportDone); err != nil {
 			return err
@@ -730,11 +737,19 @@ func (w *Worker) heartbeat(ctx context.Context) {
 	}
 }
 
+// errSealed is returned by a produce call on a sealed channel. A restarted
+// source pod sees it when the operation already completed; the work is
+// not repeated.
+var errSealed = errors.New("channel is sealed")
+
 func (w *Worker) retry(ctx context.Context, f func() error) error {
 	var err error
 	for i := 0; i < 30 && ctx.Err() == nil; i++ {
 		if err = f(); err == nil {
 			return nil
+		}
+		if errors.Is(err, errSealed) {
+			return err
 		}
 		log.Printf("coordinator call failed (attempt %d): %v", i+1, err)
 		time.Sleep(time.Second)

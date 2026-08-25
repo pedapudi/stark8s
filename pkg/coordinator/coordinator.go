@@ -48,6 +48,10 @@ type operation struct {
 	pods map[string]*pod
 	// owner maps "partitions/p" -> pod name.
 	owner map[string]string
+	// completed latches Complete: once every input is drained and every
+	// live pod has reported done, the operation stays complete even after
+	// its pods are scaled away, so the controller never restarts it.
+	completed bool
 }
 
 func (o *operation) liveIDs() []string {
@@ -1088,6 +1092,9 @@ func (co *Coordinator) operationMetrics(name string) OperationMetrics {
 			complete = false
 		}
 	}
-	om.Complete = complete
+	if complete {
+		o.completed = true
+	}
+	om.Complete = o.completed
 	return om
 }
