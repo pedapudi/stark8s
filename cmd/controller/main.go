@@ -16,8 +16,8 @@ import (
 )
 
 func main() {
-	var exchangeImage string
-	flag.StringVar(&exchangeImage, "exchange-image", os.Getenv("STARK8S_EXCHANGE_IMAGE"), "image used for per-workload exchanges")
+	var coordinatorImage string
+	flag.StringVar(&coordinatorImage, "coordinator-image", os.Getenv("STARK8S_COORDINATOR_IMAGE"), "image used for per-workload coordinators")
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
 
@@ -30,7 +30,7 @@ func main() {
 		ctrl.Log.Error(err, "manager")
 		os.Exit(1)
 	}
-	r := &controller.Reconciler{Client: mgr.GetClient(), ExchangeImage: exchangeImage, ControllerNamespace: controller.Namespace()}
+	r := &controller.Reconciler{Client: mgr.GetClient(), CoordinatorImage: coordinatorImage, ControllerNamespace: controller.Namespace()}
 	if err := r.SetupWithManager(mgr); err != nil {
 		ctrl.Log.Error(err, "setup")
 		os.Exit(1)

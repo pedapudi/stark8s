@@ -1,6 +1,7 @@
 # PageRank as a cyclic graph. "contrib" is a feedback channel: it loops from
 # rank back into rank, records carry an epoch, and epoch e+1 is released only
 # after every rank replica has finished epoch e (bulk-synchronous supersteps).
+# rank runs two replicas over four hash partitions, two partitions each.
 apiVersion: stark8s.io/v1alpha1
 kind: Workload
 metadata:
@@ -18,6 +19,7 @@ spec:
     - name: rank
       scaling:
         horizontal: {min: 2, max: 2}
+      slots: 2
       template:
         spec:
           containers:
