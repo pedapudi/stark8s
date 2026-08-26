@@ -150,3 +150,54 @@ broadcast channel per `BroadcastExchangeExec`, and a sink for each action.
 Resource shapes per stage come from the planner's statistics or from a
 previous run's VerticalPodAutoscaler recommendations. Such a tool is not
 part of this repository; the mapping above is its specification.
+
+## reduceByKey and the map-side combine
+
+`rdd.reduceByKey(f)` is two things: a combine applied on the map side, before
+anything crosses the network, and an aggregation applied on the reduce side
+after the shuffle. Spark fuses them because it is handed one associative
+function and can place it on both sides.
+
+A channel expresses the first half directly:
+
+```yaml
+- name: shuffle
+  from: map
+  to: reduce
+  partitioning: {mode: Hash, partitions: 6}
+  delivery: Materialized
+  combine: Sum
+```
+
+The producer now folds every record sharing a key as it buffers, so a `map`
+stage that emits one `(word, 1)` per occurrence puts one record per distinct
+word on the wire. The reduction is in records, not bytes, and on this engine
+records are what cost: a producer flushes and acknowledges per segment, so
+shipping one record per fact is the difference between a workload that runs and
+one that spends all its time in control-plane round trips.
+
+The consumer still aggregates. `combine` folds within one producer's buffer,
+and the same key generally arrives from every producer, so the consuming
+operation writes the same `OnRecord` accumulation it would have written
+otherwise. What changes is how much reaches it.
+
+Four functions are available: `Sum`, `Min`, `Max`, and `Count`. `Count` ignores
+the emitted value, so a word count can emit `nil` and let the channel do the
+counting.
+
+The function must be associative and commutative — the producer applies it to
+whatever subset of a key's records happens to be buffered together, and a flush
+can split that subset at any point.
+
+### Min and Max are idempotent, and that buys something
+
+Delivery is at-least-once, so a segment can be redelivered. If the consumer
+applies the channel's own function, `Min` and `Max` give the same answer however
+many times a record arrives, and no deduplication is needed. `Sum` and `Count`
+do not: a redelivered record double-counts, and in an iterative program the
+error compounds across supersteps. `CombineMode.Idempotent()` reports which is
+which, so a program can assert the property it depends on rather than assume it.
+
+This is why a label-propagation connected-components job (`Min` over vertex
+labels) needs no deduplication machinery, while a PageRank job (`Sum` over rank
+contributions) does.
