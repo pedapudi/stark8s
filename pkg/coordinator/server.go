@@ -26,6 +26,15 @@ func Handler(co *Coordinator) http.Handler {
 	mux.HandleFunc("GET "+PathTopology, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, co.Topology())
 	})
+	mux.HandleFunc("PUT "+PathOperations, func(w http.ResponseWriter, r *http.Request) {
+		var specs []OperationSpec
+		if err := json.NewDecoder(r.Body).Decode(&specs); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		co.SetOperations(specs)
+		w.WriteHeader(204)
+	})
 	mux.HandleFunc("GET "+PathMetrics, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, co.Metrics())
 	})

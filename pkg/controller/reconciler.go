@@ -159,6 +159,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 	}
 
+	// Publish the replica counts. The coordinator needs them to tell a
+	// Broadcast segment that every replica has read from one that only the
+	// replicas started so far have read.
+	if err := r.pushOperations(ctx, wl, opStatus); err != nil {
+		logger.Info("operation push failed", "err", err.Error())
+	}
+
 	// Refresh metrics after sealing so status reflects this pass.
 	if m, err := r.metrics(ctx, wl); err == nil {
 		metrics = m
@@ -376,6 +383,28 @@ func (r *Reconciler) metrics(ctx context.Context, wl *v1alpha1.Workload) (metric
 		v.operations[o.Name] = o
 	}
 	return v, nil
+}
+
+// pushOperations publishes the replica count of every operation. A gated
+// operation has no Deployment yet and is published as zero, which holds its
+// producers' segments rather than freeing them.
+func (r *Reconciler) pushOperations(ctx context.Context, wl *v1alpha1.Workload, ops []v1alpha1.OperationStatus) error {
+	specs := make([]coordinator.OperationSpec, 0, len(ops))
+	for _, o := range ops {
+		specs = append(specs, coordinator.OperationSpec{Name: o.Name, Replicas: o.Replicas})
+	}
+	body, _ := json.Marshal(specs)
+	req, _ := http.NewRequestWithContext(ctx, "PUT", r.coordinatorURL(wl)+coordinator.PathOperations, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := r.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("operation push: %s", resp.Status)
+	}
+	return nil
 }
 
 func (r *Reconciler) seal(ctx context.Context, wl *v1alpha1.Workload, channel string) error {
