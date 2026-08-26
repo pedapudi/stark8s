@@ -31,6 +31,7 @@ which serves them on the same segment API.
 | `scaling.vertical` on a `Never` operation | VerticalPodAutoscaler, only when the `autoscaling.k8s.io` API is installed | `<workload>-<operation>` |
 | each channel with both a producer and a consumer | NetworkPolicy | `<workload>-edge-<channel>` |
 | operation pods as a group | NetworkPolicy | `<workload>-operations` |
+| each operation that declares `egress` | NetworkPolicy | `<workload>-egress-<operation>` |
 | the coordinator | NetworkPolicy | `<workload>-coordinator` |
 
 Every resource carries an owner reference to the Workload, so deleting the
@@ -164,9 +165,10 @@ consumer should be at most that value.
 
 ## Networking
 
-NetworkPolicy restricts which pods can open connections. Three kinds of
+NetworkPolicy restricts which pods can open connections. Four kinds of
 policy are created; together they permit exactly the connections the
-execution model requires.
+execution model requires, plus whatever reach outside the workload an
+operation has asked for.
 
 **`<workload>-edge-<channel>`**, one per channel that has both a producer
 and a consumer. It selects the producer operation's pods and permits
@@ -181,6 +183,28 @@ declares both policy types, and permits egress to the coordinator pods on
 ports 8080 and 8090, egress to any operation pod of the same workload on
 port 8090, and egress to DNS (port 53, UDP and TCP). It grants no ingress,
 so ingress to an operation pod is permitted only by an edge policy.
+
+**`<workload>-egress-<operation>`**, one per operation whose spec declares
+`egress`. It selects that operation's pods alone, declares only the egress
+policy type, and adds one rule per declared destination. Network policies are
+additive, so these rules widen that operation's reach and leave every other
+operation on the rules above. An operation that declares nothing gets no such
+policy.
+
+Two destinations exist. `Metadata` permits TCP port 80 to `169.254.169.254/32`,
+the link-local address the instance metadata server answers on, which is how a
+pod obtains an identity token. `Internet` permits TCP port 443 to `0.0.0.0/0`
+with the three RFC 1918 blocks and the link-local range in `except`. Those
+exceptions are what stop a grant to reach outside from also reaching every pod
+and service in the cluster, which would undo the per-edge isolation the other
+policies exist for. A cluster whose pod or service network falls outside the
+RFC 1918 blocks needs its own range added to `privateRanges` in the
+reconciler; nothing in the API can discover it.
+
+The declaration sits on the operation rather than on the workload, so one
+vertex of the graph may reach outside while its neighbours may not, and a
+reader can see which ones do. Removing the declaration deletes the policy;
+egress policies are found through the `stark8s.io/operation` label.
 
 **`<workload>-coordinator`** selects the coordinator pod and permits
 ingress on ports 8080 and 8090 from the workload's operation pods and from

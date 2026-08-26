@@ -204,6 +204,17 @@ func Validate(s *v1alpha1.WorkloadSpec) error {
 		if o.Slots < 0 {
 			return fmt.Errorf("operation %q: slots must be at least 1", o.Name)
 		}
+		for _, e := range o.Egress {
+			switch e.To {
+			case v1alpha1.EgressMetadata, v1alpha1.EgressInternet:
+			default:
+				// Rejected here rather than ignored, so that a typo is a
+				// failure to admit the workload instead of a pod that cannot
+				// open a connection for reasons nothing explains.
+				return fmt.Errorf("operation %q: unknown egress destination %q, want one of %q or %q",
+					o.Name, e.To, v1alpha1.EgressMetadata, v1alpha1.EgressInternet)
+			}
+		}
 	}
 	chans := map[string]bool{}
 	for _, c := range s.Channels {
@@ -686,6 +697,60 @@ func edgePolicyName(wl *v1alpha1.Workload, channel string) string {
 	return wl.Name + "-edge-" + channel
 }
 
+// egressPolicyName is the policy that carries one operation's declared reach
+// outside the workload.
+func egressPolicyName(wl *v1alpha1.Workload, op string) string {
+	return wl.Name + "-egress-" + op
+}
+
+// metadataCIDR is the link-local address the instance metadata server answers
+// on. It is the same address across the cloud providers that offer one.
+const metadataCIDR = "169.254.169.254/32"
+
+// privateRanges are the addresses an Internet grant must not reach. The three
+// RFC 1918 blocks cover cluster pod and service networks on every deployment
+// this has been used on. Link-local is excluded as well, so that asking for
+// the internet does not also hand over the metadata server: that is a
+// separate destination and has to be asked for by name.
+//
+// A cluster whose pod or service network sits outside these ranges would need
+// its own block listed here. Nothing in the API can discover that, so it is
+// stated rather than derived.
+var privateRanges = []string{
+	"10.0.0.0/8",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"169.254.0.0/16",
+}
+
+// egressRulesFor turns an operation's declared destinations into policy
+// rules. An operation that declares none gets none, which leaves it with
+// exactly the rules the shared operations policy already grants.
+func egressRulesFor(op v1alpha1.Operation) []networkingv1.NetworkPolicyEgressRule {
+	tcp := corev1.ProtocolTCP
+	http := intstr.FromInt(80)
+	https := intstr.FromInt(443)
+	var out []networkingv1.NetworkPolicyEgressRule
+	for _, e := range op.Egress {
+		switch e.To {
+		case v1alpha1.EgressMetadata:
+			out = append(out, networkingv1.NetworkPolicyEgressRule{
+				To:    []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: metadataCIDR}}},
+				Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &http}},
+			})
+		case v1alpha1.EgressInternet:
+			out = append(out, networkingv1.NetworkPolicyEgressRule{
+				To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{
+					CIDR:   "0.0.0.0/0",
+					Except: append([]string(nil), privateRanges...),
+				}}},
+				Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &https}},
+			})
+		}
+	}
+	return out
+}
+
 func (r *Reconciler) ensureNetworkPolicies(ctx context.Context, wl *v1alpha1.Workload) error {
 	workloadPods := metav1.LabelSelector{MatchLabels: map[string]string{LabelWorkload: wl.Name, LabelRole: RoleOperation}}
 	coordinatorPods := metav1.LabelSelector{MatchLabels: coordinatorLabels(wl)}
@@ -739,6 +804,36 @@ func (r *Reconciler) ensureNetworkPolicies(ctx context.Context, wl *v1alpha1.Wor
 		return err
 	}
 
+	// One policy per operation that declared egress. Network policies are
+	// additive, so this grants the extra destinations to that operation's
+	// pods alone and leaves the shared operations policy above untouched. An
+	// operation that declared nothing gets no policy here and so keeps
+	// exactly the reach it had before this field existed.
+	wantEgress := map[string]bool{}
+	for i := range wl.Spec.Operations {
+		op := wl.Spec.Operations[i]
+		rules := egressRulesFor(op)
+		if len(rules) == 0 {
+			continue
+		}
+		wantEgress[op.Name] = true
+		selector := metav1.LabelSelector{MatchLabels: map[string]string{
+			LabelWorkload: wl.Name, LabelRole: RoleOperation, LabelOperation: op.Name,
+		}}
+		np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: egressPolicyName(wl, op.Name), Namespace: wl.Namespace}}
+		if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, np, func() error {
+			np.Labels = map[string]string{LabelWorkload: wl.Name, LabelOperation: op.Name}
+			np.Spec = networkingv1.NetworkPolicySpec{
+				PodSelector: selector,
+				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
+				Egress:      rules,
+			}
+			return controllerutil.SetControllerReference(wl, np, r.Scheme())
+		}); err != nil {
+			return err
+		}
+	}
+
 	// One policy per edge: the consumer's pods may open the producer's
 	// segment port.
 	wanted := map[string]bool{}
@@ -773,8 +868,17 @@ func (r *Reconciler) ensureNetworkPolicies(ctx context.Context, wl *v1alpha1.Wor
 	}
 	for i := range list.Items {
 		np := &list.Items[i]
-		ch, isEdge := np.Labels[LabelChannel]
-		if !isEdge || wanted[ch] {
+		if ch, isEdge := np.Labels[LabelChannel]; isEdge {
+			if wanted[ch] {
+				continue
+			}
+		} else if op, isEgress := np.Labels[LabelOperation]; isEgress {
+			// An operation that gave up its egress declaration loses the
+			// policy, so the grant does not outlive the spec that asked for it.
+			if wantEgress[op] {
+				continue
+			}
+		} else {
 			continue
 		}
 		if err := r.Delete(ctx, np); client.IgnoreNotFound(err) != nil {
