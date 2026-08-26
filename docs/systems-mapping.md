@@ -503,6 +503,35 @@ checkpointing and no lineage re-execution.
 **Time.** No event time, no watermark, no windowing. The epoch on a record
 counts loop iterations and has no relation to wall-clock or event-clock time.
 
+**An operation triggered by both data and time.** An operation is driven either
+by records or by nothing, and never by a clock. `Run` calls the `Source` handler
+only when the operation has no inbound channels (`pkg/sdk/sdk.go:584`), and
+`Handlers` offers exactly `Source`, `OnRecord`, `OnEpochEnd` and `OnDrain`
+(`pkg/sdk/sdk.go:62-75`), none of which fires on an interval. So an operation
+with an inbound channel has nowhere to run a poll loop, and one without an
+inbound channel cannot be configured from the graph.
+
+Every external source wants both at once: poll a feed, a queue or an API on an
+interval, while taking the set of things to poll for from a channel other
+operations can write. That shape cannot be declared. Worse, the obvious attempt
+deadlocks rather than failing. Give such an operation an inbound channel with no
+producing operation, and nothing ever seals that channel. A channel reports
+drained only once it is sealed (`pkg/coordinator/coordinator.go:812`), and any
+undrained inbound channel clears `allDrained` (`pkg/sdk/sdk.go:659`). So the
+operation never reaches `OnDrain` and never reports done, and every operation
+behind a Materialized edge waits on it forever.
+
+The workaround is to keep the operation a source and have it read its
+configuration through the external consumer API, polling
+`GET /channels/<name>/records?after=<cursor>` inside its own loop. That works
+and preserves the behaviour, at the cost of the configuration edge no longer
+being an edge: the channel is declared with neither endpoint, so the graph no
+longer shows what feeds the operation. Closing this needs either a timer
+handler, or lifting the `len(w.Inbound) == 0` gate so a `Source` can coexist
+with inbound channels. The second is the smaller change, and the question it
+raises is what should drain an operation whose `Source` has returned while its
+inbound channels remain open.
+
 **A second reader on a channel.** An edge is either internal or externally
 readable. Consumer groups, compaction and retention all sit behind that.
 
