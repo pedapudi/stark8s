@@ -1,0 +1,88 @@
+# Fan out a chunked scan over a pool of workers, then gather the results.
+#
+# Written with futures, this would be a driver that holds a big array, puts a
+# shared calibration table into the object store, submits one task per chunk,
+# and waits on the list of futures. Here "plan" emits the chunk descriptors,
+# "scan" is the task pool, and the gather is two properties of the "hits"
+# channel: its Hash partitioning routes each result to a reducer, and its
+# drain says when every result is in. Nothing waits on futures, and no driver
+# process exists at run time.
+#
+# See examples/tilescan/main.go for the four things the translation has to
+# replace, and for what the Broadcast table costs here that it does not cost
+# in a shared-memory object store.
+apiVersion: stark8s.io/v1alpha1
+kind: Workload
+metadata:
+  name: tilescan
+spec:
+  operations:
+    # Exactly one replica: every replica of a source operation runs its
+    # Source handler independently, so more than one would duplicate the
+    # work list.
+    - name: plan
+      scaling:
+        horizontal: {min: 1, max: 1}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/tilescan", "plan"]
+    # The task pool. The replica count follows the runnable partitions of
+    # "tiles". A Ray cluster does the same thing by adding workers when the
+    # pending-task queue grows.
+    - name: scan
+      slots: 1
+      scaling:
+        horizontal: {min: 1, max: 8}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/tilescan", "scan"]
+    - name: reduce
+      slots: 1
+      scaling:
+        horizontal: {min: 1, max: 4}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/tilescan", "reduce"]
+  channels:
+    # The shared object. Broadcast gives every consuming replica its own full
+    # copy of the calibration table. A futures runtime would instead hand each
+    # task a pointer into a shared-memory store, so this is the one place the
+    # translation costs memory: the bill grows with the replica count.
+    - name: calib
+      from: plan
+      to: scan
+      partitioning: {mode: Broadcast, partitions: 1}
+      delivery: Pipelined
+    # The work queue. A tile has no key affinity, so RoundRobin spreads the
+    # tiles evenly. The partition count is the ceiling on scan's useful
+    # parallelism.
+    - name: tiles
+      from: plan
+      to: scan
+      partitioning: {mode: RoundRobin, partitions: 8}
+      delivery: Pipelined
+    # The gather. Hash on the band sends every result for a band to one
+    # reducer, so the summary needs no second reduction. Materialized holds
+    # reduce back until scan has finished, which is the barrier the driver's
+    # get(futures) imposes.
+    - name: hits
+      from: scan
+      to: reduce
+      partitioning: {mode: Hash, partitions: 4}
+      delivery: Materialized
+    # No consumer: the summaries are read from outside through the
+    # coordinator API.
+    - name: regions
+      from: reduce
