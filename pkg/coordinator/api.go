@@ -35,9 +35,15 @@ const (
 	// the last record scanned, to pass as `after` on the next call.
 	RecordsNextHeader = "X-Stark8s-Next"
 
-	PathTopology = "/topology"      // PUT  []v1alpha1.Channel; GET -> []v1alpha1.Channel (pods read partitioning and feedback settings)
-	PathMetrics  = "/metrics"       // GET  Metrics
-	PathHealth   = "/healthz"       // GET
+	PathTopology = "/topology" // PUT  []v1alpha1.Channel; GET -> []v1alpha1.Channel (pods read partitioning and feedback settings)
+	PathMetrics  = "/metrics"  // GET  Metrics
+	PathHealth   = "/healthz"  // GET
+	// PathEditor serves the graph editor, which draws the workload and
+	// overlays what the coordinator observes. It reads PathTopology once for
+	// the graph and polls PathMetrics for the overlay, so viewing a running
+	// workload needs a port-forward and nothing else. The route is read-only
+	// and is registered for GET alone.
+	PathEditor   = "/editor"        // GET  text/html
 	PathRegister = "/pods/register" // POST PodRegistration (also the heartbeat; repeat every 5s)
 	// PathSourceDone: the pod has emitted everything it will emit. Source
 	// pods post it after their Source handler; Drain pods post it after

@@ -975,8 +975,9 @@ button[aria-pressed="true"] { background: var(--v2-rule-soft); color: var(--v2-i
       <section class="pane" aria-label="observed status">
         <div class="pane-head">
           <h2 class="eyebrow">status</h2>
-          <span class="hint mono pane-note" style="padding:0">paste kubectl get workload -o yaml</span>
+          <span class="hint mono pane-note" id="status-hint" style="padding:0">paste kubectl get workload -o yaml</span>
           <span class="spacer"></span>
+          <button id="btn-coord-load" hidden>load graph</button>
           <button id="btn-status-clear">clear</button>
         </div>
         <textarea id="status" class="mono" spellcheck="false" aria-label="observed workload status yaml" wrap="off"></textarea>
@@ -1661,8 +1662,111 @@ function expectedShape(doc, opName, recordsOf) {
   return { source: false, runnable, raw, replicas, clamp, slots: e.slots, min: e.min, max: e.max };
 }
 
+
+// ---------- reading a coordinator's view of a running workload ----------
+
+// apiBase is the path a page served at `pathname` should prefix its control
+// API calls with: the address with the last segment removed, so /editor gives
+// "" and /some/prefix/editor gives "/some/prefix". A page opened from the file
+// system has no origin to ask and gets null, which is how the viewer decides
+// there is nothing to connect to.
+function apiBase(protocol, pathname) {
+  if (protocol !== 'http:' && protocol !== 'https:') return null;
+  return String(pathname || '').replace(/\/[^/]*$/, '');
+}
+
+// observedChannel keeps the fields the model uses and drops the empty ones, so
+// the document reads like a workload somebody wrote rather than like a
+// serialisation. The values are the EFFECTIVE ones the coordinator holds,
+// which is why a channel can show a partitioning its author left out.
+function observedChannel(c) {
+  const out = { name: c.name };
+  if (c.from) out.from = c.from;
+  if (c.to) out.to = c.to;
+  if (c.partitioning && (c.partitioning.mode || c.partitioning.partitions)) out.partitioning = Object.assign({}, c.partitioning);
+  if (c.delivery) out.delivery = c.delivery;
+  if (c.durability) out.durability = c.durability;
+  if (c.feedback) out.feedback = Object.assign({}, c.feedback);
+  return out;
+}
+
+// observedDocument builds a Workload from what a coordinator knows.
+//
+// It knows the channels exactly. It does NOT know the pod templates, the
+// scaling bounds, or the workload's own name, because those live on the custom
+// resource and never reach it. So each operation carries its name alone and
+// the document is left unnamed rather than given an invented one. Operations
+// are ordered by first mention in the channel list, then by any the metrics
+// name that no channel does, so the same input always gives the same document.
+function observedDocument(topology, metrics) {
+  const names = [];
+  const seen = new Set();
+  const add = (n) => { if (n && !seen.has(n)) { seen.add(n); names.push(n); } };
+  for (const c of topology || []) { add(c.from); add(c.to); }
+  for (const o of (metrics && metrics.operations) || []) add(o.name);
+  const doc = blankWorkload();
+  delete doc.metadata.name;
+  doc.spec.operations = names.map((n) => ({ name: n }));
+  doc.spec.channels = (topology || []).map(observedChannel);
+  return doc;
+}
+
+// SEEDS name where the document on screen came from, which is the only thing
+// that decides whether a coordinator may replace it.
+const SEEDS = { example: 'example', restored: 'restored', user: 'user' };
+
+// coordinatorMayAdopt answers whether the coordinator's graph may replace what
+// is on screen.
+//
+// The test is what would be LOST, and the trap is that "is the document empty"
+// does not answer it. The page loads a built-in example during start-up, so by
+// the time an asynchronous connection has resolved the document is never
+// empty, and an emptiness check defends the example as though a reader had
+// written it. So the seed is recorded instead: an untouched example may be
+// replaced, a document restored from storage or edited by hand may not, and an
+// empty document may be replaced whatever its seed, because there is nothing
+// in it to lose.
+function coordinatorMayAdopt(seed, doc) {
+  const spec = (doc && doc.spec) || {};
+  if (!(spec.operations || []).length && !(spec.channels || []).length) return true;
+  return seed === SEEDS.example;
+}
+
+// observedStatus translates a coordinator's metrics into the shape the overlay
+// reads.
+//
+// The channel counters map one for one. The operation fields do not. A
+// coordinator has no notion of a phase, and the pods it counts are the ones
+// that registered with it, which is neither the replica count the controller
+// asked for nor Kubernetes readiness. So phase, ready and replicas are left
+// unset, the phase glyph does not draw, and what it does know is reported
+// under its own names. An overlay that shows less truthfully beats one that
+// fills the gaps by guessing.
+function observedStatus(m) {
+  return {
+    operations: ((m && m.operations) || []).map((o) => ({
+      name: o.name,
+      livePods: o.livePods,
+      runnableTasks: o.runnableTasks,
+      complete: o.complete,
+      holdsUnconsumed: o.holdsUnconsumed,
+    })),
+    channels: ((m && m.channels) || []).map((c) => ({
+      name: c.name,
+      sealed: c.sealed,
+      pending: c.pending,
+      inFlight: c.inFlight,
+      produced: c.produced,
+      epoch: c.epoch,
+      overflowed: c.overflowed,
+      lost: c.lost,
+    })),
+  };
+}
+
 return { YAMLError, parseYAML, emitYAML, toYAML, fromYAML, blankWorkload, normalize, validate, layout,
-  opEffective, chEffective, subLine, nodeWidth, deepEqual, clone, roundTrip, expectedShape, busyPartitions, DEFAULTS, NODE_H };
+  opEffective, chEffective, subLine, nodeWidth, deepEqual, clone, roundTrip, expectedShape, busyPartitions, DEFAULTS, NODE_H,
+  apiBase, observedChannel, observedDocument, observedStatus, coordinatorMayAdopt, SEEDS };
 })();
 </script>
 
@@ -2073,6 +2177,7 @@ const state = {
   pinned: {},           // operation name -> {x, y} for dragged nodes
   selection: null,      // {kind: 'op'|'ch', name}
   status: null,         // parsed observed status, or null
+  seed: Core.SEEDS.example, // where doc came from: example, restored, or user
   view: null,           // {x, y, w, h} viewBox; null means fit
   userView: false,
   digest: '',
@@ -2409,7 +2514,17 @@ function renderCanvas() {
       if (cap.source) subEl.appendChild(document.createTextNode(' · source'));
     } else {
       let subText = Core.subLine(eff);
-      if (st && st.replicas != null) subText += ` · ${st.ready == null ? st.replicas : st.ready}/${st.replicas}`;
+      if (st && st.replicas != null) {
+        subText += ` · ${st.ready == null ? st.replicas : st.ready}/${st.replicas}`;
+      } else if (st && st.livePods != null) {
+        // The coordinator counts the pods that have registered with it and
+        // have not expired. That is not the same figure as the replicas the
+        // controller asked for, nor as readiness, so it is drawn under its
+        // own name rather than in the ready/replicas slot.
+        subText += ` · ${st.livePods} live`;
+        if (st.runnableTasks) subText += ` · ${st.runnableTasks} runnable`;
+        if (st.complete) subText += ' · complete';
+      }
       subEl.appendChild(document.createTextNode(subText));
     }
     g.appendChild(subEl);
@@ -2501,6 +2616,10 @@ function note(text) {
 // ---------- model changes ----------
 
 function afterModelChange(source) {
+  // Anything that changes the model makes the document the reader's, so a
+  // coordinator connecting a moment later leaves it alone. A status update
+  // changes no part of the document and does not count.
+  if (source !== 'status') state.seed = Core.SEEDS.user;
   if (source !== 'yaml') {
     const text = Core.toYAML(state.doc);
     if (text !== state.yamlText) { state.yamlText = text; $('yaml').value = text; refreshHl(); }
@@ -3002,13 +3121,19 @@ function applyYamlText() {
   }
 }
 
-function loadYaml(text, resetView) {
+// seed names where this document came from; see Core.coordinatorMayAdopt. It
+// is set HERE rather than by the caller because applying the text runs through
+// afterModelChange, which marks the document as the reader's — so an
+// assignment before the call is overwritten and one after it is easy to
+// forget. Anything loaded without a stated seed is the reader's.
+function loadYaml(text, resetView, seed) {
   $('yaml').value = text;
   refreshHl();
   state.pinned = {};
   state.selection = null;
   if (resetView) state.userView = false;
   applyYamlText();
+  state.seed = seed || Core.SEEDS.user;
 }
 
 $('btn-copy').addEventListener('click', () => copyText(state.yamlText || $('yaml').value));
@@ -3089,6 +3214,121 @@ function applyStatusText() {
   }
   afterModelChange('status');
 }
+
+// ---------- the coordinator, when one is serving this page ----------
+
+// A coordinator holds everything this page needs to show a running workload:
+// the channel graph on /topology and the observed counters on /metrics. When
+// the page is served from one, it reads the graph once and then polls the
+// counters, so viewing a live workload is a port-forward and nothing else.
+//
+// Whether a coordinator is there is DETECTED, never configured. Opened from
+// the file system, or served by a plain static file server, the first fetch
+// fails and the page carries on exactly as it always has. Every request is a
+// GET, and the page never posts anything back.
+
+const COORD_POLL_MS = 2000;
+const COORD_TOPOLOGY = '/topology';
+const COORD_METRICS = '/metrics';
+const coord = { base: null, live: false, timer: null, at: null, misses: 0 };
+
+async function coordFetch(path) {
+  const resp = await fetch(coord.base + path, { headers: { accept: 'application/json' }, cache: 'no-store' });
+  if (!resp.ok) throw new Error(`${path}: ${resp.status}`);
+  return resp.json();
+}
+
+// refreshOverlay redraws the observed state and NOTHING else.
+//
+// afterModelChange cannot be used here. It regenerates the YAML from the
+// model and writes it back into the pane, and the pane may be holding text
+// the reader typed and formatted, including comments the model does not
+// carry. That is harmless when a human triggers it and destructive on a
+// timer. renderCanvas is gated on a digest of the model and the status, so an
+// unchanged poll costs one comparison and does not touch the drawing or the
+// viewport.
+function refreshOverlay() {
+  renderCanvas();
+  renderStatus();
+}
+
+function coordNote(text) {
+  const noteEl = $('status-note');
+  noteEl.classList.remove('bad');
+  noteEl.textContent = text;
+}
+
+function coordApply(m) {
+  // A pasted document is the reader's own choice of what to look at, so it
+  // wins over the live feed until it is cleared.
+  if ($('status').value.trim()) return false;
+  state.status = Core.observedStatus(m);
+  refreshOverlay();
+  return true;
+}
+
+async function coordPoll() {
+  let m;
+  try {
+    m = await coordFetch(COORD_METRICS);
+  } catch (err) {
+    coord.misses++;
+    // One missed poll is a hiccup; three in a row is worth saying, and the
+    // last overlay stays on the drawing rather than blanking.
+    if (coord.misses === 3) coordNote('lost contact with the coordinator · showing the last reading');
+    return;
+  }
+  coord.misses = 0;
+  coord.at = new Date();
+  if (coordApply(m)) {
+    const n = state.status.channels.length;
+    coordNote(`live · ${n} channel${n === 1 ? '' : 's'} · ${coord.at.toLocaleTimeString()}`);
+  }
+}
+
+async function coordConnect() {
+  const base = Core.apiBase(location.protocol, location.pathname);
+  if (base === null) return;
+  coord.base = base;
+  let topology, metrics;
+  try {
+    [topology, metrics] = await Promise.all([coordFetch(COORD_TOPOLOGY), coordFetch(COORD_METRICS)]);
+  } catch (err) {
+    return; // nothing is serving the control API here; stay standalone
+  }
+  if (!Array.isArray(topology)) return;
+
+  coord.live = true;
+  $('status-hint').textContent = 'live from the coordinator';
+  $('btn-coord-load').hidden = false;
+
+  // Take over the document only when there is nothing to lose. A reader who
+  // arrives with work in progress, restored from storage or typed, keeps it
+  // and can press "load graph" instead.
+  if (Core.coordinatorMayAdopt(state.seed, state.doc)) coordLoadGraph(topology, metrics);
+  coord.at = new Date();
+  if (coordApply(metrics)) {
+    const n = state.status.channels.length;
+    coordNote(`live · ${n} channel${n === 1 ? '' : 's'} · ${coord.at.toLocaleTimeString()}`);
+  }
+  coord.timer = setInterval(coordPoll, COORD_POLL_MS);
+}
+
+function coordLoadGraph(topology, metrics) {
+  loadYaml(Core.toYAML(Core.observedDocument(topology, metrics)), true);
+  note('graph read from the coordinator · operations carry their names only, because it does not hold the pod templates');
+}
+
+$('btn-coord-load').addEventListener('click', async () => {
+  try {
+    const [topology, metrics] = await Promise.all([coordFetch(COORD_TOPOLOGY), coordFetch(COORD_METRICS)]);
+    coordLoadGraph(topology, metrics);
+    coordApply(metrics);
+  } catch (err) {
+    coordNote('could not read the graph: ' + err.message);
+    $('status-note').classList.add('bad');
+  }
+});
 
 // ---------- workload name ----------
 
@@ -3292,6 +3532,8 @@ new ResizeObserver(() => { if (!state.userView) fitView(); }).observe(host);
 requestAnimationFrame(() => { if (!state.userView) fitView(); });
 window.addEventListener('load', () => { if (!state.userView) fitView(); });
 
+// A coordinator connecting a moment later reads state.seed to decide whether
+// it may take over: the example may be replaced, restored work may not.
 const stored = load('model', null);
 if (stored && typeof stored.yaml === 'string' && stored.yaml.trim()) {
   state.pinned = stored.pinned && typeof stored.pinned === 'object' ? stored.pinned : {};
@@ -3299,10 +3541,17 @@ if (stored && typeof stored.yaml === 'string' && stored.yaml.trim()) {
   if (typeof stored.status === 'string') $('status').value = stored.status;
   applyYamlText();
   if ($('status').value.trim()) applyStatusText();
+  state.seed = Core.SEEDS.restored;
 } else {
-  loadYaml(EXAMPLES[0].text, true);
+  loadYaml(EXAMPLES[0].text, true, Core.SEEDS.example);
 }
 refreshHl();
+
+// Last, and deliberately after the stored document has been restored, so that
+// the check for "is there anything to lose" sees the real answer. It is
+// asynchronous and nothing below waits for it: a page with no coordinator
+// behind it finishes booting without a pause.
+coordConnect();
 
 if (new URLSearchParams(location.search).has('selftest')) selfTest();
 })();

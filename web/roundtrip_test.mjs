@@ -156,9 +156,6 @@ check('layout: pinned position wins', nodes.get('map').x === 999 && nodes.get('m
 const pr = Core.fromYAML(readFileSync(join(root, 'examples', 'pagerank', 'workload.yaml'), 'utf8'));
 check('layout: feedback edges do not affect rank', Core.layout(pr, {}).get('rank').rank === 1);
 
-console.log(failures ? `\n${failures} failure(s)` : '\nall checks passed');
-process.exit(failures ? 1 : 0);
-
 // Capacity planning: replicas = clamp(ceil(runnableTasks / slots), min, max).
 {
   const doc = Core.fromYAML(readFileSync(join(root, 'examples', 'wordcount', 'workload.yaml'), 'utf8'));
@@ -172,3 +169,78 @@ process.exit(failures ? 1 : 0);
   const idle = at(0);
   check('capacity: no load holds map at its min of 1', idle('map').replicas === 1 && idle('map').runnable === 0);
 }
+
+// Reading a coordinator's view. apiBase decides whether there is a control
+// API to talk to at all, and where it is.
+check('apiBase: served at /editor', Core.apiBase('http:', '/editor') === '');
+check('apiBase: served under a prefix', Core.apiBase('https:', '/some/prefix/editor') === '/some/prefix');
+check('apiBase: a static server serving the file', Core.apiBase('http:', '/web/editor.html') === '/web');
+check('apiBase: the file system has nothing to connect to', Core.apiBase('file:', '/home/x/editor.html') === null);
+
+// observedDocument turns a topology into a Workload the editor can draw.
+{
+  const topology = [
+    { name: 'counts', from: 'map', to: 'reduce', partitioning: { mode: 'Hash', partitions: 8 }, delivery: 'Materialized' },
+    { name: 'lines', from: 'ingest', to: 'map', partitioning: { mode: 'RoundRobin', partitions: 4 }, delivery: 'Pipelined' },
+    { name: 'results', from: 'reduce', partitioning: { mode: 'RoundRobin', partitions: 8 }, durability: 'Retained' },
+  ];
+  const metrics = { operations: [{ name: 'map' }, { name: 'reduce' }, { name: 'ingest' }, { name: 'lonely' }] };
+  const doc = Core.observedDocument(topology, metrics);
+  check('observed: every operation the graph mentions appears',
+    doc.spec.operations.map((o) => o.name).join(',') === 'map,reduce,ingest,lonely');
+  check('observed: operations carry a name and nothing invented',
+    doc.spec.operations.every((o) => Object.keys(o).length === 1 && o.name));
+  check('observed: the workload is left unnamed', doc.metadata.name === undefined);
+  check('observed: channels keep their attributes',
+    Core.deepEqual(doc.spec.channels[0], { name: 'counts', from: 'map', to: 'reduce', partitioning: { mode: 'Hash', partitions: 8 }, delivery: 'Materialized' }));
+  check('observed: an absent consumer stays absent', doc.spec.channels[2].to === undefined);
+  // The document has to survive the editor's own reader and writer, because
+  // that is what the viewer does with it.
+  const round = Core.fromYAML(Core.toYAML(doc));
+  check('observed: the document round-trips', Core.deepEqual(round.spec.channels, doc.spec.channels));
+  check('observed: the drawing ranks it', Core.layout(round, {}).get('reduce').rank === 2);
+  check('observed: an empty topology is still a document',
+    Core.observedDocument([], null).spec.operations.length === 0);
+}
+
+// observedStatus reports what a coordinator knows and nothing else. The
+// operation figures are the point: phase, ready and replicas are absent
+// because a coordinator has none of them.
+{
+  const st = Core.observedStatus({
+    channels: [{ name: 'counts', sealed: true, pending: 42, inFlight: 1, produced: 59, epoch: 2, overflowed: 3, lost: 0 }],
+    operations: [{ name: 'map', livePods: 2, runnableTasks: 5, complete: false, holdsUnconsumed: true }],
+  });
+  check('observed: channel counters map one for one',
+    Core.deepEqual(st.channels[0], { name: 'counts', sealed: true, pending: 42, inFlight: 1, produced: 59, epoch: 2, overflowed: 3, lost: 0 }));
+  check('observed: operation figures are reported under their own names',
+    st.operations[0].livePods === 2 && st.operations[0].runnableTasks === 5 && st.operations[0].holdsUnconsumed === true);
+  check('observed: no phase is invented', st.operations[0].phase === undefined);
+  check('observed: no replica count is invented',
+    st.operations[0].replicas === undefined && st.operations[0].ready === undefined);
+  check('observed: empty metrics give empty lists',
+    Core.observedStatus(null).channels.length === 0 && Core.observedStatus({}).operations.length === 0);
+}
+
+
+// Whether a coordinator may replace what is on screen. This is the decision
+// the viewer gets wrong if it asks "is the document empty": the page loads an
+// example during start-up, so by the time an asynchronous connection resolves
+// the document is never empty and the example is defended as if a reader had
+// written it.
+{
+  const example = Core.fromYAML(readFileSync(join(root, 'examples', 'wordcount', 'workload.yaml'), 'utf8'));
+  const empty = Core.blankWorkload('untitled');
+  check('adopt: the untouched example gives way', Core.coordinatorMayAdopt(Core.SEEDS.example, example) === true);
+  check('adopt: a document restored from storage is kept', Core.coordinatorMayAdopt(Core.SEEDS.restored, example) === false);
+  check('adopt: a document the reader edited is kept', Core.coordinatorMayAdopt(Core.SEEDS.user, example) === false);
+  check('adopt: an empty document gives way whatever its seed',
+    Core.coordinatorMayAdopt(Core.SEEDS.user, empty) === true && Core.coordinatorMayAdopt(Core.SEEDS.restored, empty) === true);
+  check('adopt: a missing document is not an obstacle', Core.coordinatorMayAdopt(Core.SEEDS.user, null) === true);
+  // The seed names are part of the contract between the page and this check.
+  check('adopt: the seeds are the three the page records',
+    Core.SEEDS.example === 'example' && Core.SEEDS.restored === 'restored' && Core.SEEDS.user === 'user');
+}
+
+console.log(failures ? `\n${failures} failure(s)` : '\nall checks passed');
+process.exit(failures ? 1 : 0);
