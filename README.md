@@ -82,6 +82,10 @@ the generated policies are enforced.
   and how the pieces find each other.
 - [docs/spark-mapping.md](docs/spark-mapping.md) — how a Spark physical
   plan maps onto a Workload, and what the mapping exposes.
+- [docs/systems-mapping.md](docs/systems-mapping.md) — which families of
+  distributed system a Workload can represent, which channel attribute
+  carries each one, what it would take to run an agent SDK on it, and what
+  the model does not have.
 - [docs/precedent.md](docs/precedent.md) — prior systems and papers, and
   what this design takes from each.
 - [web/editor.html](web/editor.html) — a single-file graph editor and
