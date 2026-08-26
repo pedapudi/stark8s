@@ -1,0 +1,79 @@
+# The parameter server as a graph. "server" is the stateful actor: one
+# replica, one weight vector. "worker" is the task pool: each replica owns
+# whichever data shards hash to it. The loop closes on "weights", a
+# Broadcast feedback channel, because every worker needs the same vector;
+# "gradients" runs back with a single hash partition, so every gradient
+# reaches the one server replica.
+#
+# maxEpochs is the number of training rounds plus one. The epoch of a
+# weights record is its round number, rounds start at 1, and the vector the
+# server produces after the last round is stamped with maxEpochs and dropped
+# by the engine — which is what ends the loop. That final vector is on
+# "checkpoints", which is readable from outside while training runs.
+apiVersion: stark8s.io/v1alpha1
+kind: Workload
+metadata:
+  name: paramserver
+spec:
+  operations:
+    - name: data              # emits the training set as one record per shard
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/paramserver", "-shards=4", "data"]
+
+    - name: server            # the actor. One replica, because the weights
+      slots: 1                # are one piece of state with one owner.
+      scaling: {horizontal: {min: 1, max: 1}}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/paramserver", "-shards=4", "-rate=1.4", "server"]
+
+    - name: worker            # the task pool. Each replica owns a data shard.
+      slots: 1
+      scaling: {horizontal: {min: 4, max: 4}}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/paramserver", "worker"]
+
+  channels:
+    # The shards. Hash-partitioned on the shard key with as many partitions
+    # as shards, so ownership of a shard is the coordinator's decision and
+    # stays with one replica. Materialized: no worker starts until the whole
+    # training set has been written.
+    - name: shards
+      from: data
+      to: worker
+      partitioning: {mode: Hash, partitions: 4}
+      delivery: Materialized
+
+    # ray.get(ps.get_weights.remote()) — every worker needs the SAME weights,
+    # so Broadcast rather than a partitioned channel. Marking it feedback is
+    # what makes it a training loop instead of a single pass.
+    - name: weights
+      from: server
+      to: worker
+      partitioning: {mode: Broadcast, partitions: 1}
+      feedback: {mode: Asynchronous, maxEpochs: 41}
+
+    # ps.apply_gradients.remote(g) — every worker sends to the one server, so
+    # the partition count is 1 and every gradient lands on the single owner.
+    - name: gradients
+      from: worker
+      to: server
+      partitioning: {mode: Hash, partitions: 1}
+
+    - name: checkpoints       # readable from outside during training
+      from: server
+      durability: Retained
