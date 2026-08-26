@@ -163,6 +163,40 @@ spec:
                       - Drain
                       - Never
                       type: string
+                    egress:
+                      description: |-
+                        Egress lists what this operation may reach outside the workload.
+
+                        The default is nothing. Operation pods are otherwise allowed to reach
+                        only the coordinator, DNS, and the segment port of pods in the same
+                        workload, which is what keeps one operation off another operation's
+                        channels. An operation that has to read a feed, call an API or fetch an
+                        identity token says so here, and the grant applies to that operation
+                        alone; its neighbours are unaffected.
+
+                        Declaring it per operation rather than per workload keeps the grant
+                        visible in the graph, so a reader can see which vertices reach outside
+                        and a reviewer sees the widening in the same change as the code that
+                        needs it.
+                      items:
+                        description: |-
+                          EgressRule grants one operation access to one destination outside the
+                          workload.
+
+                          It is a struct holding a single field rather than a bare destination so
+                          that a narrower grant can be expressed later, by adding an explicit CIDR or
+                          a port list here, without changing the shape of anything already written.
+                        properties:
+                          to:
+                            description: To names the destination.
+                            enum:
+                            - Metadata
+                            - Internet
+                            type: string
+                        required:
+                        - to
+                        type: object
+                      type: array
                     name:
                       type: string
                     scaling:

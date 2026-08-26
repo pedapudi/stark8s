@@ -164,6 +164,33 @@ type Scaling struct {
 	Vertical   *VerticalScaling  `json:"vertical,omitempty"`
 }
 
+// EgressDestination names somewhere outside the workload that an operation is
+// allowed to open connections to.
+type EgressDestination string
+
+const (
+	// EgressMetadata is the instance metadata server on its link-local
+	// address, over plain HTTP. It is how a pod obtains an identity token for
+	// the account it runs as, which everything else outside the cluster tends
+	// to need first.
+	EgressMetadata EgressDestination = "Metadata"
+	// EgressInternet is HTTPS to addresses outside the cluster. The private
+	// ranges are excluded, so this grants no reach to other pods or services.
+	EgressInternet EgressDestination = "Internet"
+)
+
+// EgressRule grants one operation access to one destination outside the
+// workload.
+//
+// It is a struct holding a single field rather than a bare destination so
+// that a narrower grant can be expressed later, by adding an explicit CIDR or
+// a port list here, without changing the shape of anything already written.
+type EgressRule struct {
+	// To names the destination.
+	// +kubebuilder:validation:Enum=Metadata;Internet
+	To EgressDestination `json:"to"`
+}
+
 // Operation is a vertex of the graph: one logical computation backed by its
 // own pool of pods.
 type Operation struct {
@@ -182,6 +209,20 @@ type Operation struct {
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
 	Slots int32 `json:"slots,omitempty"`
+	// Egress lists what this operation may reach outside the workload.
+	//
+	// The default is nothing. Operation pods are otherwise allowed to reach
+	// only the coordinator, DNS, and the segment port of pods in the same
+	// workload, which is what keeps one operation off another operation's
+	// channels. An operation that has to read a feed, call an API or fetch an
+	// identity token says so here, and the grant applies to that operation
+	// alone; its neighbours are unaffected.
+	//
+	// Declaring it per operation rather than per workload keeps the grant
+	// visible in the graph, so a reader can see which vertices reach outside
+	// and a reviewer sees the widening in the same change as the code that
+	// needs it.
+	Egress []EgressRule `json:"egress,omitempty"`
 }
 
 // CoordinatorSpec configures the per-workload coordinator that tracks
