@@ -199,4 +199,7 @@ const (
 	EnvFeedback    = "STARK8S_FEEDBACK"     // inbound feedback channels
 	EnvFeedbackOut = "STARK8S_FEEDBACK_OUT" // outbound feedback channels
 	EnvSegmentDir  = "STARK8S_SEGMENT_DIR"  // local segment store; default /var/lib/stark8s/segments
+	// EnvTickInterval is a Go duration such as "30s". Absent or empty leaves
+	// the operation driven only by its records.
+	EnvTickInterval = "STARK8S_TICK_INTERVAL"
 )

@@ -182,6 +182,16 @@ type Operation struct {
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
 	Slots int32 `json:"slots,omitempty"`
+	// TickInterval makes the operation run on a clock as well as on its
+	// input: every replica calls its Tick handler this often, between passes
+	// over its inbound channels. It suits an operation that polls a feed, a
+	// queue or an API on a schedule while taking what to poll for from a
+	// channel. Leave it unset for an operation driven only by records.
+	//
+	// The handler runs on the same goroutine as record processing, so this is
+	// a floor on the period rather than a guarantee: a long batch of records
+	// delays the next tick.
+	TickInterval *metav1.Duration `json:"tickInterval,omitempty"`
 }
 
 // CoordinatorSpec configures the per-workload coordinator that tracks
