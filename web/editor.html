@@ -715,6 +715,26 @@ body.resizing-row, body.resizing-row * { cursor: row-resize !important; user-sel
 svg.canvas { display: block; width: 100%; height: 100%; }
 svg.canvas.connecting { cursor: crosshair; }
 
+/* The legend is one wrapping row of the real marks. It is shown by default,
+   because the reason it exists is to make a screenshot or a printout
+   readable, and a legend that starts hidden fails exactly that case. The
+   toggle is for working in a crowded graph, where the canvas height matters
+   more than the key does. */
+.legend {
+  border-top: 1px solid var(--v2-rule);
+  padding: var(--dt-gap-line) var(--dt-gap-edge);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--dt-gap-line) calc(var(--dt-gap-edge) * 1.4);
+  font-family: var(--v2-mono);
+  font-size: calc(10px * var(--dt-font-scale, 1));
+  color: var(--v2-ink-faint);
+  max-height: 7em;
+  overflow-y: auto;
+}
+.legend[hidden] { display: none; }
+.legend .item { display: flex; align-items: center; gap: 5px; }
+.legend .item svg { display: block; flex: none; overflow: visible; }
 .status-strip {
   border-top: 1px solid var(--v2-rule);
   padding: var(--dt-gap-line) var(--dt-gap-edge);
@@ -765,6 +785,17 @@ svg.canvas.connecting { cursor: crosshair; }
 .edge-mark { fill: none; stroke: var(--v2-ink-soft); stroke-width: 1.3; stroke-linecap: round; stroke-linejoin: round; }
 .edge-mark.filled { fill: var(--v2-paper); }
 .edge-mark.arrow { stroke: var(--v2-ink-faint); }
+/* Hairline structure, and the one solid weight a mark is allowed. A dot is
+   filled with the same soft ink the strokes use, so a mark reads as one
+   drawing rather than as a shape with ornaments. */
+.edge-mark.faint { stroke: var(--v2-ink-faint); stroke-width: 0.9; }
+.edge-mark.solid { fill: var(--v2-ink-soft); stroke: none; }
+.glyph.solid { fill: var(--v2-ink-soft); stroke: none; }
+.dashed-edge { stroke-dasharray: 3.4 2.6; stroke-width: 1.1; }
+/* The marks carry no colour of their own. Selecting an edge lifts its marks
+   with the accent, and that is the only place the accent is spent. */
+.edge.selected .edge-mark { stroke: var(--v2-accent); }
+.edge.selected .edge-mark.solid { fill: var(--v2-accent); stroke: none; }
 .edge.selected .edge-mark.arrow { stroke: var(--v2-accent); }
 .mark-hit { cursor: help; outline: none; }
 .mark-hit:focus-visible { outline: 2px solid var(--v2-accent); }
@@ -999,6 +1030,7 @@ button[aria-pressed="true"] { background: var(--v2-rule-soft); color: var(--v2-i
         <button id="btn-layout">auto layout</button>
         <button id="btn-fit">fit</button>
         <button id="btn-capacity" aria-pressed="false" title="show the pods each operation would run at for an assumed load">capacity</button>
+        <button id="btn-legend" aria-pressed="true" title="show what each mark on the drawing means">legend</button>
         <span class="cap-load" id="cap-load" hidden>
           <label class="mono" for="cap-load-input">load</label>
           <input type="number" id="cap-load-input" min="0" step="100" value="1000" aria-label="assumed records per channel">
@@ -1014,6 +1046,7 @@ button[aria-pressed="true"] { background: var(--v2-rule-soft); color: var(--v2-i
           <div class="hovercard-detail"></div>
         </div>
       </div>
+      <div class="legend" id="legend" aria-label="what the marks mean"></div>
       <div class="status-strip" id="status-strip" aria-live="polite"></div>
     </div>
 
@@ -2222,9 +2255,120 @@ const MARK_TEXT = {
   Broadcast: ['Broadcast partitioning', 'every consumer replica receives every record'],
   Materialized: ['Materialized delivery', 'a stage barrier: nothing is delivered until the producer has completed, and the consumer is not started before then'],
   Retained: ['Retained durability', 'records are kept after acknowledgement, so the channel can be replayed or read from outside'],
+  ExternalProducer: ['External producer', 'records are produced from outside the workload through the coordinator API'],
+  ExternalConsumer: ['External consumer', 'records are read from outside the workload through the coordinator API; such channels are always retained'],
+  Undeclared: ['Undeclared endpoint', 'this channel names an operation the document does not declare, so nothing would produce or consume it'],
   Drain: ['Drain completion', 'finishes once every inbound channel is sealed and consumed; its Deployment is then scaled to zero'],
   Never: ['Never completes', 'runs until the workload is deleted'],
 };
+
+// The drawings.
+//
+// Each mark draws its own idea rather than a decoration standing in for it:
+// rails for a key that always takes the same one, a fan for an even spread, a
+// ripple for something every replica receives. They are read at ten to
+// eighteen pixels on an edge, so each is a silhouette of three or four
+// confident strokes. Anything fussier turns to mud at that size, and the test
+// is whether two of them can be told apart at a glance and without colour.
+//
+// The marks stay in the soft and faint inks ON PURPOSE. A graph carries dozens
+// of edges, so accenting every mark would flood the drawing and the accent
+// would stop meaning anything. The accent is spent on selection, and on the
+// one exemplar the legend highlights. Please do not "improve" these by
+// colouring them.
+//
+// One function per mark, called from the edge AND from the legend, so the two
+// cannot drift apart.
+const MARKS = {
+  // Rails, with the same rail taken twice. Equal keys always land on one
+  // replica, so the point is the repetition rather than the choice.
+  Hash: (g) => {
+    g.appendChild(el('path', { d: 'M-7,-3.6 H7', class: 'edge-mark faint' }));
+    g.appendChild(el('path', { d: 'M-7,3.6 H7', class: 'edge-mark' }));
+    g.appendChild(el('circle', { cx: -3.4, cy: 3.6, r: 1.7, class: 'edge-mark solid' }));
+    g.appendChild(el('circle', { cx: 3.4, cy: 3.6, r: 1.7, class: 'edge-mark solid' }));
+  },
+  // An even fan out of one point. Three rays of equal weight reaching three
+  // separate landings: spread evenly, with no key deciding which.
+  RoundRobin: (g) => {
+    // The rays are hairlines and the landings are solid, so at a small size
+    // the four dots carry the drawing. Heavier rays would close into a
+    // chevron and read as one more arrowhead.
+    g.appendChild(el('path', { d: 'M-5.4,0 L3.4,-4.6 M-5.4,0 L4.6,0 M-5.4,0 L3.4,4.6', class: 'edge-mark faint' }));
+    g.appendChild(el('circle', { cx: -5.4, cy: 0, r: 1.5, class: 'edge-mark solid' }));
+    for (const [x, y] of [[4.6, -5.4], [6, 0], [4.6, 5.4]]) {
+      g.appendChild(el('circle', { cx: x, cy: y, r: 1.4, class: 'edge-mark solid' }));
+    }
+  },
+  // A ripple. Arcs spreading from one point reach everything in front of
+  // them, which is the difference from the fan: not one landing of several,
+  // but all of them. Curves rather than straight rays, so the two silhouettes
+  // never read as the same drawing.
+  Broadcast: (g) => {
+    g.appendChild(el('circle', { cx: -5.4, cy: 0, r: 1.4, class: 'edge-mark solid' }));
+    g.appendChild(el('path', { d: 'M-2.6,-3.4 A 4.4 4.4 0 0 1 -2.6,3.4', class: 'edge-mark' }));
+    g.appendChild(el('path', { d: 'M-0.2,-5 A 6.4 6.4 0 0 1 -0.2,5', class: 'edge-mark' }));
+    g.appendChild(el('path', { d: 'M2.2,-6.4 A 8.4 8.4 0 0 1 2.2,6.4', class: 'edge-mark faint' }));
+  },
+  // A closed gate with records pooled behind it. Nothing passes until the
+  // producer finishes, so the queue upstream is the whole idea.
+  Materialized: (g) => {
+    g.appendChild(el('path', { d: 'M2,-7 V7', class: 'edge-mark' }));
+    g.appendChild(el('path', { d: 'M0.2,-7 H3.8 M0.2,7 H3.8', class: 'edge-mark faint' }));
+    for (const y of [-3.2, 0, 3.2]) {
+      g.appendChild(el('circle', { cx: -2.4, cy: y, r: 1.3, class: 'edge-mark solid' }));
+    }
+  },
+  // Sediment. Layers that stay after everything above them has moved on,
+  // widest at the base, which is what a record kept past acknowledgement is.
+  Retained: (g) => {
+    g.appendChild(el('path', { d: 'M-6.2,3.6 H6.2', class: 'edge-mark' }));
+    g.appendChild(el('path', { d: 'M-4,0.2 H4', class: 'edge-mark' }));
+    g.appendChild(el('path', { d: 'M-1.8,-3.2 H1.8', class: 'edge-mark' }));
+  },
+  // The workload's boundary, drawn as a dashed envelope with an opening, and
+  // an arrow crossing inward through it.
+  ExternalProducer: (g) => {
+    g.appendChild(el('path', { d: 'M-2,-7.5 Q-6.4,-4 -5.6,-2.2 M-5.6,2.2 Q-6.4,4 -2,7.5', class: 'glyph faint dashed-edge' }));
+    g.appendChild(el('path', { d: 'M-8.5,0 H3.4', class: 'glyph' }));
+    g.appendChild(el('path', { d: 'M1,-2.6 L3.8,0 L1,2.6', class: 'glyph' }));
+  },
+  // The same boundary, crossed outward: the arrow leaves through the opening.
+  ExternalConsumer: (g) => {
+    g.appendChild(el('path', { d: 'M2,-7.5 Q6.4,-4 5.6,-2.2 M5.6,2.2 Q6.4,4 2,7.5', class: 'glyph faint dashed-edge' }));
+    g.appendChild(el('path', { d: 'M-3.4,0 H8.5', class: 'glyph' }));
+    g.appendChild(el('path', { d: 'M6,-2.6 L8.8,0 L6,2.6', class: 'glyph' }));
+  },
+  // A tick: the operation finishes and is scaled away.
+  Drain: (g) => {
+    g.appendChild(el('path', { d: 'M-4,0.5 L-1.2,3.2 L4,-3', class: 'glyph' }));
+  },
+  // A cycle that closes on itself: the operation runs until the workload is
+  // deleted. It was a plain circle, which collided with the ring the Waiting
+  // phase draws a few pixels away on the same node. An open loop with a head
+  // returning into it says "again" instead of "here".
+  Never: (g) => {
+    g.appendChild(el('path', { d: 'M3.4,-2.4 A 4 4 0 1 0 4.6,1.2', class: 'glyph' }));
+    g.appendChild(el('path', { d: 'M2,-3.4 L3.6,-2.2 L2.2,-0.6', class: 'glyph' }));
+  },
+  // The error. A torn envelope whose halves no longer meet, and a crossing
+  // that stops short. It has to be unmistakable at a glance, because the
+  // failure it reports is a typed name that looks deliberate.
+  Undeclared: (g) => {
+    g.appendChild(el('path', { d: 'M-1.4,-7.5 Q-6.4,-4.4 -5.2,-2.8 M-6.6,2.4 Q-5.4,4.6 -1,7.1', class: 'glyph bad dashed-edge' }));
+    g.appendChild(el('path', { d: 'M-9,0 H-4.6', class: 'glyph bad' }));
+    g.appendChild(el('path', { d: 'M-1.4,-3 L3.6,3 M3.6,-3 L-1.4,3', class: 'glyph bad' }));
+  },
+};
+
+// drawMark returns one mark's drawing. The edge and the legend both come
+// through here, which is what keeps the legend honest.
+function drawMark(name) {
+  const g = el('g', { class: 'mark-art' });
+  const draw = MARKS[name];
+  if (draw) draw(g);
+  return g;
+}
 
 function phaseGlyph(phase) {
   const g = el('g', { class: 'glyph' + (phase === 'Failed' ? ' bad' : '') });
@@ -2299,19 +2443,10 @@ function renderCanvas() {
       build(m);
       g.appendChild(hov(m, name, context, detail));
     };
-    if (eff.durability === 'Retained') {
-      markAt(e.kind === 'source' ? 0.3 : 0.12, (m) => m.appendChild(el('rect', { x: -3.5, y: -3.5, width: 7, height: 7, class: 'edge-mark filled' })), MARK_TEXT.Retained[0], c.name, MARK_TEXT.Retained[1]);
-    }
-    if (eff.mode === 'Hash') {
-      markAt(0.5, (m) => m.appendChild(el('path', { d: 'M-6,-5 L-2,5 M-2,-5 L2,5 M2,-5 L6,5', class: 'edge-mark' })), MARK_TEXT.Hash[0], `${c.name} · ${eff.partitions} partitions`, MARK_TEXT.Hash[1]);
-    } else if (eff.mode === 'RoundRobin') {
-      markAt(0.5, (m) => m.appendChild(el('circle', { r: 4.5, class: 'edge-mark filled' })), MARK_TEXT.RoundRobin[0], `${c.name} · ${eff.partitions} partitions`, MARK_TEXT.RoundRobin[1]);
-    } else if (eff.mode === 'Broadcast') {
-      markAt(0.5, (m) => { m.appendChild(el('circle', { r: 5.5, class: 'edge-mark filled', stroke: 'none' })); m.appendChild(el('path', { d: 'M-2,0 L6,-5 M-2,0 L7,0 M-2,0 L6,5', class: 'edge-mark' })); }, MARK_TEXT.Broadcast[0], c.name, MARK_TEXT.Broadcast[1]);
-    }
-    if (eff.delivery === 'Materialized') {
-      markAt(e.kind === 'sink' ? 0.7 : 0.86, (m) => m.appendChild(el('line', { x1: 0, y1: -7, x2: 0, y2: 7, class: 'edge-mark' })), MARK_TEXT.Materialized[0], c.name, MARK_TEXT.Materialized[1]);
-    }
+    const place = (t, mark, context) => markAt(t, (m) => m.appendChild(drawMark(mark)), MARK_TEXT[mark][0], context || c.name, MARK_TEXT[mark][1]);
+    if (eff.durability === 'Retained') place(e.kind === 'source' ? 0.3 : 0.12, 'Retained');
+    if (MARKS[eff.mode]) place(0.5, eff.mode, `${c.name} · ${eff.partitions} partitions`);
+    if (eff.delivery === 'Materialized') place(e.kind === 'sink' ? 0.7 : 0.86, 'Materialized');
 
     // Labels: the channel name, and below it the feedback bound and any
     // observed counters. Positions are collected and de-collided after the
@@ -2337,24 +2472,28 @@ function renderCanvas() {
     const widthChars = Math.max(c.name.length * 6, ...meta.map((m) => m.length * 5.4), 1);
     labelBlocks.push({ g, x: mid.x, y: mid.y + above, w: widthChars, name: c.name, meta });
 
-    // Glyphs for a producer or consumer outside the workload.
-    if (e.kind === 'source') {
-      const s = e.unknownFrom
-        ? hov(el('g', { class: 'mark-hit', transform: `translate(${e.glyph.x},${e.glyph.y})`, tabindex: 0, role: 'img', 'aria-label': 'unknown producer' }), `unknown producer "${c.from}"`, c.name, 'no operation of this name is declared')
-        : hov(el('g', { class: 'mark-hit', transform: `translate(${e.glyph.x},${e.glyph.y})`, tabindex: 0, role: 'img', 'aria-label': 'external producer' }), 'external producer', c.name, 'records are produced from outside the workload through the coordinator API');
-      s.appendChild(el('circle', { r: 6, class: 'glyph filled' }));
-      s.appendChild(el('circle', { r: 1.6, class: 'glyph', fill: 'currentColor' }));
+    // The workload boundary, where a channel has no operation at one end.
+    //
+    // An UNDECLARED endpoint is a different drawing, and that is a
+    // correctness fix rather than a flourish. Both cases used to draw one
+    // filled circle and differ only in their hover text, so a typo in a
+    // `from:` field looked exactly like deliberate ingress. Validation listed
+    // it and the drawing denied it.
+    const endpoint = (mark, label, context, detail) => {
+      const s = hov(el('g', { class: 'mark-hit', transform: `translate(${e.glyph.x},${e.glyph.y})`, tabindex: 0, role: 'img', 'aria-label': label }), label, context, detail);
+      s.appendChild(el('circle', { r: 10, fill: 'transparent', stroke: 'none' }));
+      s.appendChild(drawMark(mark));
       g.appendChild(s);
-      grow(e.glyph.x - 8, e.glyph.y - 8);
+      grow(e.glyph.x - 10, e.glyph.y - 10);
+      grow(e.glyph.x + 10, e.glyph.y + 10);
+    };
+    if (e.kind === 'source') {
+      if (e.unknownFrom) endpoint('Undeclared', `undeclared producer "${c.from}"`, c.name, MARK_TEXT.Undeclared[1]);
+      else endpoint('ExternalProducer', MARK_TEXT.ExternalProducer[0], c.name, MARK_TEXT.ExternalProducer[1]);
     }
     if (e.kind === 'sink') {
-      const s = e.unknownTo
-        ? hov(el('g', { class: 'mark-hit', transform: `translate(${e.glyph.x},${e.glyph.y})`, tabindex: 0, role: 'img', 'aria-label': 'unknown consumer' }), `unknown consumer "${c.to}"`, c.name, 'no operation of this name is declared')
-        : hov(el('g', { class: 'mark-hit', transform: `translate(${e.glyph.x},${e.glyph.y})`, tabindex: 0, role: 'img', 'aria-label': 'external consumer' }), 'external consumer', c.name, 'records are read from outside the workload through the coordinator API; such channels are always retained');
-      s.appendChild(el('circle', { r: 6, class: 'glyph filled' }));
-      s.appendChild(el('line', { x1: -3, y1: 0, x2: 3, y2: 0, class: 'glyph' }));
-      g.appendChild(s);
-      grow(e.glyph.x + 8, e.glyph.y + 8);
+      if (e.unknownTo) endpoint('Undeclared', `undeclared consumer "${c.to}"`, c.name, MARK_TEXT.Undeclared[1]);
+      else endpoint('ExternalConsumer', MARK_TEXT.ExternalConsumer[0], c.name, MARK_TEXT.ExternalConsumer[1]);
     }
     gEdges.appendChild(g);
   }
@@ -2416,8 +2555,7 @@ function renderCanvas() {
     // Completion glyph at the top right: a tick for Drain, a ring for Never.
     const cg = hov(el('g', { class: 'mark-hit', transform: `translate(${n.w - 14},14)`, tabindex: 0, role: 'img', 'aria-label': MARK_TEXT[eff.completion][0] }), MARK_TEXT[eff.completion][0], o.name, MARK_TEXT[eff.completion][1]);
     cg.appendChild(el('circle', { r: 8, fill: 'transparent', stroke: 'none' }));
-    if (eff.completion === 'Never') cg.appendChild(el('circle', { r: 4, class: 'glyph' }));
-    else cg.appendChild(el('path', { d: 'M-4,0.5 L-1.2,3.2 L4,-3', class: 'glyph' }));
+    cg.appendChild(drawMark(eff.completion === 'Never' ? 'Never' : 'Drain'));
     g.appendChild(cg);
     if (st && st.phase) {
       const pg = hov(el('g', { class: 'mark-hit', transform: `translate(${n.w - 30},14)`, tabindex: 0, role: 'img', 'aria-label': `phase ${st.phase}` }), `phase ${st.phase}`, o.name, `${st.ready == null ? '' : st.ready + ' ready of '}${st.replicas == null ? '' : st.replicas + ' replicas'}${st.runnableTasks != null ? ' · ' + st.runnableTasks + ' runnable tasks' : ''}`);
@@ -2473,6 +2611,39 @@ function svgPoint(e) {
 }
 
 // ---------- status strip ----------
+
+// The legend, built from the same two sources the drawing uses: MARKS for the
+// picture and MARK_TEXT for the words. Calling drawMark here rather than
+// keeping a second copy of the path data is the whole point — a legend drawn
+// separately would agree with the canvas today and disagree within a month.
+//
+// The order is the order a reader meets the marks along an edge: what decides
+// the routing, then when it is delivered, then what happens to it afterwards,
+// then the two ends, then the node's own marks, then the error.
+const LEGEND_ORDER = ['Hash', 'RoundRobin', 'Broadcast', 'Materialized', 'Retained',
+  'ExternalProducer', 'ExternalConsumer', 'Drain', 'Never', 'Undeclared'];
+
+function renderLegend() {
+  const host = $('legend');
+  host.textContent = '';
+  for (const name of LEGEND_ORDER) {
+    if (!MARKS[name]) continue;
+    const [title, detail] = MARK_TEXT[name] || [name, ''];
+    const item = document.createElement('span');
+    item.className = 'item';
+    const svg = el('svg', { width: 26, height: 18, viewBox: '-13 -9 26 18', role: 'img', 'aria-label': title });
+    // A stub of edge under the mark, so a mark reads here exactly as it reads
+    // on the drawing rather than floating on its own.
+    if (name !== 'Drain' && name !== 'Never') svg.appendChild(el('path', { d: 'M-13,0 H13', class: 'edge-line' }));
+    svg.appendChild(drawMark(name));
+    item.appendChild(svg);
+    const label = document.createElement('span');
+    label.textContent = title;
+    item.appendChild(label);
+    item.title = detail;
+    host.appendChild(item);
+  }
+}
 
 function renderStatus() {
   const strip = $('status-strip');
@@ -3099,6 +3270,15 @@ $('wl-ns').addEventListener('change', () => { const v = $('wl-ns').value.trim();
 
 $('btn-add').addEventListener('click', () => { addOperation(null); });
 $('btn-layout').addEventListener('click', autoLayout);
+$('btn-legend').addEventListener('click', () => {
+  const host = $('legend');
+  const on = host.hasAttribute('hidden');
+  if (on) host.removeAttribute('hidden'); else host.setAttribute('hidden', '');
+  $('btn-legend').setAttribute('aria-pressed', String(on));
+  store('legend', on);
+  if (!state.userView) fitView();
+});
+
 $('btn-fit').addEventListener('click', () => { state.userView = false; fitView(); });
 
 $('btn-capacity').addEventListener('click', () => {
@@ -3303,6 +3483,14 @@ if (stored && typeof stored.yaml === 'string' && stored.yaml.trim()) {
   loadYaml(EXAMPLES[0].text, true);
 }
 refreshHl();
+
+// The legend is drawn once: it depends on the marks and their words, and
+// neither changes while the page is open. Its visibility is remembered.
+renderLegend();
+if (load('legend', true) === false) {
+  $('legend').setAttribute('hidden', '');
+  $('btn-legend').setAttribute('aria-pressed', 'false');
+}
 
 if (new URLSearchParams(location.search).has('selftest')) selfTest();
 })();

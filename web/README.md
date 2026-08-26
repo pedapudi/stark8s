@@ -43,24 +43,52 @@ the drawing.
 Colour carries direction only: an invalid element and a failed phase take
 the theme's bad colour, and the one accent marks the selection. Every
 other attribute is a drawn mark. Pointing at a mark opens a card that
-names it; the table below is the same vocabulary.
+names it; the table below is the same vocabulary, and the legend under the
+canvas draws it.
+
+Each mark draws its own idea rather than a shape standing in for one:
+rails for a key that always takes the same one, a fan for an even spread,
+a ripple for something every replica receives, a gate for a barrier, and
+layers for what is kept. They are read at ten to eighteen pixels on an
+edge, so each is a silhouette of three or four strokes; the test applied
+to every one of them is whether two can be told apart at a glance, at that
+size, without colour.
+
+The marks stay in the soft and faint inks. A graph carries dozens of
+edges, so accenting every mark would flood the drawing and the accent
+would stop meaning anything; it is spent on the selection and nowhere
+else.
+
+## The legend
+
+The strip under the canvas names every mark. It draws them by calling the
+same function the canvas calls, and takes its words from the same table
+the hover cards use, so it cannot drift from what is on screen. The
+`legend` control in the toolbar hides it, and the choice is remembered.
+
+It is shown by default. The reason it exists is to make a screenshot or a
+printout readable by someone who cannot hover over anything, and a legend
+that starts hidden fails exactly that case. Hiding it is the right choice
+when the canvas height matters more than the key does, which is why the
+control is there.
 
 | mark | where | meaning |
 |---|---|---|
-| short bar across the edge near the consumer | edge | Materialized delivery: a stage barrier; nothing is delivered until the producer has completed |
-| plain edge with no bar | edge | Pipelined delivery |
-| fan of three slanted strokes at the midpoint | edge | Hash partitioning |
-| small ring at the midpoint | edge | RoundRobin partitioning |
-| three strokes radiating forward at the midpoint | edge | Broadcast partitioning |
-| small square at the producer end | edge | Retained durability |
+| two rails with a bead on the same one twice, at the midpoint | edge | Hash partitioning: equal keys always reach the same replica |
+| a fan of hairlines from one point to three separated landings, at the midpoint | edge | RoundRobin partitioning: spread evenly, with no key deciding where |
+| a ripple of arcs spreading from one point, at the midpoint | edge | Broadcast partitioning: every replica receives every record |
+| a gate with records pooled behind it, near the consumer | edge | Materialized delivery: a stage barrier; nothing is delivered until the producer has completed |
+| no gate | edge | Pipelined delivery |
+| stacked layers, widest at the base, near the producer | edge | Retained durability: records are kept after acknowledgement |
 | arc above the nodes, or a loop on one node, with a faint label giving the epoch bound and mode | edge | feedback channel |
 | dashed stroke | edge | the channel is the overflow target of a feedback loop |
 | thicker stroke | edge | observed status reports pending records on the channel |
 | dashed stroke in the bad colour | edge or node | validation fails for this element |
 | tick at the top right of a node | node | Drain completion: the operation finishes once its inbound channels are sealed and consumed |
-| ring at the top right of a node | node | Never completion: the operation runs until the workload is deleted |
-| circle with a centre dot | edge end | external producer: records arrive through the exchange API |
-| circle with a centre bar | edge end | external consumer: records are read through the exchange API |
+| a loop closing on itself, at the top right of a node | node | Never completion: the operation runs until the workload is deleted |
+| an arrow entering through a gap in a dashed boundary | edge end | external producer: records arrive through the exchange API |
+| an arrow leaving through a gap in a dashed boundary | edge end | external consumer: records are read through the exchange API |
+| a torn boundary and a cross, in the bad colour | edge end | the channel names an operation the document does not declare |
 | empty ring, dotted ring, tick, cross | node, from observed status | phase Waiting, Running, Succeeded, Failed |
 | `ready/replicas` text in the node's second line | node, from observed status | ready and total replicas |
 | `pending · inflight · produced · epoch` text under an edge | edge, from observed status | the channel's counters |
