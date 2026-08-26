@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +15,12 @@ import (
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 	"github.com/pedapudi/stark8s/pkg/sdk"
 )
+
+// allPlantedCells is every cell of the array that carries an added signal,
+// in the order the summaries sort them. It is written out here rather than
+// derived from the anomalies table in main.go, so that a change to that table
+// makes this test fail instead of following it.
+var allPlantedCells = []string{"17,19", "20,22", "28,30", "3,1", "31,31", "5,4", "9,10"}
 
 // channels mirrors workload.yaml.
 func channels() []v1alpha1.Channel {
@@ -161,17 +168,21 @@ func TestTileScanFansOutAndGathers(t *testing.T) {
 		}
 	}
 
-	// Every anomaly was found and nothing else was, across all bands.
-	total := 0
+	// Every planted cell was found across all bands and nothing else was.
+	// The comparison is against the literal list rather than against the
+	// implementation's own table of planted cells, so the test can disagree
+	// with the code it is checking.
+	var found []string
 	for _, g := range got {
-		total += g.Hits
+		found = append(found, g.Cells...)
 	}
-	if total != len(anomalies) {
-		t.Errorf("found %d cells, want the %d planted", total, len(anomalies))
+	sort.Strings(found)
+	if fmt.Sprint(found) != fmt.Sprint(allPlantedCells) {
+		t.Errorf("the run found %v, want %v", found, allPlantedCells)
 	}
 
-	// One record per tile on the shuffle, not one per cell, and nothing
-	// left behind on any channel.
+	// The shuffle carried one record per tile, and nothing was left behind on
+	// any channel.
 	for _, cm := range h.co.Metrics().Channels {
 		switch cm.Name {
 		case "hits":
@@ -189,10 +200,126 @@ func TestTileScanFansOutAndGathers(t *testing.T) {
 	}
 }
 
-// TestScanBuffersTilesUntilCalibrationArrives pins the ordering hazard the
-// example works around: nothing orders one inbound channel against another,
-// so a tile can be delivered before the broadcast table it needs.
-func TestScanBuffersTilesUntilCalibrationArrives(t *testing.T) {
+// trueProfile is the calibration table the driver shares.
+func trueProfile() []int {
+	profile := make([]int, gridCols)
+	for c := range profile {
+		profile[c] = background(c)
+	}
+	return profile
+}
+
+// cellsOf lists a tile result's cells in a comparable order.
+func cellsOf(res tileResult) []string {
+	out := make([]string, 0, len(res.Hits))
+	for _, h := range res.Hits {
+		out = append(out, cellKey(h.Row, h.Col))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestScanTileUsesTheSharedTable pins the example's headline claim: the answer
+// depends on the calibration table the driver shared.
+//
+// The shipped fixture cannot show this on its own. Its background is a
+// function of the column, so a scan that ignored the shared table and
+// recomputed the background itself would produce exactly the same seven
+// cells, and every assertion about the shipped numbers would still pass. The
+// check therefore feeds tables that are deliberately wrong in three different
+// ways and requires the result to follow each one.
+func TestScanTileUsesTheSharedTable(t *testing.T) {
+	full := tile{Row0: 0, Row1: gridRows, Col0: 0, Col1: gridCols}
+
+	// The real table. The residual left over is the planted signal plus at
+	// most four of baseline variation, so exactly the planted cells clear the
+	// threshold of 20.
+	if got := cellsOf(scanTile(full, trueProfile())); fmt.Sprint(got) != fmt.Sprint(allPlantedCells) {
+		t.Errorf("with the shared table the scan found %v, want %v", got, allPlantedCells)
+	}
+
+	// A table of zeros leaves the whole background in every residual, so
+	// every cell clears the threshold.
+	zero := make([]int, gridCols)
+	if res := scanTile(full, zero); len(res.Hits) != gridRows*gridCols {
+		t.Errorf("with a table of zeros the scan reported %d cells, want all %d",
+			len(res.Hits), gridRows*gridCols)
+	}
+
+	// A table reading higher than the largest planted signal hides
+	// everything.
+	high := trueProfile()
+	for c := range high {
+		high[c] += 100
+	}
+	if res := scanTile(full, high); len(res.Hits) != 0 {
+		t.Errorf("with a table above every signal the scan reported %d cells, want none", len(res.Hits))
+	}
+
+	// A table wrong in one column only. Reading column 7 low by the full
+	// threshold promotes all 32 of its cells and leaves the rest alone, so
+	// this also shows the scan indexes the table by column.
+	skewed := trueProfile()
+	skewed[7] -= threshold
+	got := cellsOf(scanTile(full, skewed))
+	if len(got) != len(allPlantedCells)+gridRows {
+		t.Errorf("with column 7 read low the scan found %d cells, want %d",
+			len(got), len(allPlantedCells)+gridRows)
+	}
+	for _, cell := range got {
+		if !strings.HasSuffix(cell, ",7") && !contains(allPlantedCells, cell) {
+			t.Errorf("cell %s was reported, but only column 7 and the planted cells should be", cell)
+		}
+	}
+}
+
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// TestScanHoldsTilesUntilTheTableArrives pins the ordering hazard the example
+// works around. Nothing orders one inbound channel against another, so a tile
+// can be delivered before the broadcast table it needs.
+//
+// Holding the tile is only half of it. A scanner that held tiles and then
+// dropped them when the table arrived would lose that work with no error
+// anywhere, and the missing cells would look like cells that were scanned and
+// found clean, so the release is checked too.
+func TestScanHoldsTilesUntilTheTableArrives(t *testing.T) {
+	var s scanner
+	first := tile{Row0: 0, Row1: tileSize, Col0: 0, Col1: tileSize}
+	second := tile{Row0: 0, Row1: tileSize, Col0: tileSize, Col1: 2 * tileSize}
+
+	if ready := s.take(first); len(ready) != 0 {
+		t.Fatalf("a tile arriving before the table was ready to scan: %v", ready)
+	}
+	if ready := s.take(second); len(ready) != 0 {
+		t.Fatalf("a second tile arriving before the table was ready to scan: %v", ready)
+	}
+
+	ready := s.calibrate(trueProfile())
+	if len(ready) != 2 || ready[0] != first || ready[1] != second {
+		t.Fatalf("the table released %v, want both held tiles in arrival order", ready)
+	}
+	if n := len(s.pending); n != 0 {
+		t.Errorf("%d tiles are still held after the table arrived", n)
+	}
+
+	// With the table in hand a tile is scanned straight away.
+	if ready := s.take(first); len(ready) != 1 || ready[0] != first {
+		t.Errorf("after the table arrived a tile released %v, want just that tile", ready)
+	}
+}
+
+// TestScanDrainFailsOnUnservicedTiles: a replica that runs out of input while
+// still holding tiles never received the table, and its share of the scan is
+// missing from the summary.
+func TestScanDrainFailsOnUnservicedTiles(t *testing.T) {
 	hs := scanHandlers()
 	w := &sdk.Worker{Operation: "scan", Instance: "scan-0"}
 	ctx := context.Background()
@@ -201,12 +328,44 @@ func TestScanBuffersTilesUntilCalibrationArrives(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A tile before the table: buffered, and emitting nothing means Emit is
-	// never called, so the nil Worker plumbing is never exercised.
+	// The tile is held, so nothing is emitted and the worker's channel
+	// plumbing is never touched.
 	if err := hs.OnRecord(ctx, w, sdk.Record{Channel: "tiles", Value: tileJSON}); err != nil {
 		t.Fatalf("tile before calibration: %v", err)
 	}
 	if err := hs.OnDrain(ctx, w); err == nil {
 		t.Fatal("drain with an unserviced tile should fail")
+	}
+}
+
+// TestTilesCoverTheGridOnceWithinOneBand pins the relation the reduction key
+// depends on. A tile is labelled by the band of its first column, so a tile
+// that spanned two bands would file half its cells under the wrong one. That
+// holds only while a band is at least as wide as a tile and the two divide
+// the grid evenly, which is a relation between four constants and nothing
+// else checks it.
+func TestTilesCoverTheGridOnceWithinOneBand(t *testing.T) {
+	all := tiles()
+	if want := (gridRows / tileSize) * (gridCols / tileSize); len(all) != want {
+		t.Fatalf("tiles() returned %d tiles, want %d", len(all), want)
+	}
+	covered := map[string]int{}
+	for _, tl := range all {
+		if first, last := bandOf(tl.Col0), bandOf(tl.Col1-1); first != last {
+			t.Errorf("tile %+v spans bands %s to %s, so its label covers cells it does not own", tl, first, last)
+		}
+		for r := tl.Row0; r < tl.Row1; r++ {
+			for c := tl.Col0; c < tl.Col1; c++ {
+				covered[cellKey(r, c)]++
+			}
+		}
+	}
+	if len(covered) != gridRows*gridCols {
+		t.Errorf("the tiling covers %d cells, want the whole %dx%d grid", len(covered), gridRows, gridCols)
+	}
+	for cell, n := range covered {
+		if n != 1 {
+			t.Errorf("cell %s is covered by %d tiles, want exactly 1", cell, n)
+		}
 	}
 }

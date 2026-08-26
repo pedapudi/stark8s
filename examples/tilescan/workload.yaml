@@ -1,10 +1,16 @@
-# Fan-out/gather: the shape of a task-parallel program built from futures.
+# Fan out a chunked scan over a pool of workers, then gather the results.
 #
-# A driver would hold a big array, put a shared calibration table into the
-# object store, submit one task per chunk, and wait on the list of futures.
-# Here "plan" emits the chunk descriptors, "scan" is the task pool, and the
-# gather is expressed by the Hash partitioning and drain of "hits" rather
-# than by a process waiting on futures. There is no driver at run time.
+# Written with futures, this would be a driver that holds a big array, puts a
+# shared calibration table into the object store, submits one task per chunk,
+# and waits on the list of futures. Here "plan" emits the chunk descriptors,
+# "scan" is the task pool, and the gather is two properties of the "hits"
+# channel: its Hash partitioning routes each result to a reducer, and its
+# drain says when every result is in. Nothing waits on futures, and no driver
+# process exists at run time.
+#
+# See examples/tilescan/main.go for the four things the translation has to
+# replace, and for what the Broadcast table costs here that it does not cost
+# in a shared-memory object store.
 apiVersion: stark8s.io/v1alpha1
 kind: Workload
 metadata:
@@ -24,9 +30,9 @@ spec:
               image: stark8s:dev
               imagePullPolicy: IfNotPresent
               command: ["/tilescan", "plan"]
-    # The task pool. Replica count follows the runnable partitions of
-    # "tiles", which is the autoscaling a Ray cluster would do by adding
-    # workers when the pending-task queue grows.
+    # The task pool. The replica count follows the runnable partitions of
+    # "tiles". A Ray cluster does the same thing by adding workers when the
+    # pending-task queue grows.
     - name: scan
       slots: 1
       scaling:
@@ -50,23 +56,27 @@ spec:
               imagePullPolicy: IfNotPresent
               command: ["/tilescan", "reduce"]
   channels:
-    # The shared object: one copy per consuming replica, not one pointer
-    # per task into a shared-memory store.
+    # The shared object. Broadcast gives every consuming replica its own full
+    # copy of the calibration table. A futures runtime would instead hand each
+    # task a pointer into a shared-memory store, so this is the one place the
+    # translation costs memory: the bill grows with the replica count.
     - name: calib
       from: plan
       to: scan
       partitioning: {mode: Broadcast, partitions: 1}
       delivery: Pipelined
-    # The work queue. RoundRobin because a tile has no key affinity; the
-    # partition count is the ceiling on scan's useful parallelism.
+    # The work queue. A tile has no key affinity, so RoundRobin spreads the
+    # tiles evenly. The partition count is the ceiling on scan's useful
+    # parallelism.
     - name: tiles
       from: plan
       to: scan
       partitioning: {mode: RoundRobin, partitions: 8}
       delivery: Pipelined
-    # The gather. Hash on the band means every result for a band reaches
-    # one reducer; Materialized means reduce is not started until scan has
-    # finished, which is the barrier the driver's get(futures) imposes.
+    # The gather. Hash on the band sends every result for a band to one
+    # reducer, so the summary needs no second reduction. Materialized holds
+    # reduce back until scan has finished, which is the barrier the driver's
+    # get(futures) imposes.
     - name: hits
       from: scan
       to: reduce
