@@ -362,3 +362,30 @@ func TestSynchronousLoopDoesNotStallOnIdlePods(t *testing.T) {
 		t.Fatalf("%d supersteps of no real work took %v, over the %v budget: a pod idle at the barrier is sleeping through its release", supersteps, elapsed, budget)
 	}
 }
+
+func TestUnfetchableSegmentFailsInsteadOfHanging(t *testing.T) {
+	h, stop := newHarness(t, []v1alpha1.Channel{
+		{Name: "s", From: "produce", To: "consume", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 1}},
+	})
+	defer stop()
+
+	// A segment announced by a pod that is no longer serving it. The
+	// coordinator still queues it, and nothing can ever fetch it.
+	if err := h.co.Announce("s", "produce", []coordinator.SegmentAnnouncement{{
+		ID: "seg-gone", Channel: "s", Records: 1, Bytes: 2,
+		Holder: "127.0.0.1:1", Producer: "produce-0",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	errc := make(chan error, 1)
+	w := h.worker("consume", "consume-0", []string{"s"}, nil)
+	go func() { errc <- w.Run(h.ctx, Handlers{}) }()
+	select {
+	case err := <-errc:
+		if err == nil || !strings.Contains(err.Error(), "seg-gone") {
+			t.Fatalf("Run returned %v, want an error naming the segment it could not fetch", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned: a segment that cannot be fetched hangs the worker instead of failing it")
+	}
+}

@@ -588,6 +588,18 @@ const (
 	barrierPollCeiling = 250 * time.Millisecond
 )
 
+// Fetching a segment from its holder. The coordinator has no way to hand a
+// delivered segment back to the pending queue on request, so a consumer that
+// cannot fetch one has only two options: retry, or stop. It retries this
+// many times, doubling the wait from fetchRetryFloor to fetchRetryCeiling --
+// about 5s in total, enough to ride out a holder restart or a network blip
+// -- and then fails.
+const (
+	fetchAttempts     = 6
+	fetchRetryFloor   = 200 * time.Millisecond
+	fetchRetryCeiling = 2 * time.Second
+)
+
 // Run executes the worker: it registers, starts heartbeats and the segment
 // server, loads the topology, and then drives the source or the
 // poll/process/ack loop. When the work is done it idles until ctx ends,
@@ -652,12 +664,21 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			}
 			for _, work := range resp.Work {
 				for _, seg := range work.Segments {
-					recs, err := w.fetch(seg)
+					recs, err := w.fetchRetry(ctx, seg)
 					if err != nil {
-						// The segment stays in flight; it is redelivered if
-						// this pod expires or marked lost if the holder does.
-						log.Printf("fetch segment %s: %v", seg.ID, err)
-						continue
+						if ctx.Err() != nil {
+							return ctx.Err()
+						}
+						// Skipping the segment is not an option: it stays in
+						// flight, so the channel never goes quiet, Drained
+						// never becomes true, OnDrain never runs and the
+						// workload hangs silently. The coordinator returns an
+						// in-flight segment to the pending queue only when it
+						// expires the consumer holding it, which needs this
+						// pod to stop heartbeating. So fail: the pod exits
+						// naming the cause, the Deployment replaces it, and
+						// the coordinator re-queues the segment after PodTTL.
+						return fmt.Errorf("consuming %s: %w", ch, err)
 					}
 					progressed = true
 					w.task = coordinator.TaskID{Channel: ch, Partition: work.Partition, Epoch: seg.Epoch}
@@ -750,6 +771,34 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 		}
 	}
 	return ctx.Err()
+}
+
+// fetchRetry fetches a segment, riding out a transient failure of its holder
+// for a bounded number of attempts.
+func (w *Worker) fetchRetry(ctx context.Context, seg coordinator.SegmentRef) ([]wireRecord, error) {
+	wait := fetchRetryFloor
+	var err error
+	for i := 0; i < fetchAttempts && ctx.Err() == nil; i++ {
+		var recs []wireRecord
+		if recs, err = w.fetch(seg); err == nil {
+			return recs, nil
+		}
+		log.Printf("fetch segment %s from %s (attempt %d of %d): %v", seg.ID, seg.Holder, i+1, fetchAttempts, err)
+		if i == fetchAttempts-1 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(wait):
+		}
+		if wait < fetchRetryCeiling {
+			wait *= 2
+		}
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return nil, fmt.Errorf("fetch segment %s from %s: giving up after %d attempts: %w", seg.ID, seg.Holder, fetchAttempts, err)
 }
 
 // idle keeps the pod alive after its work is done: heartbeats continue,
