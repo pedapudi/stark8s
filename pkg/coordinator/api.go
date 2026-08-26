@@ -17,7 +17,7 @@
 // also serves them on the segment API.
 package coordinator
 
-import "github.com/pedapudi/stark8s/api/v1alpha1"
+import "github.com/pedapudi/stark8s/api/graph"
 
 // Ports and paths.
 const (
@@ -35,7 +35,7 @@ const (
 	// the last record scanned, to pass as `after` on the next call.
 	RecordsNextHeader = "X-Stark8s-Next"
 
-	PathTopology = "/topology"      // PUT  []v1alpha1.Channel; GET -> []v1alpha1.Channel (pods read partitioning and feedback settings)
+	PathTopology = "/topology"      // PUT  []graph.Channel; GET -> []graph.Channel (pods read partitioning and feedback settings)
 	PathMetrics  = "/metrics"       // GET  Metrics
 	PathHealth   = "/healthz"       // GET
 	PathRegister = "/pods/register" // POST PodRegistration (also the heartbeat; repeat every 5s)
@@ -135,9 +135,9 @@ type ConsumeResponse struct {
 	Epoch int32 `json:"epoch"`
 	// Quiescent: Synchronous feedback with nothing pending or in flight at the
 	// current epoch; the consumer should finish the epoch and report it.
-	Quiescent bool                  `json:"quiescent"`
-	MaxEpochs int32                 `json:"maxEpochs,omitempty"`
-	Mode      v1alpha1.FeedbackMode `json:"mode,omitempty"`
+	Quiescent bool               `json:"quiescent"`
+	MaxEpochs int32              `json:"maxEpochs,omitempty"`
+	Mode      graph.FeedbackMode `json:"mode,omitempty"`
 }
 
 // SegmentAck marks a fetched segment as processed by the calling pod.
