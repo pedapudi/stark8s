@@ -48,6 +48,12 @@ type operation struct {
 	pods map[string]*pod
 	// owner maps "partitions/p" -> pod name.
 	owner map[string]string
+	// pinned holds the owner keys whose owner has actually been handed a
+	// segment. A consumer accumulates in-memory state for the partitions it
+	// has processed, so a pinned partition stays with its owner for as long
+	// as that owner is alive; an unpinned one carries no state anywhere and
+	// is redistributed freely as the pod pool grows.
+	pinned map[string]bool
 	// completed latches completion so an operation scaled to zero stays
 	// complete. It is set once inputs are drained and every live pod has
 	// reported done, and cleared as soon as an inbound channel has runnable
@@ -65,6 +71,61 @@ func (o *operation) liveIDs() []string {
 }
 
 func ownerKey(partitions, p int) string { return fmt.Sprintf("%d/%d", partitions, p) }
+
+// balanceHash spreads the partitions of the operation's hash channels with
+// partition count n over its live pods.
+//
+// A partition that has been handed work is pinned: its owner may hold state
+// derived from the records it processed, so moving it would silently corrupt
+// the result and it is left where it is until the owner expires. Every other
+// partition carries no state anywhere, so it is (re)assigned here, least
+// loaded pod first, counting pinned partitions as load already carried. A
+// pod that registers after the first one therefore still receives a share
+// instead of finding every partition taken.
+//
+// The result is a function of the live pods and the pinned partitions alone,
+// so repeated calls that change neither return the same assignment and
+// ownership does not flap. Balancing is per partition count because the
+// assignment for one count must not depend on the assignment for another,
+// which is what makes that fixed point reachable; two hash channels with
+// equal partition counts into one operation share these keys and so stay
+// co-partitioned.
+func (o *operation) balanceHash(n int) {
+	ids := o.liveIDs()
+	if len(ids) == 0 {
+		return
+	}
+	live := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		live[id] = true
+	}
+	load := make(map[string]int, len(ids))
+	var free []int
+	for p := 0; p < n; p++ {
+		k := ownerKey(n, p)
+		owner, owned := o.owner[k]
+		if owned && !live[owner] {
+			delete(o.owner, k)
+			delete(o.pinned, k)
+			owned = false
+		}
+		if owned && o.pinned[k] {
+			load[owner]++
+			continue
+		}
+		free = append(free, p)
+	}
+	for _, p := range free {
+		best := ids[0]
+		for _, id := range ids[1:] {
+			if load[id] < load[best] {
+				best = id
+			}
+		}
+		o.owner[ownerKey(n, p)] = best
+		load[best]++
+	}
+}
 
 // segment is the coordinator's record of one announced segment.
 type segment struct {
@@ -180,7 +241,7 @@ func New(selfAddr string) *Coordinator {
 func (co *Coordinator) op(name string) *operation {
 	o, ok := co.ops[name]
 	if !ok {
-		o = &operation{pods: map[string]*pod{}, owner: map[string]string{}}
+		o = &operation{pods: map[string]*pod{}, owner: map[string]string{}, pinned: map[string]bool{}}
 		co.ops[name] = o
 	}
 	return o
@@ -347,6 +408,7 @@ func (co *Coordinator) expireConsumer(opName string, o *operation, id string) {
 	for k, owner := range o.owner {
 		if owner == id {
 			delete(o.owner, k)
+			delete(o.pinned, k)
 		}
 	}
 	for _, c := range co.channels {
@@ -631,33 +693,13 @@ func (co *Coordinator) seal(c *channel) {
 //
 // RoundRobin partitions have no key affinity so they are rebalanced freely
 // across live pods. Hash partitions carry key affinity so ownership is
-// sticky and shared across the operation's channels: a partition stays with
-// its first owner until that owner expires.
+// sticky and shared across the operation's channels, but only once the owner
+// has been handed work for the partition: see balanceHash.
 func (c *channel) assigned(o *operation, id string) []int {
-	ids := o.liveIDs()
-	idx := sort.SearchStrings(ids, id)
 	var out []int
 	n := c.partitions()
 	if c.spec.Partitioning.Mode == v1alpha1.PartitionHash {
-		for p := 0; p < n; p++ {
-			k := ownerKey(n, p)
-			if _, ok := o.owner[k]; ok {
-				continue
-			}
-			best, bestN := "", int(^uint(0)>>1)
-			for _, cid := range ids {
-				cnt := 0
-				for _, owner := range o.owner {
-					if owner == cid {
-						cnt++
-					}
-				}
-				if cnt < bestN {
-					best, bestN = cid, cnt
-				}
-			}
-			o.owner[k] = best
-		}
+		o.balanceHash(n)
 		for p := 0; p < n; p++ {
 			if o.owner[ownerKey(n, p)] == id {
 				out = append(out, p)
@@ -665,9 +707,11 @@ func (c *channel) assigned(o *operation, id string) []int {
 		}
 		return out
 	}
+	ids := o.liveIDs()
 	if len(ids) == 0 {
 		return nil
 	}
+	idx := sort.SearchStrings(ids, id)
 	for p := 0; p < n; p++ {
 		if p%len(ids) == idx {
 			out = append(out, p)
@@ -803,6 +847,12 @@ func (co *Coordinator) Consume(name, opName, podName string, max int) (*ConsumeR
 					n++
 				}
 				if len(work.Segments) > 0 {
+					// The pod is about to process records of this partition
+					// and may keep state derived from them, so its ownership
+					// stops being provisional here.
+					if c.spec.Partitioning.Mode == v1alpha1.PartitionHash {
+						o.pinned[ownerKey(c.partitions(), p)] = true
+					}
 					resp.Work = append(resp.Work, work)
 				}
 			}

@@ -114,10 +114,13 @@ the generated policies are enforced.
 - Delivery is at-least-once. A consumer that expires has its unacknowledged
   records redelivered to another replica; application state on the expired
   replica is lost. There is no state checkpointing.
-- Hash partitions are assigned to consumer replicas on first contact and
-  stay there. Adding replicas to a hash-partitioned consumer after all
-  partitions are owned has no effect, so `partitions` should be at least
-  the maximum replica count.
+- Hash partition ownership is provisional until the coordinator hands the
+  owner a segment for that partition, and pinned to it from then on: a
+  replica accumulating state for a partition never loses it to a rebalance,
+  only to its own expiry. Replicas that register later pick up whichever
+  partitions have not been handed work yet, so a consumer whose pods start
+  staggered still spreads over them; a partition already in use does not
+  move, so `partitions` should still be at least the maximum replica count.
 - The graph can be edited while a workload runs (the controller pushes the
   channel list on every pass and creates operations on demand), but
   removing an operation or channel from a running workload is not handled.
