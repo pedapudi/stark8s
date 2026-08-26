@@ -70,9 +70,30 @@ type Handlers struct {
 	// is quiescent at the given epoch, before the barrier advances. Emit
 	// next-epoch records here. It is called at most once per epoch.
 	OnEpochEnd func(ctx context.Context, w *Worker, epoch int32) error
-	// OnDrain is called once when every inbound channel is drained. Emit
-	// final results here; the worker then reports done and idles.
+	// OnDrain is called once when every inbound channel that has a producing
+	// operation is drained. Emit final results here; the worker then reports
+	// done and idles.
 	OnDrain func(ctx context.Context, w *Worker) error
+	// Tick is called on an interval, for operations that have work to do on a
+	// clock as well as on their input: polling a feed, a queue or an API,
+	// where a channel supplies what to poll for.
+	//
+	// It runs on the goroutine that consumes records, between passes over the
+	// inbound channels, so it never overlaps OnRecord and the two may share
+	// state without a lock. That is deliberate. The emit buffers are a plain
+	// map keyed by channel, partition and epoch, and Worker.epoch is a field
+	// rewritten for every record consumed, so a Tick running anywhere else
+	// would race with record processing on both.
+	//
+	// The cost of that choice is that a slow Tick delays record processing by
+	// its own duration, and a slow batch of records delays Tick. The interval
+	// is a floor on the period, never a guarantee.
+	//
+	// Tick needs Worker.TickInterval set. It is only reached by the loop that
+	// polls inbound channels, so an operation with no inbound channels runs
+	// Source instead and never ticks; Run rejects that combination rather
+	// than letting the handler sit there uncalled.
+	Tick func(ctx context.Context, w *Worker) error
 }
 
 // bufKey identifies one output buffer: a segment in the making.
@@ -98,6 +119,9 @@ type Worker struct {
 	// ":8090". Tests may set "127.0.0.1:0" to run several workers in one
 	// process.
 	SegmentListen string
+	// TickInterval is how often Handlers.Tick is called. Zero leaves the
+	// operation driven entirely by its records.
+	TickInterval time.Duration
 
 	feedback    map[string]bool
 	feedbackOut map[string]bool
@@ -144,6 +168,16 @@ func FromEnv() (*Worker, error) {
 	}
 	for _, f := range split(os.Getenv(coordinator.EnvFeedbackOut)) {
 		w.feedbackOut[f] = true
+	}
+	if v := strings.TrimSpace(os.Getenv(coordinator.EnvTickInterval)); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("%s=%q: %w", coordinator.EnvTickInterval, v, err)
+		}
+		if d < 0 {
+			return nil, fmt.Errorf("%s=%q: the tick interval must not be negative", coordinator.EnvTickInterval, v)
+		}
+		w.TickInterval = d
 	}
 	if w.Coordinator == "" || w.Operation == "" {
 		return nil, fmt.Errorf("%s and %s must be set", coordinator.EnvCoordinator, coordinator.EnvOperation)
@@ -570,6 +604,13 @@ func (w *Worker) serveSegments() error {
 // returning nil; handler errors abort the worker.
 func (w *Worker) Run(ctx context.Context, h Handlers) error {
 	w.init()
+	// A handler combination that can never fire is a programming mistake, so
+	// it is caught here, before the worker touches the network. Tick is
+	// driven by the loop that polls inbound channels, and an operation with
+	// none of those runs Source instead and reaches that loop never.
+	if h.Tick != nil && len(w.Inbound) == 0 {
+		return fmt.Errorf("operation %s has a Tick handler and no inbound channels: Tick is driven by the loop that polls inbound channels, so give the operation a channel to consume or move the work into Source", w.Operation)
+	}
 	if err := w.serveSegments(); err != nil {
 		return err
 	}
@@ -601,6 +642,60 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 		log.Printf("%s: source complete", w.Instance)
 		return w.idle(ctx)
 	}
+
+	// external is the set of inbound channels that no operation produces
+	// into. They are fed from outside the workload through the records API,
+	// and bounded counts the rest.
+	//
+	// The distinction decides when this operation is finished. A channel with
+	// no producing operation is never sealed, because sealing is what the
+	// controller does when a producing operation completes and there is no
+	// producer here to complete. A channel reports drained only once it is
+	// sealed, so an external channel reports drained never. Counting it in
+	// the drain test would hold the operation open for a seal that cannot
+	// come: OnDrain would never run, the operation would never report done,
+	// its outbound channels would never be sealed, and every consumer behind
+	// a Materialized edge downstream would wait forever. So completion is
+	// decided by the channels that have a producer, and an external topic
+	// left open forever does not by itself keep the operation running.
+	//
+	// An operation whose inbound channels are ALL external is a different
+	// case, and it does not finish. There is no bounded input to wait for and
+	// nothing can ever say the outside world has stopped sending, so the
+	// operation stays in this loop consuming and ticking until its context
+	// ends. Draining it instead would be worse: it would report done before
+	// processing anything and quietly discard the stream it exists to serve.
+	// Such an operation cannot feed a Materialized channel, because that edge
+	// waits on a seal that requires a completion which will never happen.
+	// Validate rejects that graph rather than letting it hang.
+	//
+	// The epoch barrier below is left alone. A Synchronous loop that also
+	// takes an external side input still refuses to advance while that input
+	// is unsealed, which is the behaviour this change does not attempt to
+	// fix; no example combines the two.
+	external := map[string]bool{}
+	bounded := 0
+	for _, ch := range w.Inbound {
+		spec, err := w.spec(ch)
+		if err != nil {
+			return err
+		}
+		if spec.From == "" {
+			external[ch] = true
+			continue
+		}
+		bounded++
+	}
+	if len(external) > 0 {
+		log.Printf("%s: %d of %d inbound channels have no producing operation; completion follows the other %d",
+			w.Instance, len(external), len(w.Inbound), bounded)
+	}
+
+	ticking := h.Tick != nil && w.TickInterval > 0
+	if h.Tick != nil && !ticking {
+		log.Printf("%s: a Tick handler is set but the tick interval is zero, so Tick is never called", w.Instance)
+	}
+	nextTick := time.Now().Add(w.TickInterval)
 
 	backoff := 100 * time.Millisecond
 	for ctx.Err() == nil {
@@ -655,7 +750,7 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 					}
 				}
 			}
-			if !resp.Drained {
+			if !resp.Drained && !external[ch] {
 				allDrained = false
 			}
 			if w.feedback[ch] && resp.Mode != v1alpha1.FeedbackAsynchronous && !resp.Quiescent {
@@ -666,11 +761,28 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 				allQuiet = false
 			}
 		}
+
+		// Tick runs here: on this goroutine, between passes over the inbound
+		// channels, and never inside one. It is placed before the progressed
+		// check so that a busy operation still ticks; putting it after would
+		// starve the clock exactly when the input is heaviest.
+		if ticking && !time.Now().Before(nextTick) {
+			if err := h.Tick(ctx, w); err != nil {
+				return err
+			}
+			if err := w.retry(ctx, w.Flush); err != nil {
+				return err
+			}
+			// Measured from the end of the handler, so a Tick that runs longer
+			// than the interval does not come due again the instant it returns.
+			nextTick = time.Now().Add(w.TickInterval)
+		}
+
 		if progressed {
 			backoff = 100 * time.Millisecond
 			continue
 		}
-		if allDrained {
+		if allDrained && bounded > 0 {
 			if h.OnDrain != nil {
 				if err := h.OnDrain(ctx, w); err != nil {
 					return err
@@ -705,7 +817,18 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			w.lastDone = w.epoch
 			continue
 		}
-		time.Sleep(backoff)
+		// The idle backoff must not outrun the clock. Without this cap a
+		// worker that has settled at the two-second ceiling would serve a
+		// hundred-millisecond tick interval two seconds late.
+		wait := backoff
+		if ticking {
+			if d := time.Until(nextTick); d < wait {
+				wait = d
+			}
+		}
+		if wait > 0 {
+			time.Sleep(wait)
+		}
 		if backoff < 2*time.Second {
 			backoff *= 2
 		}

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -436,4 +437,114 @@ func keys(m map[string]networkingv1.NetworkPolicy) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// --- tick interval and externally fed operations -----------------------------
+
+func opNamed(name string) v1alpha1.Operation {
+	return v1alpha1.Operation{
+		Name: name,
+		Template: corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "img"}}},
+		},
+	}
+}
+
+// TestValidateRejectsMaterializedBehindAnExternallyFedOperation: an operation
+// whose every inbound channel comes from outside the workload never completes,
+// because nothing can say the outside world has stopped sending. The
+// controller seals an operation's outbound channels only once it completes, so
+// a Materialized edge from such an operation waits on a seal that cannot come
+// and its consumer never starts. That graph hangs, so it is refused.
+func TestValidateRejectsMaterializedBehindAnExternallyFedOperation(t *testing.T) {
+	spec := &v1alpha1.WorkloadSpec{
+		Operations: []v1alpha1.Operation{opNamed("poll"), opNamed("sink")},
+		Channels: []v1alpha1.Channel{
+			{Name: "config", To: "poll"},
+			{Name: "out", From: "poll", To: "sink", Delivery: v1alpha1.DeliveryMaterialized},
+		},
+	}
+	err := Validate(spec)
+	if err == nil {
+		t.Fatal("a Materialized channel behind an operation fed only from outside was accepted; it would hang")
+	}
+	for _, want := range []string{"out", "poll", "sink"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+
+	// The same graph is fine when the edge is Pipelined, because a Pipelined
+	// consumer does not wait for a seal.
+	spec.Channels[1].Delivery = v1alpha1.DeliveryPipelined
+	if err := Validate(spec); err != nil {
+		t.Errorf("a Pipelined edge from the same operation was rejected: %v", err)
+	}
+
+	// And fine when the operation also has an inbound channel with a producer,
+	// because that one can be sealed and so the operation can complete.
+	spec.Channels[1].Delivery = v1alpha1.DeliveryMaterialized
+	spec.Operations = append(spec.Operations, opNamed("gen"))
+	spec.Channels = append(spec.Channels, v1alpha1.Channel{Name: "work", From: "gen", To: "poll"})
+	if err := Validate(spec); err != nil {
+		t.Errorf("an operation with one producer-backed inbound channel was rejected: %v", err)
+	}
+}
+
+// TestValidateRejectsNegativeTickInterval keeps a typo from becoming a worker
+// that never ticks.
+func TestValidateRejectsNegativeTickInterval(t *testing.T) {
+	op := opNamed("poll")
+	op.TickInterval = &metav1.Duration{Duration: -time.Second}
+	spec := &v1alpha1.WorkloadSpec{
+		Operations: []v1alpha1.Operation{op},
+		Channels:   []v1alpha1.Channel{{Name: "config", To: "poll"}},
+	}
+	if err := Validate(spec); err == nil {
+		t.Fatal("a negative tickInterval was accepted")
+	}
+	op.TickInterval = &metav1.Duration{Duration: 30 * time.Second}
+	spec.Operations = []v1alpha1.Operation{op}
+	if err := Validate(spec); err != nil {
+		t.Errorf("a positive tickInterval was rejected: %v", err)
+	}
+}
+
+// TestTickIntervalReachesThePod: the interval is declared on the operation and
+// has to arrive as the environment variable the SDK reads, or the handler
+// never fires in a real cluster.
+func TestTickIntervalReachesThePod(t *testing.T) {
+	wl := mapReduce()
+	for i := range wl.Spec.Operations {
+		if wl.Spec.Operations[i].Name == "map" {
+			wl.Spec.Operations[i].TickInterval = &metav1.Duration{Duration: 90 * time.Second}
+		}
+	}
+	h := newHarness(t, wl)
+	h.reconcile()
+
+	d, _ := h.deployment("wc-map")
+	var got string
+	for _, e := range d.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == coordinator.EnvTickInterval {
+			got = e.Value
+		}
+	}
+	if got != "1m30s" {
+		t.Errorf("%s = %q, want %q", coordinator.EnvTickInterval, got, "1m30s")
+	}
+
+	// An operation without an interval must not carry the variable at all, so
+	// that FromEnv leaves ticking off rather than parsing an empty string.
+	// wc-read is used here because wc-reduce sits behind a Materialized edge
+	// and has no deployment until that edge is sealed.
+	r, ok := h.deployment("wc-read")
+	if !ok {
+		t.Fatal("wc-read has no deployment")
+	}
+	for _, e := range r.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == coordinator.EnvTickInterval {
+			t.Errorf("an operation with no tickInterval carries %s=%q", e.Name, e.Value)
+		}
+	}
 }

@@ -1067,10 +1067,29 @@ func (co *Coordinator) operationMetrics(name string) OperationMetrics {
 	complete := true
 	hasInbound := false
 	runnable := map[string]bool{}
+	// boundedWork is pending work on an inbound channel that some operation
+	// produces into. It is what decides completion; work pending on a channel
+	// fed from outside the workload is counted for scaling and not for
+	// completion, so a record arriving after the operation finished does not
+	// flip it back to unfinished forever. The worker has stopped consuming by
+	// then, so nothing would ever clear it.
+	boundedWork := false
 	for _, c := range co.channels {
 		if c.spec.To == name {
 			hasInbound = true
-			if !(c.sealed && c.quiet() && c.heldRecords() == 0) {
+			// A channel with no producing operation is never sealed, because
+			// sealing is what the controller does when a producing operation
+			// completes and there is no producer here to complete. Gating on
+			// it would hold this operation open forever: its outbound
+			// channels would never be sealed and every consumer behind a
+			// Materialized edge would wait for a seal that cannot come. So
+			// completion follows the channels that have a producer, which
+			// matches the rule the worker applies to its own drain.
+			//
+			// An operation whose inbound channels are ALL external still
+			// never completes. Its worker never drains and so never reports
+			// done, and the pod check below keeps complete false.
+			if c.spec.From != "" && !(c.sealed && c.quiet() && c.heldRecords() == 0) {
 				complete = false
 			}
 			if !c.gated() {
@@ -1083,6 +1102,9 @@ func (co *Coordinator) operationMetrics(name string) OperationMetrics {
 						k = "hash/" + ownerKey(c.partitions(), p)
 					}
 					runnable[k] = true
+					if c.spec.From != "" {
+						boundedWork = true
+					}
 				}
 			}
 		}
@@ -1095,7 +1117,7 @@ func (co *Coordinator) operationMetrics(name string) OperationMetrics {
 		}
 	}
 	om.RunnableTasks = int32(len(runnable))
-	if len(runnable) > 0 {
+	if boundedWork {
 		complete = false
 	}
 	if !hasInbound {
@@ -1116,7 +1138,7 @@ func (co *Coordinator) operationMetrics(name string) OperationMetrics {
 	}
 	if complete {
 		o.completed = true
-	} else if len(runnable) > 0 {
+	} else if boundedWork {
 		// Late input on an inbound channel restarts a completed operation.
 		o.completed = false
 	}

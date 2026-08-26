@@ -204,6 +204,9 @@ func Validate(s *v1alpha1.WorkloadSpec) error {
 		if o.Slots < 0 {
 			return fmt.Errorf("operation %q: slots must be at least 1", o.Name)
 		}
+		if o.TickInterval != nil && o.TickInterval.Duration < 0 {
+			return fmt.Errorf("operation %q: tickInterval must not be negative", o.Name)
+		}
 	}
 	chans := map[string]bool{}
 	for _, c := range s.Channels {
@@ -239,6 +242,34 @@ func Validate(s *v1alpha1.WorkloadSpec) error {
 			adj[c.From] = append(adj[c.From], c.To)
 		}
 	}
+	// An operation whose inbound channels all come from outside the workload
+	// never completes. Nothing can say that the outside world has stopped
+	// sending, so the operation keeps consuming, the controller never seals
+	// its outbound channels, and a Materialized edge from it waits on a seal
+	// that cannot come. That is a graph which hangs rather than one which
+	// fails, so reject it here instead.
+	for _, o := range s.Operations {
+		inbound, external := 0, 0
+		for _, c := range s.Channels {
+			if c.To != o.Name {
+				continue
+			}
+			inbound++
+			if c.From == "" {
+				external++
+			}
+		}
+		if inbound == 0 || inbound != external {
+			continue
+		}
+		for _, c := range s.Channels {
+			if c.From == o.Name && c.Delivery == v1alpha1.DeliveryMaterialized {
+				return fmt.Errorf("channel %q is Materialized, but its producer %q is fed only from outside the workload and so never completes; the channel would never be sealed and %q would never start",
+					c.Name, o.Name, c.To)
+			}
+		}
+	}
+
 	const white, grey, black = 0, 1, 2
 	color := map[string]int{}
 	var visit func(string) error
@@ -563,6 +594,9 @@ func (r *Reconciler) podTemplate(wl *v1alpha1.Workload, op *v1alpha1.Operation) 
 		{Name: coordinator.EnvFeedback, Value: strings.Join(fb, ",")},
 		{Name: coordinator.EnvFeedbackOut, Value: strings.Join(fbOut, ",")},
 		{Name: coordinator.EnvSegmentDir, Value: SegmentDir},
+	}
+	if op.TickInterval != nil && op.TickInterval.Duration > 0 {
+		env = append(env, corev1.EnvVar{Name: coordinator.EnvTickInterval, Value: op.TickInterval.Duration.String()})
 	}
 	hasVolume := false
 	for _, v := range tpl.Spec.Volumes {
