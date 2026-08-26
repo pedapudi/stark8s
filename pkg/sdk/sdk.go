@@ -82,6 +82,22 @@ type bufKey struct {
 	epoch     int32
 }
 
+// Thresholds at which an output buffer becomes a segment. Whichever trips
+// first wins.
+const (
+	// flushRecords caps a segment's record count. The per-record and
+	// per-segment costs are what dominate for the small records most
+	// operations emit, so this is the threshold that usually decides.
+	flushRecords = 500
+	// flushBytes caps a buffer's accumulated encoded size, so an operation
+	// emitting large values cannot hold an unbounded amount of memory while
+	// waiting for the 500th record. 4 MiB is small enough that a pod with a
+	// few dozen live buffers stays well inside a normal container limit, and
+	// large enough that it never fires for records under ~8 KiB, which
+	// leaves the record threshold in charge of the common case.
+	flushBytes = 4 << 20
+)
+
 // Worker is one pod of an operation.
 type Worker struct {
 	Coordinator string
@@ -106,6 +122,7 @@ type Worker struct {
 	specs  map[string]v1alpha1.Channel
 
 	buffers     map[bufKey][]wireRecord
+	bufBytes    map[bufKey]int
 	order       []bufKey
 	rr          map[string]uint64
 	unannounced map[string][]coordinator.SegmentAnnouncement
@@ -168,6 +185,7 @@ func (w *Worker) init() {
 	}
 	if w.buffers == nil {
 		w.buffers = map[bufKey][]wireRecord{}
+		w.bufBytes = map[bufKey]int{}
 		w.rr = map[string]uint64{}
 		w.unannounced = map[string][]coordinator.SegmentAnnouncement{}
 		w.overflowed = map[string]int64{}
@@ -337,7 +355,8 @@ func (w *Worker) buffer(channel, key string, value json.RawMessage, epoch int32)
 		w.order = append(w.order, k)
 	}
 	w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: value, Epoch: epoch})
-	if len(w.buffers[k]) >= 500 {
+	w.bufBytes[k] += len(key) + len(value)
+	if len(w.buffers[k]) >= flushRecords || w.bufBytes[k] >= flushBytes {
 		return w.flushBuffer(k)
 	}
 	return nil
@@ -379,6 +398,7 @@ func (w *Worker) flushBuffer(k bufKey) error {
 	recs := w.buffers[k]
 	if len(recs) == 0 {
 		delete(w.buffers, k)
+		delete(w.bufBytes, k)
 		return nil
 	}
 	spec, err := w.spec(k.channel)
@@ -391,6 +411,7 @@ func (w *Worker) flushBuffer(k bufKey) error {
 			return err
 		}
 		delete(w.buffers, k)
+		delete(w.bufBytes, k)
 		return nil
 	}
 	if w.store == nil {
@@ -403,6 +424,7 @@ func (w *Worker) flushBuffer(k bufKey) error {
 		return err
 	}
 	delete(w.buffers, k)
+	delete(w.bufBytes, k)
 	w.unannounced[k.channel] = append(w.unannounced[k.channel], coordinator.SegmentAnnouncement{
 		ID: id, Channel: k.channel, Partition: k.partition, Epoch: k.epoch,
 		Records: int64(len(recs)), Bytes: size, Holder: w.addr, Producer: w.Instance, Task: w.task,
@@ -630,6 +652,7 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 		} else if err != nil {
 			log.Printf("%s: output channel already sealed; source output was produced by an earlier pod", w.Instance)
 			w.buffers = map[bufKey][]wireRecord{}
+			w.bufBytes = map[bufKey]int{}
 		}
 		if err := w.retry(ctx, w.reportDone); err != nil {
 			return err

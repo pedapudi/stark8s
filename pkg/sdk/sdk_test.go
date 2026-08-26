@@ -389,3 +389,41 @@ func TestUnfetchableSegmentFailsInsteadOfHanging(t *testing.T) {
 		t.Fatal("Run never returned: a segment that cannot be fetched hangs the worker instead of failing it")
 	}
 }
+
+func TestLargeRecordsFlushOnBytes(t *testing.T) {
+	h, stop := newHarness(t, []v1alpha1.Channel{
+		{Name: "big", From: "a", To: "b", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 1}},
+		{Name: "small", From: "a", To: "b", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 1}},
+	})
+	defer stop()
+	w := h.worker("a", "a-0", nil, []string{"big", "small"})
+
+	// Ten records of 1 MiB each: 10 MiB buffered, nowhere near the 500
+	// records the count threshold waits for.
+	value := strings.Repeat("x", 1<<20)
+	for i := 0; i < 10; i++ {
+		if err := w.Emit("big", fmt.Sprintf("k%d", i), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(w.unannounced["big"]); n < 2 {
+		t.Fatalf("10 MiB in 10 records produced %d segments, want at least 2: the buffer grows without bound until it holds %d records", n, flushRecords)
+	}
+
+	// Small records still flush on the count alone, at exactly the same
+	// point as before.
+	for i := 0; i < flushRecords-1; i++ {
+		if err := w.Emit("small", "k", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(w.unannounced["small"]); n != 0 {
+		t.Fatalf("%d small records produced %d segments, want none before the %dth", flushRecords-1, n, flushRecords)
+	}
+	if err := w.Emit("small", "k", 0); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(w.unannounced["small"]); n != 1 {
+		t.Fatalf("%d small records produced %d segments, want exactly 1", flushRecords, n)
+	}
+}
