@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/api/v1alpha1"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
@@ -160,9 +161,9 @@ func mapReduce() *v1alpha1.Workload {
 				{Name: "map", Slots: 2, Scaling: v1alpha1.Scaling{Horizontal: v1alpha1.HorizontalScaling{Min: 1, Max: 4}}, Template: container()},
 				{Name: "reduce", Slots: 1, Scaling: v1alpha1.Scaling{Horizontal: v1alpha1.HorizontalScaling{Min: 1, Max: 3}}, Template: container()},
 			},
-			Channels: []v1alpha1.Channel{
-				{Name: "lines", From: "read", To: "map", Delivery: v1alpha1.DeliveryPipelined},
-				{Name: "shuffle", From: "map", To: "reduce", Delivery: v1alpha1.DeliveryMaterialized},
+			Channels: []graph.Channel{
+				{Name: "lines", From: "read", To: "map", Delivery: graph.DeliveryPipelined},
+				{Name: "shuffle", From: "map", To: "reduce", Delivery: graph.DeliveryMaterialized},
 				{Name: "totals", From: "reduce"},
 			},
 		},
@@ -344,7 +345,7 @@ func TestPerEdgeNetworkPolicies(t *testing.T) {
 	if err := h.c.Get(context.Background(), h.key, wl); err != nil {
 		t.Fatal(err)
 	}
-	wl.Spec.Channels = []v1alpha1.Channel{wl.Spec.Channels[0], wl.Spec.Channels[2]}
+	wl.Spec.Channels = []graph.Channel{wl.Spec.Channels[0], wl.Spec.Channels[2]}
 	if err := h.c.Update(context.Background(), wl); err != nil {
 		t.Fatal(err)
 	}

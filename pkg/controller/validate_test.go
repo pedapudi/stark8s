@@ -3,10 +3,11 @@ package controller
 import (
 	"testing"
 
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/api/v1alpha1"
 )
 
-func spec(chans ...v1alpha1.Channel) *v1alpha1.WorkloadSpec {
+func spec(chans ...graph.Channel) *v1alpha1.WorkloadSpec {
 	return &v1alpha1.WorkloadSpec{
 		Operations: []v1alpha1.Operation{{Name: "a"}, {Name: "b"}, {Name: "c"}},
 		Channels:   chans,
@@ -15,36 +16,36 @@ func spec(chans ...v1alpha1.Channel) *v1alpha1.WorkloadSpec {
 
 func TestValidateRejectsCycleWithoutFeedback(t *testing.T) {
 	s := spec(
-		v1alpha1.Channel{Name: "ab", From: "a", To: "b"},
-		v1alpha1.Channel{Name: "bc", From: "b", To: "c"},
-		v1alpha1.Channel{Name: "ca", From: "c", To: "a"},
+		graph.Channel{Name: "ab", From: "a", To: "b"},
+		graph.Channel{Name: "bc", From: "b", To: "c"},
+		graph.Channel{Name: "ca", From: "c", To: "a"},
 	)
 	if err := Validate(s); err == nil {
 		t.Fatal("cycle without feedback accepted")
 	}
-	s.Channels[2].Feedback = &v1alpha1.Feedback{MaxEpochs: 5}
+	s.Channels[2].Feedback = &graph.Feedback{MaxEpochs: 5}
 	if err := Validate(s); err != nil {
 		t.Fatal(err)
 	}
-	s.Channels[2].Feedback.Mode = v1alpha1.FeedbackAsynchronous
+	s.Channels[2].Feedback.Mode = graph.FeedbackAsynchronous
 	if err := Validate(s); err != nil {
 		t.Fatalf("asynchronous feedback on a cycle rejected: %v", err)
 	}
 }
 
 func TestValidateRejectsUnknownOperation(t *testing.T) {
-	if err := Validate(spec(v1alpha1.Channel{Name: "x", From: "a", To: "zz"})); err == nil {
+	if err := Validate(spec(graph.Channel{Name: "x", From: "a", To: "zz"})); err == nil {
 		t.Fatal("unknown consumer accepted")
 	}
 }
 
 func TestValidateOverflowMustBeDeclared(t *testing.T) {
-	loop := v1alpha1.Channel{Name: "loop", From: "a", To: "a",
-		Feedback: &v1alpha1.Feedback{Mode: v1alpha1.FeedbackAsynchronous, MaxEpochs: 3, Overflow: "spill"}}
+	loop := graph.Channel{Name: "loop", From: "a", To: "a",
+		Feedback: &graph.Feedback{Mode: graph.FeedbackAsynchronous, MaxEpochs: 3, Overflow: "spill"}}
 	if err := Validate(spec(loop)); err == nil {
 		t.Fatal("undeclared overflow channel accepted")
 	}
-	if err := Validate(spec(loop, v1alpha1.Channel{Name: "spill", From: "a"})); err != nil {
+	if err := Validate(spec(loop, graph.Channel{Name: "spill", From: "a"})); err != nil {
 		t.Fatalf("declared overflow channel rejected: %v", err)
 	}
 	loop.Feedback.Overflow = "loop"
@@ -72,9 +73,9 @@ func TestValidateSlots(t *testing.T) {
 func TestDesiredReplicas(t *testing.T) {
 	s := &v1alpha1.WorkloadSpec{
 		Operations: []v1alpha1.Operation{{Name: "src"}, {Name: "piped"}, {Name: "staged"}},
-		Channels: []v1alpha1.Channel{
-			{Name: "p", From: "src", To: "piped", Delivery: v1alpha1.DeliveryPipelined},
-			{Name: "m", From: "piped", To: "staged", Delivery: v1alpha1.DeliveryMaterialized},
+		Channels: []graph.Channel{
+			{Name: "p", From: "src", To: "piped", Delivery: graph.DeliveryPipelined},
+			{Name: "m", From: "piped", To: "staged", Delivery: graph.DeliveryMaterialized},
 		},
 	}
 	op := func(name string, slots, min, max int32) *v1alpha1.Operation {
