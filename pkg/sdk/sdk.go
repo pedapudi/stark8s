@@ -82,6 +82,22 @@ type bufKey struct {
 	epoch     int32
 }
 
+// Thresholds at which an output buffer becomes a segment. Whichever trips
+// first wins.
+const (
+	// flushRecords caps a segment's record count. The per-record and
+	// per-segment costs are what dominate for the small records most
+	// operations emit, so this is the threshold that usually decides.
+	flushRecords = 500
+	// flushBytes caps a buffer's accumulated encoded size, so an operation
+	// emitting large values cannot hold an unbounded amount of memory while
+	// waiting for the 500th record. 4 MiB is small enough that a pod with a
+	// few dozen live buffers stays well inside a normal container limit, and
+	// large enough that it never fires for records under ~8 KiB, which
+	// leaves the record threshold in charge of the common case.
+	flushBytes = 4 << 20
+)
+
 // Worker is one pod of an operation.
 type Worker struct {
 	Coordinator string
@@ -106,6 +122,7 @@ type Worker struct {
 	specs  map[string]v1alpha1.Channel
 
 	buffers     map[bufKey][]wireRecord
+	bufBytes    map[bufKey]int
 	order       []bufKey
 	rr          map[string]uint64
 	unannounced map[string][]coordinator.SegmentAnnouncement
@@ -168,6 +185,7 @@ func (w *Worker) init() {
 	}
 	if w.buffers == nil {
 		w.buffers = map[bufKey][]wireRecord{}
+		w.bufBytes = map[bufKey]int{}
 		w.rr = map[string]uint64{}
 		w.unannounced = map[string][]coordinator.SegmentAnnouncement{}
 		w.overflowed = map[string]int64{}
@@ -337,7 +355,8 @@ func (w *Worker) buffer(channel, key string, value json.RawMessage, epoch int32)
 		w.order = append(w.order, k)
 	}
 	w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: value, Epoch: epoch})
-	if len(w.buffers[k]) >= 500 {
+	w.bufBytes[k] += len(key) + len(value)
+	if len(w.buffers[k]) >= flushRecords || w.bufBytes[k] >= flushBytes {
 		return w.flushBuffer(k)
 	}
 	return nil
@@ -379,6 +398,7 @@ func (w *Worker) flushBuffer(k bufKey) error {
 	recs := w.buffers[k]
 	if len(recs) == 0 {
 		delete(w.buffers, k)
+		delete(w.bufBytes, k)
 		return nil
 	}
 	spec, err := w.spec(k.channel)
@@ -391,6 +411,7 @@ func (w *Worker) flushBuffer(k bufKey) error {
 			return err
 		}
 		delete(w.buffers, k)
+		delete(w.bufBytes, k)
 		return nil
 	}
 	if w.store == nil {
@@ -403,6 +424,7 @@ func (w *Worker) flushBuffer(k bufKey) error {
 		return err
 	}
 	delete(w.buffers, k)
+	delete(w.bufBytes, k)
 	w.unannounced[k.channel] = append(w.unannounced[k.channel], coordinator.SegmentAnnouncement{
 		ID: id, Channel: k.channel, Partition: k.partition, Epoch: k.epoch,
 		Records: int64(len(recs)), Bytes: size, Holder: w.addr, Producer: w.Instance, Task: w.task,
@@ -564,6 +586,42 @@ func (w *Worker) serveSegments() error {
 
 // --- running --------------------------------------------------------------
 
+// Consume polling. When a poll finds nothing the worker sleeps, doubling the
+// sleep from pollFloor up to a ceiling.
+const (
+	pollFloor = 100 * time.Millisecond
+	// pollCeiling applies outside a Synchronous loop, where a pod that finds
+	// nothing is idle because its producers are slow and there is nothing
+	// for it to react to promptly.
+	pollCeiling = 2 * time.Second
+	// barrierPollCeiling applies while an inbound Synchronous feedback
+	// channel is driving the epoch. There every pod is idle by definition
+	// while it waits at the barrier, so pollCeiling saturates and the pod
+	// can then sleep for up to another 2s after the barrier releases -- dead
+	// time comparable to a whole superstep, on every superstep.
+	//
+	// 250ms bounds that wakeup delay while keeping the request rate modest:
+	// one consume per inbound channel per pod per 250ms, so 4 requests per
+	// second per channel from each pod. A 200-pod operation with two inbound
+	// channels asks the coordinator for at most 1600 consumes/s, each a
+	// short critical section under the coordinator's single mutex. Polling
+	// harder would trade a shared bottleneck for latency the barrier does
+	// not actually have.
+	barrierPollCeiling = 250 * time.Millisecond
+)
+
+// Fetching a segment from its holder. The coordinator has no way to hand a
+// delivered segment back to the pending queue on request, so a consumer that
+// cannot fetch one has only two options: retry, or stop. It retries this
+// many times, doubling the wait from fetchRetryFloor to fetchRetryCeiling --
+// about 5s in total, enough to ride out a holder restart or a network blip
+// -- and then fails.
+const (
+	fetchAttempts     = 6
+	fetchRetryFloor   = 200 * time.Millisecond
+	fetchRetryCeiling = 2 * time.Second
+)
+
 // Run executes the worker: it registers, starts heartbeats and the segment
 // server, loads the topology, and then drives the source or the
 // poll/process/ack loop. When the work is done it idles until ctx ends,
@@ -594,6 +652,7 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 		} else if err != nil {
 			log.Printf("%s: output channel already sealed; source output was produced by an earlier pod", w.Instance)
 			w.buffers = map[bufKey][]wireRecord{}
+			w.bufBytes = map[bufKey]int{}
 		}
 		if err := w.retry(ctx, w.reportDone); err != nil {
 			return err
@@ -602,7 +661,11 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 		return w.idle(ctx)
 	}
 
-	backoff := 100 * time.Millisecond
+	backoff := pollFloor
+	// observedEpoch is the last epoch this pod saw, so that a barrier
+	// release puts the poll rate back at the floor even when the pod then
+	// finds no work of its own in the new superstep.
+	observedEpoch := int32(-1)
 	for ctx.Err() == nil {
 		progressed := false
 		allDrained := true
@@ -624,12 +687,21 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			}
 			for _, work := range resp.Work {
 				for _, seg := range work.Segments {
-					recs, err := w.fetch(seg)
+					recs, err := w.fetchRetry(ctx, seg)
 					if err != nil {
-						// The segment stays in flight; it is redelivered if
-						// this pod expires or marked lost if the holder does.
-						log.Printf("fetch segment %s: %v", seg.ID, err)
-						continue
+						if ctx.Err() != nil {
+							return ctx.Err()
+						}
+						// Skipping the segment is not an option: it stays in
+						// flight, so the channel never goes quiet, Drained
+						// never becomes true, OnDrain never runs and the
+						// workload hangs silently. The coordinator returns an
+						// in-flight segment to the pending queue only when it
+						// expires the consumer holding it, which needs this
+						// pod to stop heartbeating. So fail: the pod exits
+						// naming the cause, the Deployment replaces it, and
+						// the coordinator re-queues the segment after PodTTL.
+						return fmt.Errorf("consuming %s: %w", ch, err)
 					}
 					progressed = true
 					w.task = coordinator.TaskID{Channel: ch, Partition: work.Partition, Epoch: seg.Epoch}
@@ -666,8 +738,12 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 				allQuiet = false
 			}
 		}
+		if w.epoch != observedEpoch {
+			observedEpoch = w.epoch
+			backoff = pollFloor
+		}
 		if progressed {
-			backoff = 100 * time.Millisecond
+			backoff = pollFloor
 			continue
 		}
 		if allDrained {
@@ -705,12 +781,47 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			w.lastDone = w.epoch
 			continue
 		}
+		ceiling := pollCeiling
+		if w.syncLoop {
+			ceiling = barrierPollCeiling
+		}
+		if backoff > ceiling {
+			backoff = ceiling
+		}
 		time.Sleep(backoff)
-		if backoff < 2*time.Second {
+		if backoff < ceiling {
 			backoff *= 2
 		}
 	}
 	return ctx.Err()
+}
+
+// fetchRetry fetches a segment, riding out a transient failure of its holder
+// for a bounded number of attempts.
+func (w *Worker) fetchRetry(ctx context.Context, seg coordinator.SegmentRef) ([]wireRecord, error) {
+	wait := fetchRetryFloor
+	var err error
+	for i := 0; i < fetchAttempts && ctx.Err() == nil; i++ {
+		var recs []wireRecord
+		if recs, err = w.fetch(seg); err == nil {
+			return recs, nil
+		}
+		log.Printf("fetch segment %s from %s (attempt %d of %d): %v", seg.ID, seg.Holder, i+1, fetchAttempts, err)
+		if i == fetchAttempts-1 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(wait):
+		}
+		if wait < fetchRetryCeiling {
+			wait *= 2
+		}
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return nil, fmt.Errorf("fetch segment %s from %s: giving up after %d attempts: %w", seg.ID, seg.Holder, fetchAttempts, err)
 }
 
 // idle keeps the pod alive after its work is done: heartbeats continue,

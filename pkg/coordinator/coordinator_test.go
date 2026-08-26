@@ -560,3 +560,71 @@ func TestPendingByPartitionAndHTTPRoundTrip(t *testing.T) {
 }
 
 func bytesReader(b []byte) *bytes.Reader { return bytes.NewReader(b) }
+
+func TestHashPartitionsRebalanceOntoLatePods(t *testing.T) {
+	co := New("self:8090")
+	co.Configure([]v1alpha1.Channel{{Name: "s", From: "a", To: "b",
+		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 4}}})
+	// One replica of the consumer is ready before the others and polls an
+	// empty channel, as happens whenever pods start staggered.
+	register(t, co, "b", "b-0")
+	if _, err := co.Consume("s", "b", "b-0", 10); err != nil {
+		t.Fatal(err)
+	}
+	pods := []string{"b-0", "b-1", "b-2", "b-3"}
+	for _, id := range pods[1:] {
+		register(t, co, "b", id)
+	}
+	for p := int32(0); p < 4; p++ {
+		announce(t, co, "s", "a", "a-0", p, 0, 1)
+	}
+	got := map[string]int64{}
+	for _, id := range pods {
+		if n, _ := drain(t, co, "s", "b", id); n > 0 {
+			got[id] = n
+		}
+	}
+	if len(got) != 4 {
+		t.Fatalf("4 partitions over 4 replicas reached %d of them (%v): partitions taken before the other replicas registered are never revisited", len(got), got)
+	}
+}
+
+func TestHashPartitionStaysWithTheOwnerThatProcessedIt(t *testing.T) {
+	co := New("self:8090")
+	co.Configure([]v1alpha1.Channel{{Name: "s", From: "a", To: "b",
+		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 4}}})
+	register(t, co, "b", "b-0")
+	announce(t, co, "s", "a", "a-0", 2, 0, 1)
+	if n, _ := drain(t, co, "s", "b", "b-0"); n != 1 {
+		t.Fatalf("first consumer got %d records, want 1", n)
+	}
+	for _, id := range []string{"b-1", "b-2", "b-3"} {
+		register(t, co, "b", id)
+	}
+	// b-0 may hold state derived from partition 2, so partition 2 must keep
+	// going to b-0 however many replicas appear and however often the
+	// assignment is recomputed.
+	for round := 0; round < 3; round++ {
+		announce(t, co, "s", "a", "a-0", 2, 0, 1)
+		for _, id := range []string{"b-1", "b-2", "b-3", "b-0"} {
+			n, _ := drain(t, co, "s", "b", id)
+			if n > 0 && id != "b-0" {
+				t.Fatalf("round %d: partition 2 migrated to %s after b-0 processed it", round, id)
+			}
+		}
+	}
+	// The other three partitions carry no state anywhere, so they are free
+	// to move onto the replicas that arrived late.
+	for p := int32(0); p < 4; p++ {
+		announce(t, co, "s", "a", "a-0", p, 0, 1)
+	}
+	owners := map[string]bool{}
+	for _, id := range []string{"b-0", "b-1", "b-2", "b-3"} {
+		if n, _ := drain(t, co, "s", "b", id); n > 0 {
+			owners[id] = true
+		}
+	}
+	if len(owners) != 4 {
+		t.Fatalf("4 partitions spread over %d replicas: %v", len(owners), owners)
+	}
+}
