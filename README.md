@@ -52,7 +52,9 @@ the size of the sealed shuffle, and each replica owns a fixed set of hash
 partitions, so every count for a word lands on one replica.
 
 A cyclic example, PageRank with a feedback channel from `rank` to itself, is
-in [examples/pagerank](examples/pagerank/workload.yaml).
+in [examples/pagerank](examples/pagerank/workload.yaml). A cycle between two
+operations, the parameter server, is in
+[examples/paramserver](examples/paramserver).
 
 ## Running locally
 
@@ -82,6 +84,9 @@ the generated policies are enforced.
   and how the pieces find each other.
 - [docs/spark-mapping.md](docs/spark-mapping.md) — how a Spark physical
   plan maps onto a Workload, and what the mapping exposes.
+- [docs/ray-mapping.md](docs/ray-mapping.md) — which Ray programs map onto
+  a Workload, the parameter server written out, and where a synchronous
+  barrier across two operations breaks down.
 - [docs/precedent.md](docs/precedent.md) — prior systems and papers, and
   what this design takes from each.
 - [web/editor.html](web/editor.html) — a single-file graph editor and
@@ -98,7 +103,7 @@ the generated policies are enforced.
 | `pkg/exchange` | the earlier brokered in-memory channel runtime, kept only while `pkg/controller` still imports it |
 | `pkg/sdk` | worker library: local segments, fetch, process, acknowledge, supersteps |
 | `cmd/controller`, `cmd/coordinator` | binaries |
-| `examples/wordcount`, `examples/pagerank` | acyclic and cyclic examples |
+| `examples/wordcount`, `examples/pagerank`, `examples/agent-loop`, `examples/paramserver` | acyclic, cyclic, agent-graph, and parameter-server examples |
 | `config/crd`, `config/manager` | install manifests |
 | `hack` | local cluster scripts |
 | `web` | single-file Workload graph editor and its round-trip test |
