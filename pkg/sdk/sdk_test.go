@@ -312,3 +312,53 @@ func TestSegmentDirFallsBackWhenNotWritable(t *testing.T) {
 	}
 	s.remove(id)
 }
+
+func TestSynchronousLoopDoesNotStallOnIdlePods(t *testing.T) {
+	const supersteps = 8
+	h, stop := newHarness(t, []v1alpha1.Channel{
+		{Name: "graph", From: "seed", To: "rank", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 4}},
+		{Name: "contrib", From: "rank", To: "rank",
+			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 4},
+			Feedback:     &v1alpha1.Feedback{Mode: v1alpha1.FeedbackSynchronous, MaxEpochs: supersteps}},
+	})
+	defer stop()
+
+	h.run(h.worker("seed", "seed-0", nil, []string{"graph"}), Handlers{
+		Source: func(ctx context.Context, w *Worker) error { return w.Emit("graph", "only", 1.0) },
+	})
+	// Two pods, one key: the key lands in a single partition, so one of the
+	// two pods never receives a record and spends the whole loop waiting at
+	// the barrier. The barrier cannot advance without it, so its poll rate
+	// sets the pace of every superstep.
+	for _, inst := range []string{"rank-0", "rank-1"} {
+		w := h.worker("rank", inst, []string{"graph", "contrib"}, []string{"contrib"})
+		w.SetFeedback([]string{"contrib"}, []string{"contrib"})
+		keys := map[string]bool{}
+		h.run(w, Handlers{
+			OnRecord: func(ctx context.Context, w *Worker, r Record) error {
+				keys[r.Key] = true
+				return nil
+			},
+			OnEpochEnd: func(ctx context.Context, w *Worker, epoch int32) error {
+				for k := range keys {
+					if err := w.Emit("contrib", k, 1.0); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		})
+	}
+	h.waitComplete("seed")
+	if err := h.co.Seal("graph"); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	h.waitComplete("rank")
+	elapsed := time.Since(start)
+	// Comfortably above the ~300ms a superstep costs when the idle pod wakes
+	// promptly, and comfortably below the seconds it costs when it does not.
+	if budget := supersteps * time.Second; elapsed > budget {
+		t.Fatalf("%d supersteps of no real work took %v, over the %v budget: a pod idle at the barrier is sleeping through its release", supersteps, elapsed, budget)
+	}
+}

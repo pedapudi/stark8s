@@ -564,6 +564,30 @@ func (w *Worker) serveSegments() error {
 
 // --- running --------------------------------------------------------------
 
+// Consume polling. When a poll finds nothing the worker sleeps, doubling the
+// sleep from pollFloor up to a ceiling.
+const (
+	pollFloor = 100 * time.Millisecond
+	// pollCeiling applies outside a Synchronous loop, where a pod that finds
+	// nothing is idle because its producers are slow and there is nothing
+	// for it to react to promptly.
+	pollCeiling = 2 * time.Second
+	// barrierPollCeiling applies while an inbound Synchronous feedback
+	// channel is driving the epoch. There every pod is idle by definition
+	// while it waits at the barrier, so pollCeiling saturates and the pod
+	// can then sleep for up to another 2s after the barrier releases -- dead
+	// time comparable to a whole superstep, on every superstep.
+	//
+	// 250ms bounds that wakeup delay while keeping the request rate modest:
+	// one consume per inbound channel per pod per 250ms, so 4 requests per
+	// second per channel from each pod. A 200-pod operation with two inbound
+	// channels asks the coordinator for at most 1600 consumes/s, each a
+	// short critical section under the coordinator's single mutex. Polling
+	// harder would trade a shared bottleneck for latency the barrier does
+	// not actually have.
+	barrierPollCeiling = 250 * time.Millisecond
+)
+
 // Run executes the worker: it registers, starts heartbeats and the segment
 // server, loads the topology, and then drives the source or the
 // poll/process/ack loop. When the work is done it idles until ctx ends,
@@ -602,7 +626,11 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 		return w.idle(ctx)
 	}
 
-	backoff := 100 * time.Millisecond
+	backoff := pollFloor
+	// observedEpoch is the last epoch this pod saw, so that a barrier
+	// release puts the poll rate back at the floor even when the pod then
+	// finds no work of its own in the new superstep.
+	observedEpoch := int32(-1)
 	for ctx.Err() == nil {
 		progressed := false
 		allDrained := true
@@ -666,8 +694,12 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 				allQuiet = false
 			}
 		}
+		if w.epoch != observedEpoch {
+			observedEpoch = w.epoch
+			backoff = pollFloor
+		}
 		if progressed {
-			backoff = 100 * time.Millisecond
+			backoff = pollFloor
 			continue
 		}
 		if allDrained {
@@ -705,8 +737,15 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			w.lastDone = w.epoch
 			continue
 		}
+		ceiling := pollCeiling
+		if w.syncLoop {
+			ceiling = barrierPollCeiling
+		}
+		if backoff > ceiling {
+			backoff = ceiling
+		}
 		time.Sleep(backoff)
-		if backoff < 2*time.Second {
+		if backoff < ceiling {
 			backoff *= 2
 		}
 	}
