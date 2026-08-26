@@ -96,7 +96,7 @@ the generated policies are enforced.
 | `pkg/controller` | reconciler: Workload to Kubernetes resources |
 | `pkg/coordinator` | the control-plane protocol (`api.go`) and the coordinator server |
 | `pkg/exchange` | the earlier brokered in-memory channel runtime, kept only while `pkg/controller` still imports it |
-| `pkg/sdk` | worker library: local segments, fetch, process, acknowledge, supersteps |
+| `pkg/sdk` | worker library: local segments, fetch, process, acknowledge, supersteps, pass-by-reference payloads (`blob.go`) |
 | `cmd/controller`, `cmd/coordinator` | binaries |
 | `examples/wordcount`, `examples/pagerank` | acyclic and cyclic examples |
 | `config/crd`, `config/manager` | install manifests |
