@@ -20,6 +20,7 @@ const html = readFileSync(join(here, 'editor.html'), 'utf8');
 
 const coreSrc = /<script id="core">([\s\S]*?)<\/script>/.exec(html)[1];
 const Core = new Function(coreSrc + '\nreturn Core;')();
+const MARK_TEXT = new Function(/const MARK_TEXT = \{[\s\S]*?\n\};/.exec(html)[0] + '\nreturn MARK_TEXT;')();
 
 let failures = 0;
 function check(name, ok, detail) {
@@ -155,6 +156,94 @@ check('layout: ranks read < map < reduce', nodes.get('read').rank === 0 && nodes
 check('layout: pinned position wins', nodes.get('map').x === 999 && nodes.get('map').y === 7);
 const pr = Core.fromYAML(readFileSync(join(root, 'examples', 'pagerank', 'workload.yaml'), 'utf8'));
 check('layout: feedback edges do not affect rank', Core.layout(pr, {}).get('rank').rank === 1);
+
+
+// ---------- the marks ----------
+//
+// The marks are drawings, so most of what matters about them is only visible
+// in a browser. These are the parts a machine can hold: that there is exactly
+// one copy of each drawing, that the legend and the canvas both reach it, that
+// no mark outgrows the size it is drawn at, and that none of them spends
+// colour it is not allowed to spend.
+{
+  const marksBlock = /const MARKS = \{[\s\S]*?\n\};/.exec(html)[0];
+  const legendFn = /function renderLegend\(\)[\s\S]*?\n\}\n/.exec(html)[0];
+  const edgeBlock = /const place = \(t, mark, context\)[\s\S]*?delivery === 'Materialized'\) place\([^;]*;/.exec(html)[0];
+  const endpointBlock = /const endpoint = \(mark, label[\s\S]*?kind === 'sink'\) \{[\s\S]*?\n    \}/.exec(html)[0];
+
+  // Run the drawings against a recorder, so the geometry is checked rather
+  // than merely read.
+  const drawn = [];
+  const el = (name, attrs) => { drawn.push({ name, attrs: attrs || {} }); return { appendChild() {} }; };
+  const MARKS = new Function('el', marksBlock + '\nreturn MARKS;')(el);
+  const names = Object.keys(MARKS);
+
+  check('marks: every mark has words to go with it', names.every((n) => Array.isArray(MARK_TEXT[n])),
+    names.filter((n) => !MARK_TEXT[n]).join(','));
+
+  // Each mark is drawn at roughly ten to eighteen pixels on an edge, so no
+  // coordinate may stray far outside that box. A mark that grows silently is
+  // one that will overlap its neighbours on a short edge.
+  const LIMIT = 10;
+  for (const n of names) {
+    drawn.length = 0;
+    MARKS[n]({ appendChild() {} });
+    const nums = [];
+    for (const d of drawn) {
+      for (const k of ['cx', 'cy', 'r', 'x', 'y']) if (d.attrs[k] != null) nums.push(Math.abs(Number(d.attrs[k])) + (k === 'r' ? Math.abs(Number(d.attrs.cx || 0)) : 0));
+      const path = d.attrs.d;
+      if (path) for (const m of String(path).matchAll(/-?\d+(?:\.\d+)?/g)) nums.push(Math.abs(Number(m[0])));
+    }
+    check(`marks: ${n} stays inside the size it is drawn at`, nums.length > 0 && Math.max(...nums) <= LIMIT,
+      `largest coordinate ${Math.max(...nums)} exceeds ${LIMIT}`);
+    check(`marks: ${n} draws something`, drawn.length > 0);
+  }
+
+  // Colour is a theme's business. A mark that names one stops working the
+  // moment somebody switches theme.
+  check('marks: no mark hard-codes a colour', !/#[0-9a-fA-F]{3,8}\b|rgba?\(/.test(marksBlock));
+  // The accent marks the selection and the legend's exemplar. Spending it on
+  // a mark would flood a graph that carries dozens of edges.
+  check('marks: no mark spends the accent', !/accent/.test(marksBlock));
+
+  // One copy of each drawing. The way a legend goes stale is somebody pasting
+  // path data into it, so the test is that neither the legend nor the edge
+  // code carries geometry of its own.
+  check('marks: the legend draws through drawMark', /drawMark\(name\)/.test(legendFn));
+  check('marks: the edge draws through drawMark', /drawMark\(mark\)/.test(edgeBlock + endpointBlock));
+  // The legend draws one thing of its own: a stub of edge under each mark, so
+  // a mark reads there as it reads on the canvas. Everything else it draws
+  // must come from drawMark, and the way to be sure is that no path it builds
+  // carries a mark's class.
+  const legendPaths = [...legendFn.matchAll(/el\('path',\s*\{[^}]*class:\s*'([^']+)'/g)].map((m) => m[1]);
+  check('marks: the legend draws only the edge stub of its own', legendPaths.every((c) => c === 'edge-line'),
+    legendPaths.filter((c) => c !== 'edge-line').join(','));
+  check('marks: the legend carries no mark geometry', !/class:\s*'(edge-mark|glyph)/.test(legendFn));
+  check('marks: the edge defines no mark geometry of its own', !/\bd:\s*'M/.test(edgeBlock));
+
+  // A mark the legend never lists is a mark nobody can look up.
+  const order = /const LEGEND_ORDER = \[([\s\S]*?)\];/.exec(html)[1];
+  const listed = [...order.matchAll(/'([A-Za-z]+)'/g)].map((m) => m[1]);
+  check('marks: the legend lists every mark', names.every((n) => listed.includes(n)),
+    names.filter((n) => !listed.includes(n)).join(','));
+  check('marks: the legend lists nothing that is not a mark', listed.every((n) => names.includes(n)),
+    listed.filter((n) => !names.includes(n)).join(','));
+
+  // The error case must be a different drawing from the endpoint it sits
+  // next to. It used to be the same circle with different hover text, so a
+  // typed name that matched no operation looked like deliberate ingress.
+  const geom = (n) => { drawn.length = 0; MARKS[n]({ appendChild() {} }); return JSON.stringify(drawn); };
+  check('marks: an undeclared endpoint does not draw an external one',
+    geom('Undeclared') !== geom('ExternalProducer') && geom('Undeclared') !== geom('ExternalConsumer'));
+  check('marks: the undeclared endpoint is drawn as bad', /class: 'glyph bad/.test(marksBlock));
+  // Every pair of marks is a different drawing.
+  for (let i = 0; i < names.length; i++) {
+    for (let j = i + 1; j < names.length; j++) {
+      if (geom(names[i]) === geom(names[j])) check(`marks: ${names[i]} and ${names[j]} are different drawings`, false);
+    }
+  }
+  check('marks: every mark is a distinct drawing', true);
+}
 
 console.log(failures ? `\n${failures} failure(s)` : '\nall checks passed');
 process.exit(failures ? 1 : 0);
