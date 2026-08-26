@@ -15,6 +15,11 @@
 // with no consuming operation are posted to the coordinator instead, which
 // keeps them for external readers.
 //
+// A large payload can bypass the record encoding entirely: EmitBlob streams
+// it into a file of its own beside the segments and emits a small record
+// referring to it, and OpenBlob streams it back from the holder. See blob.go
+// for the rule binding a blob's lifetime to its carrying segment.
+//
 // Run implements the completion and loop protocols so application code only
 // handles records. A worker never exits on its own: once its work is done
 // it keeps heartbeating and serving the segments it holds until ctx ends,
@@ -56,6 +61,11 @@ type wireRecord struct {
 	Key   string          `json:"key"`
 	Value json.RawMessage `json:"value"`
 	Epoch int32           `json:"epoch"`
+	// blob is the id of the blob this record refers to, for a record from
+	// EmitBlob. It is producer-local bookkeeping: it stays out of the segment
+	// (the handle in Value is what travels) and binds the blob's lifetime to
+	// the segment this record is flushed into.
+	blob string
 }
 
 // Handlers are the application callbacks. All are optional.
@@ -103,7 +113,10 @@ type Worker struct {
 	feedbackOut map[string]bool
 
 	client *http.Client
-	specs  map[string]v1alpha1.Channel
+	// blobClient transfers blob payloads; unlike client it has no overall
+	// timeout, because a blob may be arbitrarily large.
+	blobClient *http.Client
+	specs      map[string]v1alpha1.Channel
 
 	buffers     map[bufKey][]wireRecord
 	order       []bufKey
@@ -166,6 +179,9 @@ func (w *Worker) init() {
 	if w.client == nil {
 		w.client = &http.Client{Timeout: 60 * time.Second}
 	}
+	if w.blobClient == nil {
+		w.blobClient = newBlobClient()
+	}
 	if w.buffers == nil {
 		w.buffers = map[bufKey][]wireRecord{}
 		w.rr = map[string]uint64{}
@@ -219,11 +235,17 @@ func (w *Worker) MaxEpochs() int32 { return w.maxEpoch }
 
 // --- segment store --------------------------------------------------------
 
-// segmentStore keeps this pod's segments as JSON files, one per segment.
+// segmentStore keeps this pod's segments as JSON files, one per segment, and
+// the blobs those segments refer to as files of their own.
 type segmentStore struct {
 	dir string
 	mu  sync.Mutex
 	seq uint64
+	// blobs maps a blob id to the segments that still reference it, and
+	// segBlobs is the reverse index. Both are producer-local; see blob.go for
+	// the lifetime rule they implement.
+	blobs    map[string]*blobRef
+	segBlobs map[string][]string
 }
 
 func openStore(dir, instance string) (*segmentStore, error) {
@@ -280,7 +302,12 @@ func (s *segmentStore) serve(rw http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(rw, f)
 }
 
-func (s *segmentStore) remove(id string) { _ = os.Remove(s.path(id)) }
+// remove deletes a released segment and, with it, the blobs no other segment
+// of this pod still refers to.
+func (s *segmentStore) remove(id string) {
+	_ = os.Remove(s.path(id))
+	s.releaseBlobs(id)
+}
 
 // --- emitting -------------------------------------------------------------
 
@@ -294,6 +321,13 @@ func (s *segmentStore) remove(id string) { _ = os.Remove(s.path(id)) }
 // loop's Overflow channel, or dropped and counted when none is declared.
 // Full buffers are flushed as segments; Flush sends the rest.
 func (w *Worker) Emit(channel, key string, value any) error {
+	return w.emit(channel, key, value, "")
+}
+
+// emit is Emit with the id of the blob the value refers to, empty for an
+// ordinary record. The id travels with the buffered record so that flushing
+// can bind the blob to the segment it lands in.
+func (w *Worker) emit(channel, key string, value any, blob string) error {
 	w.init()
 	spec, err := w.spec(channel)
 	if err != nil {
@@ -309,15 +343,20 @@ func (w *Worker) Emit(channel, key string, value any) error {
 		if spec.Feedback != nil && spec.Feedback.Mode == v1alpha1.FeedbackAsynchronous && epoch >= spec.Feedback.MaxEpochs {
 			if spec.Feedback.Overflow == "" {
 				w.overflowed[channel]++
+				if blob != "" && w.store != nil {
+					// The record is dropped at the loop bound, so nothing will
+					// ever reference the blob.
+					w.store.dropBlob(blob)
+				}
 				return nil
 			}
-			return w.buffer(spec.Feedback.Overflow, key, b, epoch)
+			return w.buffer(spec.Feedback.Overflow, key, b, epoch, blob)
 		}
 	}
-	return w.buffer(channel, key, b, epoch)
+	return w.buffer(channel, key, b, epoch, blob)
 }
 
-func (w *Worker) buffer(channel, key string, value json.RawMessage, epoch int32) error {
+func (w *Worker) buffer(channel, key string, value json.RawMessage, epoch int32, blob string) error {
 	spec, err := w.spec(channel)
 	if err != nil {
 		return err
@@ -336,7 +375,7 @@ func (w *Worker) buffer(channel, key string, value json.RawMessage, epoch int32)
 	if _, ok := w.buffers[k]; !ok {
 		w.order = append(w.order, k)
 	}
-	w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: value, Epoch: epoch})
+	w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: value, Epoch: epoch, blob: blob})
 	if len(w.buffers[k]) >= 500 {
 		return w.flushBuffer(k)
 	}
@@ -385,11 +424,21 @@ func (w *Worker) flushBuffer(k bufKey) error {
 	if err != nil {
 		return err
 	}
+	var blobs []string
+	for _, r := range recs {
+		if r.blob != "" {
+			blobs = append(blobs, r.blob)
+		}
+	}
 	if spec.To == "" {
 		body, _ := json.Marshal(recs)
 		if err := w.do("POST", coordinator.PathChannels+"/"+k.channel+coordinator.SuffixRecords, body, nil); err != nil {
 			return err
 		}
+		// A channel with no consuming operation has no segment and so no
+		// release signal: blobs referenced from it stay bound to nothing and
+		// live until the pod does, which is what an external reader of a
+		// retained record log needs.
 		delete(w.buffers, k)
 		return nil
 	}
@@ -402,6 +451,9 @@ func (w *Worker) flushBuffer(k bufKey) error {
 	if err != nil {
 		return err
 	}
+	// Bind before announcing: from the moment a consumer can learn of the
+	// segment, releasing it must also release its blobs.
+	w.store.bind(id, blobs)
 	delete(w.buffers, k)
 	w.unannounced[k.channel] = append(w.unannounced[k.channel], coordinator.SegmentAnnouncement{
 		ID: id, Channel: k.channel, Partition: k.partition, Epoch: k.epoch,
@@ -557,6 +609,7 @@ func (w *Worker) serveSegments() error {
 	w.addr = net.JoinHostPort(host, strconv.Itoa(port))
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /segments/{id}", store.serve)
+	mux.HandleFunc("GET "+blobRoute+"{id}", store.serveBlob)
 	go func() { _ = http.Serve(ln, mux) }()
 	w.store = store
 	return nil
