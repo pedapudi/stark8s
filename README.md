@@ -99,6 +99,7 @@ the generated policies are enforced.
 | `pkg/sdk` | worker library: local segments, fetch, process, acknowledge, supersteps |
 | `cmd/controller`, `cmd/coordinator` | binaries |
 | `examples/wordcount`, `examples/pagerank` | acyclic and cyclic examples |
+| `examples/tilescan` | fan-out/gather: a chunked scan with a broadcast shared table, the shape of a task-parallel futures program |
 | `config/crd`, `config/manager` | install manifests |
 | `hack` | local cluster scripts |
 | `web` | single-file Workload graph editor and its round-trip test |
