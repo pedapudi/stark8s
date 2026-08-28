@@ -732,6 +732,20 @@ svg.canvas.connecting { cursor: crosshair; }
 
 /* ---- figure ---- */
 
+/* Channel colour.
+   A channel's hue is its partitioning mode — the attribute that decides
+   where a record goes, and the one a reader most often wants to find by
+   eye. The hues are not new colours: each maps to a token the theme has
+   already tuned against its own paper, so all twenty-one themes keep their
+   contrast without a per-theme table.
+   Selection therefore cannot be hue alone, since a Hash channel already
+   carries the accent; it is a halo plus weight instead, below. */
+:root {
+  --v2-chan-hash:      var(--v2-accent);
+  --v2-chan-rr:        var(--v2-good);
+  --v2-chan-broadcast: var(--v2-caution);
+  --v2-chan-external:  var(--v2-flat);
+}
 .node-body { fill: var(--v2-panel); stroke: var(--v2-rule); stroke-width: 1; }
 .node:hover .node-body { stroke: var(--v2-ink-faint); }
 .node.invalid .node-body { stroke: var(--v2-bad); stroke-dasharray: 4 3; }
@@ -751,18 +765,31 @@ svg.canvas.connecting { cursor: crosshair; }
 .glyph.bad { stroke: var(--v2-bad); }
 .glyph.faint { stroke: var(--v2-ink-faint); }
 
-.edge-line { fill: none; stroke: var(--v2-ink-faint); stroke-width: 1.2; }
-.edge.lifted .edge-line { stroke-width: 2.2; }
+.edge { --chan: var(--v2-ink-faint); }
+.edge.p-hash      { --chan: var(--v2-chan-hash); }
+.edge.p-rr        { --chan: var(--v2-chan-rr); }
+.edge.p-broadcast { --chan: var(--v2-chan-broadcast); }
+/* A channel with one end outside the workload is the interface, not part of
+   the dataflow, so it stays neutral whatever it is partitioned on. */
+.edge.external    { --chan: var(--v2-chan-external); }
+.edge-line { fill: none; stroke: var(--chan); stroke-width: 1.4; }
+.edge.lifted .edge-line { stroke-width: 2.6; }
 .edge.overflow .edge-line { stroke-dasharray: 5 4; }
-.edge.selected .edge-line { stroke: var(--v2-accent); stroke-width: 2.2; }
-.edge.invalid .edge-line { stroke: var(--v2-bad); stroke-dasharray: 4 3; }
+/* Selection reads as weight and a halo rather than hue, so that selecting a
+   channel that already carries the accent still shows. */
+.edge-halo { fill: none; stroke: transparent; stroke-width: 7; stroke-linecap: round; }
+.edge.selected .edge-halo { stroke: var(--chan); opacity: .22; }
+.edge.selected .edge-line { stroke-width: 2.6; }
+.edge.invalid { --chan: var(--v2-bad); }
+.edge.invalid .edge-line { stroke-dasharray: 4 3; }
 .edge-hit { fill: none; stroke: transparent; stroke-width: 14; cursor: pointer; }
-.edge:hover .edge-line { stroke: var(--v2-ink-soft); }
-.edge.selected:hover .edge-line { stroke: var(--v2-accent); }
-.edge-label { fill: var(--v2-ink-soft); font-family: var(--v2-mono); font-size: 10px; font-variant-numeric: tabular-nums; text-anchor: middle; }
+.edge:hover .edge-halo { stroke: var(--chan); opacity: .14; }
+.edge.selected:hover .edge-halo { stroke: var(--chan); opacity: .3; }
+.edge-label { fill: var(--chan); font-family: var(--v2-mono); font-size: 10px; font-variant-numeric: tabular-nums; text-anchor: middle; }
+.edge.external .edge-label { fill: var(--v2-ink-soft); }
 .edge.selected .edge-label { fill: var(--v2-ink); }
 .edge-meta { fill: var(--v2-ink-faint); font-family: var(--v2-mono); font-size: 9px; font-variant-numeric: tabular-nums; text-anchor: middle; }
-.edge-mark { fill: none; stroke: var(--v2-ink-soft); stroke-width: 1.3; stroke-linecap: round; stroke-linejoin: round; }
+.edge-mark { fill: none; stroke: var(--chan); stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
 .edge-mark.filled { fill: var(--v2-paper); }
 .edge-mark.arrow { stroke: var(--v2-ink-faint); }
 .edge.selected .edge-mark.arrow { stroke: var(--v2-accent); }
@@ -2273,7 +2300,11 @@ function renderCanvas() {
     if (e.missing) continue;
     const c = e.c, eff = Core.chEffective(c);
     const st = statusOf('ch', c.name);
-    const g = el('g', { class: 'edge' + (sel && sel.kind === 'ch' && sel.name === c.name ? ' selected' : '') + (badChs.has(c.name) ? ' invalid' : '') + (st && st.pending > 0 ? ' lifted' : ''), 'data-edge': c.name });
+    // The hue is the partitioning mode; a channel with an end outside the
+    // workload is the interface rather than dataflow, and stays neutral.
+    const MODE_CLASS = { Hash: ' p-hash', RoundRobin: ' p-rr', Broadcast: ' p-broadcast' };
+    const external = !c.from || !c.to;
+    const g = el('g', { class: 'edge' + (sel && sel.kind === 'ch' && sel.name === c.name ? ' selected' : '') + (badChs.has(c.name) ? ' invalid' : '') + (st && st.pending > 0 ? ' lifted' : '') + (external ? ' external' : (MODE_CLASS[eff.mode] || '')), 'data-edge': c.name });
     const isOverflow = doc.spec.channels.some((x) => x.feedback && x.feedback.overflow === c.name);
     if (isOverflow) g.classList.add('overflow');
     const d = `M${e.p0.x},${e.p0.y} C${e.p1.x},${e.p1.y} ${e.p2.x},${e.p2.y} ${e.p3.x},${e.p3.y}`;
@@ -2281,6 +2312,7 @@ function renderCanvas() {
     const detailBits = [`${eff.mode} · ${eff.partitions} partitions`, eff.delivery, eff.durability];
     if (eff.feedback) detailBits.push(`feedback ${eff.feedback.mode} · ${eff.feedback.maxEpochs} epochs`);
     if (isOverflow) detailBits.push('overflow target');
+    g.appendChild(el('path', { d, class: 'edge-halo' }));
     g.appendChild(el('path', { d, class: 'edge-line' }));
     const hit = hov(el('path', { d, class: 'edge-hit', tabindex: 0, role: 'button', 'aria-label': `channel ${c.name}` }), c.name, ends, detailBits.join(' · '));
     g.appendChild(hit);
