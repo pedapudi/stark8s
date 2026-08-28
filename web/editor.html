@@ -975,7 +975,7 @@ button[aria-pressed="true"] { background: var(--v2-rule-soft); color: var(--v2-i
       <section class="pane" aria-label="observed status">
         <div class="pane-head">
           <h2 class="eyebrow">status</h2>
-          <span class="hint mono pane-note" style="padding:0">paste kubectl get workload -o yaml</span>
+          <span class="hint mono pane-note" style="padding:0">paste kubectl get workload -o yaml · the spec half draws the graph</span>
           <span class="spacer"></span>
           <button id="btn-status-clear">clear</button>
         </div>
@@ -3071,17 +3071,65 @@ let statusTimer = null;
 $('yaml').addEventListener('scroll', () => { const hl = $('yaml-hl'); hl.scrollTop = $('yaml').scrollTop; hl.scrollLeft = $('yaml').scrollLeft; });
 $('status').addEventListener('input', () => { clearTimeout(statusTimer); statusTimer = setTimeout(applyStatusText, 200); });
 
+// `kubectl get workload -o yaml` — the document this pane asks for — carries
+// the spec and the observed status together. Only the status half belongs
+// here; the spec half describes the graph and belongs in the yaml pane. When
+// both arrive at once, say so and offer to draw it, rather than reporting the
+// status half missing and leaving the reader looking at the example graph.
+function specOf(doc) {
+  const spec = doc && typeof doc === 'object' ? doc.spec : null;
+  return spec && Array.isArray(spec.operations) ? spec : null;
+}
+
+// Replacing the drawn graph is the reader's call whenever there is work to
+// lose, so this is only ever reached from the offer below or when the yaml
+// pane still holds the graph this document describes.
+function drawPastedSpec(text) {
+  loadYaml(text, true);
+  const noteEl = $('status-note');
+  noteEl.textContent = 'drew the graph from this document';
+  noteEl.classList.remove('bad');
+  applyStatusText();
+}
+
+function offerPastedSpec(noteEl, text, name) {
+  noteEl.textContent = `this document also describes ${name ? '"' + name + '"' : 'a workload'} · `;
+  noteEl.classList.remove('bad');
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = 'draw its graph';
+  b.addEventListener('click', () => drawPastedSpec(text));
+  noteEl.appendChild(b);
+}
+
 function applyStatusText() {
   const text = $('status').value;
   const noteEl = $('status-note');
   if (!text.trim()) { state.status = null; noteEl.textContent = ''; noteEl.classList.remove('bad'); afterModelChange('status'); return; }
   try {
     const doc = Core.parseYAML(text);
+    const spec = specOf(doc);
     const s = doc && typeof doc === 'object' ? (doc.status && typeof doc.status === 'object' ? doc.status : doc) : null;
-    if (!s || (!Array.isArray(s.operations) && !Array.isArray(s.channels))) throw new Error('no status.operations or status.channels found');
-    state.status = { operations: s.operations || [], channels: s.channels || [], phase: s.phase, message: s.message };
-    noteEl.textContent = `phase ${s.phase || 'unknown'}${s.message ? ' · ' + s.message : ''}`;
+    const hasStatus = s && (Array.isArray(s.operations) || Array.isArray(s.channels));
+    if (!hasStatus && !spec) throw new Error('no status.operations or status.channels found');
+    state.status = hasStatus
+      ? { operations: s.operations || [], channels: s.channels || [], phase: s.phase, message: s.message }
+      : null;
+    noteEl.textContent = hasStatus ? `phase ${s.phase || 'unknown'}${s.message ? ' · ' + s.message : ''}` : '';
     noteEl.classList.remove('bad');
+    // A whole workload was pasted. Adopt its graph when the yaml pane holds
+    // nothing that would be lost — it is empty, or it already holds this same
+    // workload — and otherwise leave the choice to the reader.
+    if (spec) {
+      const name = doc.metadata && doc.metadata.name;
+      const drawn = state.doc && state.doc.metadata ? state.doc.metadata.name : null;
+      const nothingToLose = !$('yaml').value.trim() || (name && name === drawn);
+      if (nothingToLose) {
+        if ($('yaml').value.trim() !== text.trim()) loadYaml(text, true);
+      } else {
+        offerPastedSpec(noteEl, text, name);
+      }
+    }
   } catch (err) {
     state.status = null;
     noteEl.textContent = (err.line ? `line ${err.line}: ` : '') + err.message;
