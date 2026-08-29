@@ -213,6 +213,30 @@ spec:
                               type: string
                           type: object
                       type: object
+                    segments:
+                      description: |-
+                        Segments sizes the local volume this operation's pods keep their
+                        produced segments in. A pod template that declares its own volume named
+                        stark8s-segments sizes it instead, and the two cannot both be set.
+                      properties:
+                        size:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          description: |-
+                            Size is the capacity of the segment volume. The controller sets it as
+                            the volume's sizeLimit and as a floor under the first container's
+                            ephemeral-storage request, which is what the scheduler places the pod
+                            by. No limit is set: a pod's ephemeral-storage limit is charged the
+                            volume together with every container's writable layer and logs, so a
+                            limit equal to Size would evict the pod before the volume filled. A
+                            template whose containers do add up to a limit keeps it, and one that
+                            does not exceed Size is rejected rather than raised.
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                      required:
+                      - size
+                      type: object
                     slots:
                       default: 1
                       description: |-

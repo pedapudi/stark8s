@@ -123,6 +123,113 @@ On every reconcile pass the controller sends the complete channel list to
 the coordinator (`PUT /topology`). Existing channels keep their state; new
 channels are created. This is what makes the graph editable while running.
 
+## Sizing the segment volume
+
+An operation's pods keep the records they produce on local disk, so the
+segment volume has to be large enough to hold them. The size is **per pod**,
+not per operation: every replica gets a volume this large and requests this
+much disk, so an operation producing a total across N replicas needs about
+total/N, and the cluster is asked for the size times the replica count.
+
+How much has to fit depends on the outbound channels.
+
+On an **Ephemeral** channel a segment is deleted once every consumer has
+acknowledged it, so what has to fit is the peak unacknowledged output. On a
+Materialized channel that is the replica's whole output, since the consumer
+is not started until the channel seals, and the hold-until-consumed rule
+above keeps a completed operation's pods, and their segments, in place until
+the consumer has read them. While the operation is still running that rule
+does not apply: `desiredReplicas` follows the runnable-task count down and
+scales replicas away along with the segments they hold.
+
+On a **Retained** channel with a consumer nothing is ever deleted.
+`Released` skips retained channels, so the coordinator never tells the
+producer it may drop a segment, and the volume has to hold everything the
+replica produces for as long as its pod runs. Sizing such a producer for its
+peak unacknowledged output will under-provision it by the whole of its
+output.
+
+A channel with **no consumer** never reaches this volume at all. The
+coordinator forces `To: ""` channels to Retained, and the worker posts their
+records to the coordinator rather than writing a segment, so `segments.size`
+does nothing for an operation whose only output is a terminal channel — the
+records accumulate in the coordinator's memory instead.
+
+Sizing the volume is a scheduling statement, not a durability one. Segments
+live and die with the pod: `HoldsUnconsumed` is set only for non-Retained
+channels, so an operation whose output is Retained is scaled to zero on
+completion like any other and its retained segments go with it.
+
+`spec.operations[].segments.size` declares how much room that needs:
+
+```yaml
+- name: map
+  slots: 4
+  segments:
+    size: 50Gi
+  template: {spec: {containers: [{name: main, image: stark8s:dev}]}}
+```
+
+The controller then sets, on that operation's pods:
+
+- `sizeLimit` on the `stark8s-segments` volume;
+- an `ephemeral-storage` **request** on the first container, raised to the
+  declared size if the template asks for less or asks for nothing. A larger
+  request already in the template is left alone. A template naming only a
+  limit counts as already asking for it, since Kubernetes defaults an absent
+  request to the container's limit.
+
+The request is what the scheduler reads when it chooses a node, so without
+it the pods are placed as though they need no disk, and the node-pressure
+eviction ranking — which sorts by usage over request — puts a pod holding
+tens of gigabytes against a request of zero near the front of the queue.
+
+No limit is set, deliberately. The volume's `sizeLimit` already caps the
+segments, and a pod's ephemeral-storage limit is charged that volume
+together with every container's writable layer and log output, so a limit
+equal to the declared size would evict the pod before the volume could
+reach it. A template that names its own limit keeps it; a pod budget that
+does not exceed `segments.size` is rejected rather than silently raised,
+since raising it could produce a pod a `LimitRange` then refuses.
+
+A request with no limit is, however, exactly the shape a `LimitRange`
+rewrites. One carrying `default` or `max` for `ephemeral-storage` injects a
+limit onto a container that has none, and if that limit lands below the
+injected request the kubelet's admission refuses every pod — while the
+Deployment itself is admitted, so the operation reports running with no pods.
+The controller cannot see a `LimitRange`, so on a namespace that has one,
+name a limit above `segments.size` in the template.
+
+The request goes on the **first container** only, matching where the segment
+port is injected. The scheduler reads the sum, so which container carries it
+does not affect placement — but Kubernetes refuses a container whose request
+exceeds its own limit, so that container's limit has to be able to carry the
+whole size, and validation checks it separately from the pod total.
+
+That pod total follows the kubelet's arithmetic: containers that run at the
+same time add up, and a container naming no limit contributes nothing rather
+than leaving the budget unbounded, so a single sidecar with a small
+`ephemeral-storage` limit caps the whole pod. Init containers marked
+restartable are sidecars and add; a plain init container has finished before
+the others start, so it counts as a floor rather than a summand.
+
+With `segments` unset the volume is a bare `emptyDir` and nothing requests
+ephemeral storage, which leaves the capacity to whatever the cluster's
+defaults allow — on a cluster that defaults ephemeral storage, a cap the
+workload never chose; on one that does not, no cap but no scheduling
+account of it either. A producer that outgrows the space it was given is
+evicted, and its unacknowledged segments are counted lost (see
+[Status](#status)); the producing task is not re-executed.
+
+A pod template may instead declare its own volume named `stark8s-segments`
+— with a different `sizeLimit`, `medium: Memory`, or a PersistentVolumeClaim
+— and the controller will mount that rather than creating one. Setting both
+that and `segments.size` is rejected, since only one of them would apply.
+Note that this route sizes the volume without requesting anything: the
+controller only touches `ephemeral-storage` under `segments.size`, so a pod
+template declaring its own segment volume is still scheduled as though it
+needed no disk, and should carry its own request.
+
 ## Scaling
 
 **Horizontal, from runnable tasks.** On each pass (every three seconds while
@@ -233,6 +340,12 @@ The controller rejects a Workload, setting `Failed`, when:
 - `feedback.overflow` names an undeclared channel or the feedback channel
   itself;
 - `slots` is negative (zero is treated as one);
+- `segments.size` is zero, negative, or below 1Mi (a quantity with no unit
+  suffix is bytes, so `size: 50` asks for fifty of them); is set on an
+  operation whose pod template already declares a volume named
+  `stark8s-segments`; is not exceeded by the `ephemeral-storage` budget the
+  template's containers add up to; or exceeds the `ephemeral-storage` limit
+  on the container that carries the request;
 - the graph with feedback channels removed contains a cycle. A feedback
   channel of either mode, Synchronous or Asynchronous, closes a cycle.
 

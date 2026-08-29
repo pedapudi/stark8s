@@ -13,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -436,4 +437,217 @@ func keys(m map[string]networkingv1.NetworkPolicy) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+func TestSegmentVolumeSizedFromSpec(t *testing.T) {
+	wl := mapReduce()
+	size := resource.MustParse("50Gi")
+	wl.Spec.Operations[1].Segments = &v1alpha1.SegmentStorage{Size: size}
+	h := newHarness(t, wl)
+	h.reconcile()
+
+	d, _ := h.deployment("wc-map")
+	pod := d.Spec.Template
+	v := pod.Spec.Volumes[0]
+	if v.Name != segmentVolumeName || v.EmptyDir == nil || v.EmptyDir.SizeLimit == nil {
+		t.Fatalf("segment volume %+v", v)
+	}
+	if v.EmptyDir.SizeLimit.Cmp(size) != 0 {
+		t.Errorf("sizeLimit %s, want %s", v.EmptyDir.SizeLimit, &size)
+	}
+	// The scheduler places the pod by the request. No limit is set: the pod's
+	// ephemeral-storage budget is charged the volume together with the
+	// writable layers and logs, so a limit equal to size would evict the pod
+	// before the volume filled.
+	c := pod.Spec.Containers[0]
+	got, ok := c.Resources.Requests[corev1.ResourceEphemeralStorage]
+	if !ok {
+		t.Fatalf("requests has no ephemeral-storage: %v", c.Resources.Requests)
+	}
+	if got.Cmp(size) != 0 {
+		t.Errorf("request ephemeral-storage %s, want %s", &got, &size)
+	}
+	if lim, ok := c.Resources.Limits[corev1.ResourceEphemeralStorage]; ok {
+		t.Errorf("ephemeral-storage limit %s set, want none", &lim)
+	}
+
+	// An operation that declares nothing is left as it was.
+	read, _ := h.deployment("wc-read")
+	rc := read.Spec.Template.Spec.Containers[0]
+	if v := read.Spec.Template.Spec.Volumes[0]; v.EmptyDir == nil || v.EmptyDir.SizeLimit != nil {
+		t.Errorf("undeclared operation got a sizeLimit: %+v", v)
+	}
+	if _, ok := rc.Resources.Requests[corev1.ResourceEphemeralStorage]; ok {
+		t.Errorf("undeclared operation got an ephemeral-storage request: %v", rc.Resources.Requests)
+	}
+}
+
+func TestSegmentSizeIsAFloorNotAnOverride(t *testing.T) {
+	wl := mapReduce()
+	tpl := container()
+	tpl.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:              resource.MustParse("250m"),
+			corev1.ResourceEphemeralStorage: resource.MustParse("10Gi"),
+		},
+		Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("100Gi")},
+	}
+	wl.Spec.Operations[1].Template = tpl
+	wl.Spec.Operations[1].Segments = &v1alpha1.SegmentStorage{Size: resource.MustParse("50Gi")}
+	h := newHarness(t, wl)
+	h.reconcile()
+
+	d, _ := h.deployment("wc-map")
+	c := d.Spec.Template.Spec.Containers[0]
+	// A request too small to hold the segments is raised to size; the limit
+	// the template named is its own business and is passed through.
+	if got, want := c.Resources.Requests[corev1.ResourceEphemeralStorage], resource.MustParse("50Gi"); got.Cmp(want) != 0 {
+		t.Errorf("request %s, want %s", &got, &want)
+	}
+	if got, want := c.Resources.Limits[corev1.ResourceEphemeralStorage], resource.MustParse("100Gi"); got.Cmp(want) != 0 {
+		t.Errorf("limit %s, want %s", &got, &want)
+	}
+	if got, want := c.Resources.Requests[corev1.ResourceCPU], resource.MustParse("250m"); got.Cmp(want) != 0 {
+		t.Errorf("cpu request %s clobbered, want %s", &got, &want)
+	}
+}
+
+// A template that already asks for more than segments.size keeps its own
+// request, and still gets no limit invented for it.
+func TestSegmentSizeLeavesALargerRequestAlone(t *testing.T) {
+	wl := mapReduce()
+	tpl := container()
+	tpl.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("100Gi")},
+	}
+	wl.Spec.Operations[1].Template = tpl
+	wl.Spec.Operations[1].Segments = &v1alpha1.SegmentStorage{Size: resource.MustParse("50Gi")}
+	h := newHarness(t, wl)
+	h.reconcile()
+
+	d, _ := h.deployment("wc-map")
+	c := d.Spec.Template.Spec.Containers[0]
+	req := c.Resources.Requests[corev1.ResourceEphemeralStorage]
+	if want := resource.MustParse("100Gi"); req.Cmp(want) != 0 {
+		t.Errorf("request %s, want %s", &req, &want)
+	}
+	if lim, ok := c.Resources.Limits[corev1.ResourceEphemeralStorage]; ok {
+		t.Errorf("ephemeral-storage limit %s set, want none", &lim)
+	}
+	// The volume is still sized, so the operation is not silently opted out.
+	if v := d.Spec.Template.Spec.Volumes[0]; v.EmptyDir == nil || v.EmptyDir.SizeLimit == nil {
+		t.Fatalf("segment volume lost its sizeLimit: %+v", v)
+	}
+}
+
+// Kubernetes defaults an absent request to the container's limit, so a
+// template naming only a limit is already asking for that much. Writing a
+// smaller request would stop the defaulting and shrink the reservation.
+func TestSegmentSizeDoesNotLowerARequestDefaultedFromALimit(t *testing.T) {
+	wl := mapReduce()
+	tpl := container()
+	tpl.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("100Gi")},
+	}
+	wl.Spec.Operations[1].Template = tpl
+	wl.Spec.Operations[1].Segments = &v1alpha1.SegmentStorage{Size: resource.MustParse("50Gi")}
+	h := newHarness(t, wl)
+	h.reconcile()
+
+	d, _ := h.deployment("wc-map")
+	c := d.Spec.Template.Spec.Containers[0]
+	// Either the request is left absent, so Kubernetes defaults it to the
+	// 100Gi limit, or it is written at no less than that. Writing 50Gi would
+	// suppress the defaulting and shrink the reservation.
+	if req, ok := c.Resources.Requests[corev1.ResourceEphemeralStorage]; ok && req.Cmp(resource.MustParse("100Gi")) < 0 {
+		t.Errorf("request %s undercuts the limit it would have defaulted from", &req)
+	}
+	if v := d.Spec.Template.Spec.Volumes[0]; v.EmptyDir == nil || v.EmptyDir.SizeLimit == nil {
+		t.Fatalf("segment volume lost its sizeLimit: %+v", v)
+	}
+}
+
+// The request goes on the first container, so that container's own limit has
+// to be able to carry it even when the pod's total budget clears the size.
+func TestSegmentSizeRejectedAboveTheRequestCarrierLimit(t *testing.T) {
+	wl := mapReduce()
+	tpl := container()
+	tpl.Spec.Containers[0].Resources.Limits = corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("30Gi")}
+	tpl.Spec.Containers = append(tpl.Spec.Containers, corev1.Container{
+		Name:      "sidecar",
+		Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("30Gi")}},
+	})
+	wl.Spec.Operations[1].Template = tpl
+	wl.Spec.Operations[1].Segments = &v1alpha1.SegmentStorage{Size: resource.MustParse("50Gi")}
+	// The pod budget is 60Gi, so the pod-level rule alone would admit this and
+	// the emitted container would carry request 50Gi against its own 30Gi
+	// limit, which the API server refuses.
+	if err := Validate(&wl.Spec); err == nil {
+		t.Fatal("segments.size above the request carrier's own limit accepted")
+	}
+}
+
+func TestPodEphemeralStorageLimit(t *testing.T) {
+	always := corev1.ContainerRestartPolicyAlways
+	lim := func(q string) corev1.ResourceRequirements {
+		return corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse(q)}}
+	}
+	cases := []struct {
+		name string
+		spec corev1.PodSpec
+		want string
+		set  bool
+	}{
+		{name: "none", spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "a"}}}},
+		{
+			name: "containers add up",
+			spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "a", Resources: lim("40Gi")}, {Name: "b", Resources: lim("20Gi")}}},
+			want: "60Gi", set: true,
+		},
+		{
+			// A container naming no limit contributes nothing, so the sidecar
+			// alone caps the pod.
+			name: "one container unlimited",
+			spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "a"}, {Name: "b", Resources: lim("1Gi")}}},
+			want: "1Gi", set: true,
+		},
+		{
+			// Restartable init containers are sidecars: they run alongside the
+			// regular containers, so the kubelet adds them.
+			name: "restartable init adds",
+			spec: corev1.PodSpec{
+				Containers:     []corev1.Container{{Name: "a", Resources: lim("40Gi")}},
+				InitContainers: []corev1.Container{{Name: "s", RestartPolicy: &always, Resources: lim("20Gi")}},
+			},
+			want: "60Gi", set: true,
+		},
+		{
+			// A plain init container has finished by then, so it is a floor.
+			name: "plain init is a floor",
+			spec: corev1.PodSpec{
+				Containers:     []corev1.Container{{Name: "a", Resources: lim("40Gi")}},
+				InitContainers: []corev1.Container{{Name: "i", Resources: lim("80Gi")}},
+			},
+			want: "80Gi", set: true,
+		},
+		{
+			// Presence arms the kubelet's check, so zero is set, not unset.
+			name: "zero init limit is still set",
+			spec: corev1.PodSpec{InitContainers: []corev1.Container{{Name: "i", Resources: lim("0")}}},
+			want: "0", set: true,
+		},
+	}
+	for _, c := range cases {
+		got, set := podEphemeralStorageLimit(&c.spec)
+		if set != c.set {
+			t.Errorf("%s: set %v, want %v", c.name, set, c.set)
+			continue
+		}
+		if !set {
+			continue
+		}
+		if want := resource.MustParse(c.want); got.Cmp(want) != 0 {
+			t.Errorf("%s: limit %s, want %s", c.name, &got, &want)
+		}
+	}
 }

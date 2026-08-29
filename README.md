@@ -111,6 +111,14 @@ the generated policies are enforced.
   producing task is not re-executed, so the records are gone. The
   coordinator keeps its index in memory only; restarting it loses the
   segment index and the workload must be resubmitted.
+- How much a producer can hold is `spec.operations[].segments.size`, which
+  sizes the segment volume per pod and requests the matching ephemeral
+  storage. Left unset the volume is a bare `emptyDir` whose capacity is
+  whatever the cluster's defaults allow. Either way a producer that outgrows
+  the space is evicted, losing its segments as above; declaring a size makes
+  the eviction attributable to the operation rather than to the node filling
+  up, but does not prevent it. There is no spill to external storage and no
+  backpressure on a producer that fills the volume.
 - Delivery is at-least-once. A consumer that expires has its unacknowledged
   records redelivered to another replica; application state on the expired
   replica is lost. There is no state checkpointing.

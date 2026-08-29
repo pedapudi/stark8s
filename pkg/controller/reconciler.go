@@ -8,8 +8,9 @@
 //	operation       -> Deployment (<workload>-<operation>) whatever its
 //	                   completion rule, plus a ServiceAccount of the same name,
 //	                   labelled stark8s.io/workload and stark8s.io/operation,
-//	                   with STARK8S_* environment, a segment volume, and the
-//	                   segment port injected into every pod
+//	                   with STARK8S_* environment, a segment volume sized by
+//	                   segments.size, and the segment port injected into
+//	                   every pod
 //	channels        -> pushed to the coordinator as topology; sealed when the
 //	                   coordinator reports their producing operation complete
 //	scaling         -> replicas = clamp(ceil(runnableTasks / slots), min, max)
@@ -47,6 +48,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -78,6 +80,12 @@ const (
 
 	pollInterval = 3 * time.Second
 )
+
+// minSegmentSize is the smallest segments.size Validate accepts. Quantities
+// without a unit suffix are bytes, so `size: 50` asks for fifty bytes; the
+// floor is there to catch that slip rather than to say anything about how much
+// a real workload needs.
+var minSegmentSize = resource.MustParse("1Mi")
 
 // Reconciler reconciles Workloads.
 type Reconciler struct {
@@ -203,6 +211,43 @@ func Validate(s *v1alpha1.WorkloadSpec) error {
 		// Zero is the unset value and means one slot.
 		if o.Slots < 0 {
 			return fmt.Errorf("operation %q: slots must be at least 1", o.Name)
+		}
+		if o.Segments != nil {
+			if o.Segments.Size.Sign() <= 0 {
+				return fmt.Errorf("operation %q: segments.size must be greater than zero", o.Name)
+			}
+			// A bare number is bytes, so a missing unit suffix asks for a
+			// volume no segment can fit in, and the kubelet evicts the pod as
+			// soon as the directory exists. Refuse it rather than emit a pod
+			// that crash-loops on eviction.
+			if o.Segments.Size.Cmp(minSegmentSize) < 0 {
+				return fmt.Errorf("operation %q: segments.size %s is below %s; a size without a unit suffix is bytes", o.Name, &o.Segments.Size, &minSegmentSize)
+			}
+			// The controller leaves a pre-declared segment volume alone, so
+			// segments.size would silently not apply to it.
+			for _, v := range o.Template.Spec.Volumes {
+				if v.Name == segmentVolumeName {
+					return fmt.Errorf("operation %q: segments.size and a pod template volume named %q both size the segment volume; declare one or the other", o.Name, segmentVolumeName)
+				}
+			}
+			// The pod's ephemeral-storage limit is charged the segment volume
+			// together with every container's writable layer and logs, so a
+			// budget that only just covers the volume evicts the pod before
+			// the volume can fill. Raising the limit to fit would produce a
+			// pod the cluster may refuse; the contradiction is the user's to
+			// resolve.
+			if lim, ok := podEphemeralStorageLimit(&o.Template.Spec); ok && lim.Cmp(o.Segments.Size) <= 0 {
+				return fmt.Errorf("operation %q: segments.size %s leaves nothing under the pod's ephemeral-storage limit of %s, which is charged the segment volume together with every container's writable layer and logs", o.Name, &o.Segments.Size, &lim)
+			}
+			// The request goes on the first container, and Kubernetes refuses a
+			// container whose request exceeds its own limit. The pod's budget
+			// can clear segments.size on the strength of its other containers
+			// while this one cannot carry the request.
+			if len(o.Template.Spec.Containers) > 0 {
+				if lim, ok := o.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceEphemeralStorage]; ok && lim.Cmp(o.Segments.Size) < 0 {
+					return fmt.Errorf("operation %q: segments.size %s exceeds the %s ephemeral-storage limit on container %q, which carries the request", o.Name, &o.Segments.Size, &lim, o.Template.Spec.Containers[0].Name)
+				}
+			}
 		}
 	}
 	chans := map[string]bool{}
@@ -571,9 +616,14 @@ func (r *Reconciler) podTemplate(wl *v1alpha1.Workload, op *v1alpha1.Operation) 
 		}
 	}
 	if !hasVolume {
+		dir := &corev1.EmptyDirVolumeSource{}
+		if op.Segments != nil {
+			size := op.Segments.Size.DeepCopy()
+			dir.SizeLimit = &size
+		}
 		tpl.Spec.Volumes = append(tpl.Spec.Volumes, corev1.Volume{
 			Name:         segmentVolumeName,
-			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			VolumeSource: corev1.VolumeSource{EmptyDir: dir},
 		})
 	}
 	for i := range tpl.Spec.Containers {
@@ -598,9 +648,88 @@ func (r *Reconciler) podTemplate(wl *v1alpha1.Workload, op *v1alpha1.Operation) 
 			if !hasPort {
 				c.Ports = append(c.Ports, corev1.ContainerPort{ContainerPort: coordinator.SegmentPort, Name: "segments"})
 			}
+			if op.Segments != nil {
+				requestEphemeralStorage(c, op.Segments.Size)
+			}
 		}
 	}
 	return tpl
+}
+
+// podEphemeralStorageLimit reports the ephemeral-storage limit the kubelet
+// would enforce over the whole pod, and whether one is set at all. A container
+// naming no limit contributes nothing rather than leaving the budget
+// unbounded, so a lone sidecar with a small limit caps the pod.
+//
+// It follows the kubelet's arithmetic. Containers that run at the same time
+// add up: the regular containers, and the init containers marked restartable,
+// which are sidecars and stay up alongside them. A plain init container has
+// finished before any of those start, so it only has to fit on its own and
+// contributes as a floor rather than a summand.
+func podEphemeralStorageLimit(spec *corev1.PodSpec) (resource.Quantity, bool) {
+	total, set := resource.Quantity{}, false
+	add := func(c corev1.Container) {
+		if lim, ok := c.Resources.Limits[corev1.ResourceEphemeralStorage]; ok {
+			total.Add(lim)
+			set = true
+		}
+	}
+	sidecar := func(c corev1.Container) bool {
+		return c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways
+	}
+	for _, c := range spec.InitContainers {
+		if sidecar(c) {
+			add(c)
+		}
+	}
+	for _, c := range spec.Containers {
+		add(c)
+	}
+	for _, c := range spec.InitContainers {
+		if sidecar(c) {
+			continue
+		}
+		// Presence is what arms the kubelet's check, so a limit of zero
+		// counts as set even though it raises nothing.
+		if lim, ok := c.Resources.Limits[corev1.ResourceEphemeralStorage]; ok {
+			set = true
+			if lim.Cmp(total) > 0 {
+				total = lim.DeepCopy()
+			}
+		}
+	}
+	return total, set
+}
+
+// requestEphemeralStorage raises the container's ephemeral-storage request to
+// at least size, so that the scheduler places the pod where that much disk
+// exists and the eviction ranking, which sorts by usage over request, does not
+// treat the pod as though it were using disk it never asked for.
+//
+// A template already asking for at least size keeps what it has, so the field
+// is a floor rather than an override. That includes a template that names only
+// a limit: Kubernetes defaults an absent request to the container's limit, so
+// writing a smaller request here would lower the reservation the pod would
+// otherwise have been scheduled against.
+//
+// It deliberately sets no limit. The volume's own sizeLimit already caps the
+// segments, and the kubelet charges a pod's ephemeral-storage limit the volume
+// together with every container's writable layer and logs, so a limit equal to
+// size would evict the pod before the volume could ever reach it. A template
+// that names its own limit keeps it, and Validate rejects a pod budget that
+// does not exceed size.
+func requestEphemeralStorage(c *corev1.Container, size resource.Quantity) {
+	have, ok := c.Resources.Requests[corev1.ResourceEphemeralStorage]
+	if !ok {
+		have, ok = c.Resources.Limits[corev1.ResourceEphemeralStorage]
+	}
+	if ok && have.Cmp(size) >= 0 {
+		return
+	}
+	if c.Resources.Requests == nil {
+		c.Resources.Requests = corev1.ResourceList{}
+	}
+	c.Resources.Requests[corev1.ResourceEphemeralStorage] = size.DeepCopy()
 }
 
 // ensureServiceAccounts creates one ServiceAccount per operation. The

@@ -1421,7 +1421,7 @@ function normalize(doc) {
 
 // Canonical key order for the fields the editor writes; unknown keys keep
 // their place after the known ones.
-const OP_ORDER = ['name', 'completion', 'slots', 'scaling', 'template'];
+const OP_ORDER = ['name', 'completion', 'slots', 'segments', 'scaling', 'template'];
 const CH_ORDER = ['name', 'from', 'to', 'partitioning', 'delivery', 'durability', 'feedback'];
 const TOP_ORDER = ['apiVersion', 'kind', 'metadata', 'spec', 'status'];
 const SPEC_ORDER = ['operations', 'channels', 'coordinator'];
