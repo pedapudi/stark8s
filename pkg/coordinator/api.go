@@ -59,9 +59,21 @@ const (
 	// log (filtered by key when given), long-polling up to `wait` for new
 	// records; the response header RecordsNextHeader carries the offset to
 	// pass as `after` on the next call.
-	SuffixRecords     = "/records"    // POST []Record (external producer); GET ?key=&after=&wait= (external consumer)
-	SuffixOperationsD = "/operations" // reserved
+	SuffixRecords = "/records" // POST []Record (external producer); GET ?key=&after=&wait= (external consumer)
+	// PathOperations carries the replica count the controller wants for each
+	// operation. A Broadcast channel is finished with only once every replica
+	// of its consumer has acknowledged it, and the coordinator cannot count
+	// replicas that have not registered yet, so the controller publishes the
+	// number it is scaling to.
+	PathOperations = "/operations" // PUT []OperationSpec
 )
+
+// OperationSpec is what the controller publishes about one operation.
+type OperationSpec struct {
+	Name string `json:"name"`
+	// Replicas is the count the controller is scaling the operation to.
+	Replicas int32 `json:"replicas"`
+}
 
 // Record is one unit of information on a channel.
 type Record struct {

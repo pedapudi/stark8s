@@ -56,7 +56,14 @@ its replicas until the Workload is deleted.
 A completed operation's pods may still hold Ephemeral segments that a
 downstream consumer has not fetched. The coordinator reports this as
 `OperationMetrics.HoldsUnconsumed`, and while it is true the controller
-keeps the Deployment at its current replica count. When the segments are
+keeps the Deployment at its current replica count. On a partitioned channel
+one acknowledgement settles a segment, because it went to one replica. On a
+Broadcast channel the segment is settled only when acknowledgements from as
+many replicas as the controller published have arrived, so a producer feeding
+a Broadcast channel keeps a pod until its consumer has finished reading. A
+consumer whose completion is `Never` never finishes, so such a producer is
+held for the life of the workload; a replica added to it later still needs
+the records. When the segments are
 acknowledged the flag clears and the Deployment is scaled to zero. This
 hold-until-consumed rule is what makes producer-local segment storage safe
 under a Deployment, whose pods would otherwise be removed on completion.
@@ -122,6 +129,14 @@ coordinator HTTP API directly with the same information.
 On every reconcile pass the controller sends the complete channel list to
 the coordinator (`PUT /topology`). Existing channels keep their state; new
 channels are created. This is what makes the graph editable while running.
+
+The same pass sends the replica count it is scaling each operation to
+(`PUT /operations`). The coordinator needs it for Broadcast channels: every
+replica of the consumer receives every record, and the coordinator sees only
+the pods that have registered, so it cannot otherwise tell a segment every
+replica has read from one that only the replicas started so far have read. An
+operation still gated behind a Materialized channel has no Deployment and is
+sent as zero, which holds its producers'"'"' segments rather than freeing them.
 
 ## Scaling
 

@@ -48,6 +48,9 @@ type operation struct {
 	pods map[string]*pod
 	// owner maps "partitions/p" -> pod name.
 	owner map[string]string
+	// replicas is the replica count the controller last published for this
+	// operation. Zero means the controller has not published one yet.
+	replicas int32
 	// completed latches completion so an operation scaled to zero stays
 	// complete. It is set once inputs are drained and every live pod has
 	// reported done, and cleared as soon as an inbound channel has runnable
@@ -232,6 +235,20 @@ func (co *Coordinator) Configure(specs []v1alpha1.Channel) {
 		if s.To != "" {
 			co.op(s.To)
 		}
+	}
+}
+
+// SetOperations records the replica count the controller wants for each
+// operation. A Broadcast channel is finished with only when every replica of
+// its consumer has acknowledged it, and this is where that number comes from.
+func (co *Coordinator) SetOperations(specs []OperationSpec) {
+	co.mu.Lock()
+	defer co.mu.Unlock()
+	for _, s := range specs {
+		if s.Name == "" {
+			continue
+		}
+		co.op(s.Name).replicas = s.Replicas
 	}
 }
 
@@ -692,7 +709,7 @@ func (c *channel) pendingByPartition() []int64 {
 		}
 		for _, cur := range c.cursor {
 			for _, s := range c.log[cur:] {
-				if !s.lost {
+				if !s.lost && !s.released {
 					n += s.records
 				}
 			}
@@ -780,7 +797,7 @@ func (co *Coordinator) Consume(name, opName, podName string, max int) (*ConsumeR
 			for c.cursor[podName] < len(c.log) && n < max {
 				s := c.log[c.cursor[podName]]
 				c.cursor[podName]++
-				if s.lost || s.acked[podName] {
+				if s.lost || s.released || s.acked[podName] {
 					continue
 				}
 				s.delivered[podName] = true
@@ -826,7 +843,6 @@ func (co *Coordinator) Ack(name string, acks []SegmentAck) error {
 	if err != nil {
 		return err
 	}
-	o := co.op(c.spec.To)
 	for _, a := range acks {
 		s, ok := c.all[a.Holder+"/"+a.ID]
 		if !ok || s.lost {
@@ -837,26 +853,81 @@ func (co *Coordinator) Ack(name string, acks []SegmentAck) error {
 		if len(s.delivered) == 0 {
 			delete(c.inflight, s.key())
 		}
-		if c.broadcast() {
-			done := len(o.pods) > 0
-			for id := range o.pods {
-				if !s.acked[id] {
-					done = false
-				}
-			}
-			if done {
-				s.released = true
-			}
-		} else {
-			s.released = true
-		}
-		if s.released && s.data != nil && c.spec.Durability != v1alpha1.DurabilityRetained {
-			s.data = nil
-			delete(c.all, s.key())
+		if !c.broadcast() {
+			// One acknowledgement is definitive on a partitioned channel: the
+			// segment went to exactly one replica. A Broadcast segment needs
+			// one from every replica, which settle decides.
+			co.release(c, s)
 		}
 	}
 	co.settle()
 	return nil
+}
+
+// release marks a segment as needed by nobody and drops the copy the
+// coordinator holds for an external producer.
+func (co *Coordinator) release(c *channel, s *segment) {
+	s.released = true
+	if s.data != nil && c.spec.Durability != v1alpha1.DurabilityRetained {
+		s.data = nil
+		delete(c.all, s.key())
+	}
+}
+
+// releaseBroadcast releases the segments of a Broadcast channel that every
+// replica of the consuming operation has acknowledged. The last
+// acknowledgement usually decides this, and a replica count that falls to
+// meet the acknowledgements already in hand also does, so the decision is
+// taken on a sweep rather than at the moment of an acknowledgement.
+func (co *Coordinator) releaseBroadcast(c *channel) {
+	if !c.broadcast() || c.external() {
+		return
+	}
+	for _, s := range c.all {
+		if !s.lost && !s.released && co.consumedByEveryReplica(c, s) {
+			co.release(c, s)
+		}
+	}
+}
+
+// broadcastFullyConsumed reports whether every replica of the consuming
+// operation has acknowledged every segment of the channel.
+func (co *Coordinator) broadcastFullyConsumed(c *channel) bool {
+	for _, s := range c.log {
+		if !s.lost && !s.released && !co.consumedByEveryReplica(c, s) {
+			return false
+		}
+	}
+	return true
+}
+
+// consumedByEveryReplica reports whether every replica of the consuming
+// operation has acknowledged the segment.
+//
+// Every replica receives every record on a Broadcast channel, so a segment is
+// finished with only when they all have it. The registry of pods does not
+// answer that question: a replica that has not started yet has acknowledged
+// nothing and is invisible here, so counting acknowledgements against the
+// registry treats a partly-started operation as a finished one. The replica
+// count the controller publishes is the missing number.
+//
+// The count of live pods is a floor, so an operation running more pods than
+// the controller last published is still handled, and a consumer with no
+// published count behaves as it did before the count existed. The controller
+// republishes on every pass, so a consumer that has been scaled down stops
+// waiting for the replicas it no longer has one pass later. A channel whose
+// consumer has neither a published count nor a live pod keeps its segments,
+// because nothing has read them.
+func (co *Coordinator) consumedByEveryReplica(c *channel, s *segment) bool {
+	o := co.op(c.spec.To)
+	want := int(o.replicas)
+	if want < len(o.pods) {
+		want = len(o.pods)
+	}
+	if want == 0 {
+		return false
+	}
+	return len(s.acked) >= want
 }
 
 // EpochDone records that a pod finished the given epoch of a Synchronous
@@ -912,13 +983,15 @@ func (co *Coordinator) EpochDone(name, podName string, epoch int32) error {
 
 // --- Asynchronous loop termination ----------------------------------------
 
-// settle seals every Asynchronous feedback channel whose loop can produce
-// nothing more: every channel feeding the cycle from outside is sealed and
-// drained, and every channel inside the cycle is quiet. Records still being
-// processed are in flight on some channel inside the cycle, so a quiet cycle
-// with sealed inputs is finished.
+// settle releases Broadcast segments that every replica has taken, and seals
+// every Asynchronous feedback channel whose loop can produce nothing more:
+// every channel feeding the cycle from outside is sealed and drained, and
+// every channel inside the cycle is quiet. Records still being processed are
+// in flight on some channel inside the cycle, so a quiet cycle with sealed
+// inputs is finished.
 func (co *Coordinator) settle() {
 	for _, c := range co.channels {
+		co.releaseBroadcast(c)
 		if c.sealed || c.feedbackMode() != v1alpha1.FeedbackAsynchronous {
 			continue
 		}
@@ -1071,6 +1144,12 @@ func (co *Coordinator) operationMetrics(name string) OperationMetrics {
 		if c.spec.To == name {
 			hasInbound = true
 			if !(c.sealed && c.quiet() && c.heldRecords() == 0) {
+				complete = false
+			}
+			// A Broadcast channel is drained for one replica once that
+			// replica has read it, so quiescence alone would let the first
+			// replica up finish the whole operation on its own.
+			if c.broadcast() && !co.broadcastFullyConsumed(c) {
 				complete = false
 			}
 			if !c.gated() {
