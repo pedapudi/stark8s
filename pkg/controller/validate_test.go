@@ -3,6 +3,9 @@ package controller
 import (
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+
 	"github.com/pedapudi/stark8s/api/v1alpha1"
 )
 
@@ -99,5 +102,67 @@ func TestDesiredReplicas(t *testing.T) {
 		if got := desiredReplicas(s, c.op, c.runnable); got != c.want {
 			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
 		}
+	}
+}
+
+func TestValidateSegmentsSize(t *testing.T) {
+	s := spec()
+	s.Operations[0].Segments = &v1alpha1.SegmentStorage{Size: resource.MustParse("0")}
+	if err := Validate(s); err == nil {
+		t.Fatal("zero segments.size accepted")
+	}
+	s.Operations[0].Segments.Size = resource.MustParse("-1Gi")
+	if err := Validate(s); err == nil {
+		t.Fatal("negative segments.size accepted")
+	}
+	// A quantity with no unit suffix is bytes, so this asks for a 50-byte
+	// volume the kubelet evicts the pod over before it holds anything.
+	s.Operations[0].Segments.Size = resource.MustParse("50")
+	if err := Validate(s); err == nil {
+		t.Fatal("segments.size of 50 bytes accepted")
+	}
+	s.Operations[0].Segments.Size = resource.MustParse("50Gi")
+	if err := Validate(s); err != nil {
+		t.Fatal(err)
+	}
+	// A pod budget that does not exceed the size the volume may reach evicts
+	// the pod before it fills, since the budget is charged the writable layers
+	// and logs too. Raising the limit to fit is not the controller's call.
+	s.Operations[0].Template = container()
+	c := &s.Operations[0].Template.Spec.Containers[0]
+	c.Resources.Limits = corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("10Gi")}
+	if err := Validate(s); err == nil {
+		t.Fatal("segments.size above the pod's ephemeral-storage limit accepted")
+	}
+	// Equal leaves nothing for the writable layers and logs, so it is refused
+	// for the same reason rather than sitting just inside the boundary.
+	c.Resources.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse("50Gi")
+	if err := Validate(s); err == nil {
+		t.Fatal("segments.size equal to the pod's ephemeral-storage limit accepted")
+	}
+	c.Resources.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse("100Gi")
+	if err := Validate(s); err != nil {
+		t.Fatalf("segments.size under the pod's limit rejected: %v", err)
+	}
+	// The budget is the sum over the containers, and a container naming no
+	// limit contributes nothing, so a sidecar alone can cap the pod.
+	c.Resources.Limits = nil
+	s.Operations[0].Template.Spec.Containers = append(s.Operations[0].Template.Spec.Containers, corev1.Container{
+		Name:      "sidecar",
+		Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("1Gi")}},
+	})
+	if err := Validate(s); err == nil {
+		t.Fatal("segments.size above a sidecar's ephemeral-storage limit accepted")
+	}
+	s.Operations[0].Template = container()
+	// The controller leaves a pre-declared segment volume alone, so asking
+	// for both is a contradiction rather than an override.
+	s.Operations[0].Template.Spec.Volumes = []corev1.Volume{{Name: segmentVolumeName}}
+	if err := Validate(s); err == nil {
+		t.Fatal("segments.size alongside a pre-declared segment volume accepted")
+	}
+	s.Operations[0].Segments = nil
+	if err := Validate(s); err != nil {
+		t.Fatalf("pre-declared segment volume on its own rejected: %v", err)
 	}
 }
