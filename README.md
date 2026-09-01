@@ -82,6 +82,9 @@ the generated policies are enforced.
   and how the pieces find each other.
 - [docs/spark-mapping.md](docs/spark-mapping.md) — how a Spark physical
   plan maps onto a Workload, and what the mapping exposes.
+- [docs/rl-mapping.md](docs/rl-mapping.md) — how a reinforcement-learning
+  post-training loop such as OpenRL's GRPO maps onto a Workload, and what
+  the mapping exposes.
 - [docs/precedent.md](docs/precedent.md) — prior systems and papers, and
   what this design takes from each.
 - [web/editor.html](web/editor.html) — a single-file graph editor and
@@ -99,6 +102,7 @@ the generated policies are enforced.
 | `pkg/sdk` | worker library: local segments, fetch, process, acknowledge, supersteps |
 | `cmd/controller`, `cmd/coordinator` | binaries |
 | `examples/wordcount`, `examples/pagerank` | acyclic and cyclic examples |
+| `examples/grpo` | a reinforcement-learning loop: sampler, reward, and trainer around a Broadcast feedback channel |
 | `config/crd`, `config/manager` | install manifests |
 | `hack` | local cluster scripts |
 | `web` | single-file Workload graph editor and its round-trip test |
