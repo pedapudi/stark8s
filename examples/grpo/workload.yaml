@@ -1,0 +1,104 @@
+# GRPO as a graph. "sampler" draws actions from the current policy, "reward"
+# scores them, and "trainer" turns scored groups into the next policy. The
+# loop closes on "weights", a Broadcast feedback channel, because every
+# sampler replica needs the same policy. "samples" and "rewards" are hashed
+# on the prompt with the same partition count, so a sample and its score
+# reach the same trainer replica.
+#
+# maxEpochs is the number of optimiser steps. The epoch of a weights record
+# is its policy version; the policy the trainer produces after the last
+# step is stamped with maxEpochs and diverted to "final-policy", which ends
+# the loop and is where the trained policy is read from outside. "metrics"
+# carries the mean reward of each step and is readable while the loop runs.
+apiVersion: stark8s.io/v1alpha1
+kind: Workload
+metadata:
+  name: grpo
+spec:
+  operations:
+    - name: prompts           # emits the prompt set, one record per prompt
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo", "-prompts=8", "-actions=6", "prompts"]
+
+    - name: sampler           # the rollout pool. Each replica owns the
+      slots: 4                # prompts that hash to it. Fixed size: a
+      scaling: {horizontal: {min: 2, max: 2}}   # replica joining later would
+      template:               # replay every policy version from the start.
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo", "-prompts=8", "-actions=6", "-group=8", "sampler"]
+
+    - name: reward            # the environment. Scales on the backlog of
+      scaling: {horizontal: {min: 1, max: 4}}   # rollouts waiting to be scored.
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo", "-actions=6", "reward"]
+
+    - name: trainer           # one replica: the policy is one piece of
+      scaling: {horizontal: {min: 1, max: 1}}   # state with one owner.
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo", "-prompts=8", "-actions=6", "-group=8", "-iterations=3", "-rate=0.5", "trainer"]
+
+  channels:
+    # The prompt set, hashed on the prompt so ownership is the coordinator's
+    # decision. Materialized: no sampler starts until every prompt is written.
+    - name: prompt-set
+      from: prompts
+      to: sampler
+      partitioning: {mode: Hash, partitions: 8}
+      delivery: Materialized
+
+    # Samples to be scored. Hashed on the prompt; the reward operation is
+    # stateless, so the partitioning only spreads the work.
+    - name: rollouts
+      from: sampler
+      to: reward
+      partitioning: {mode: Hash, partitions: 8}
+
+    # The same samples, to be trained on. Hashed on the prompt with the same
+    # partition count as rewards, so the two halves of a group meet on one
+    # trainer replica.
+    - name: samples
+      from: sampler
+      to: trainer
+      partitioning: {mode: Hash, partitions: 8}
+
+    - name: rewards
+      from: reward
+      to: trainer
+      partitioning: {mode: Hash, partitions: 8}
+
+    # Every sampler needs the same policy, so Broadcast. Marking it feedback
+    # is what makes a training loop out of a single pass; Asynchronous
+    # because the barrier between versions is held by the trainer, which
+    # steps only when a version's batch is complete.
+    - name: weights
+      from: trainer
+      to: sampler
+      partitioning: {mode: Broadcast, partitions: 1}
+      feedback: {mode: Asynchronous, maxEpochs: 30, overflow: final-policy}
+
+    - name: final-policy      # the trained policy, read from outside
+      from: trainer
+      durability: Retained
+
+    - name: metrics           # mean reward per step, readable during training
+      from: trainer
+      durability: Retained
