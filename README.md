@@ -99,6 +99,7 @@ the generated policies are enforced.
 | `pkg/sdk` | worker library: local segments, fetch, process, acknowledge, supersteps |
 | `cmd/controller`, `cmd/coordinator` | binaries |
 | `examples/wordcount`, `examples/pagerank` | acyclic and cyclic examples |
+| `examples/agent-loop`, `examples/grpo` | a bounded tool-calling loop, and GRPO as a training loop |
 | `config/crd`, `config/manager` | install manifests |
 | `hack` | local cluster scripts |
 | `web` | single-file Workload graph editor and its round-trip test |
