@@ -17,15 +17,17 @@ var tasks = map[string]task{
 		Instruction: "Summarise why a small team might prefer a managed database.",
 		Constraints: []constraint{
 			{"bullets", "3"},
-			{"maxwords", "45"},
-			{"avoid", "very"},
+			{"maxwords", "27"},
+			{"avoid", "and"},
 		},
 	},
 	"record": {
 		ID:          "record",
 		Instruction: "Give the details of a fictional public library.",
 		Constraints: []constraint{
-			{"json", "name,city,founded"},
+			{"json", "name,city,founded,motto"},
+			{"maxwords", "16"},
+			{"avoid", "library"},
 		},
 	},
 	"headline": {
@@ -33,8 +35,9 @@ var tasks = map[string]task{
 		Instruction: "Write a headline for an article about urban cycling.",
 		Constraints: []constraint{
 			{"lines", "1"},
-			{"maxwords", "9"},
 			{"uppercase", ""},
+			{"avoid", "bikes"},
+			{"avoid", "now"},
 		},
 	},
 	"reply": {
@@ -43,8 +46,8 @@ var tasks = map[string]task{
 		Constraints: []constraint{
 			{"startswith", "Answer:"},
 			{"endswith", "Thank you."},
-			{"minwords", "12"},
-			{"maxwords", "60"},
+			{"maxwords", "27"},
+			{"avoid", "order"},
 		},
 	},
 }

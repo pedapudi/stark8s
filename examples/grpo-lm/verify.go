@@ -67,6 +67,13 @@ func (c constraint) check(text string) bool {
 		}
 		return len(strings.Fields(text)) >= n
 
+	case "exactwords":
+		n, err := strconv.Atoi(c.Arg)
+		if err != nil {
+			return false
+		}
+		return len(strings.Fields(text)) == n
+
 	case "endswith":
 		return strings.HasSuffix(strings.TrimSpace(text), c.Arg)
 
@@ -78,7 +85,7 @@ func (c constraint) check(text string) bool {
 
 	case "json":
 		var m map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(strings.TrimSpace(text)), &m); err != nil {
+		if err := json.Unmarshal([]byte(unfence(text)), &m); err != nil {
 			return false
 		}
 		want := strings.Split(c.Arg, ",")
@@ -103,6 +110,25 @@ func (c constraint) check(text string) bool {
 		return len(strings.Fields(text)) > 0
 	}
 	return false
+}
+
+// unfence strips a markdown code fence. A model asked for JSON very often
+// returns correct JSON inside ```json ... ```, and rejecting that measures the
+// wrapper rather than the answer — which reads exactly like a model that
+// cannot do the task. Calibration on the real model found this: eight of eight
+// completions were perfect JSON and all eight scored zero.
+func unfence(text string) string {
+	t := strings.TrimSpace(text)
+	if !strings.HasPrefix(t, "```") {
+		return t
+	}
+	if i := strings.IndexByte(t, '\n'); i >= 0 {
+		t = t[i+1:]
+	}
+	if j := strings.LastIndex(t, "```"); j >= 0 {
+		t = t[:j]
+	}
+	return strings.TrimSpace(t)
 }
 
 func countBullets(text string) int {
@@ -158,6 +184,8 @@ func describe(c constraint) string {
 		return fmt.Sprintf("use at most %s words in total", c.Arg)
 	case "minwords":
 		return fmt.Sprintf("use at least %s words in total", c.Arg)
+	case "exactwords":
+		return fmt.Sprintf("use exactly %s words in total", c.Arg)
 	case "endswith":
 		return fmt.Sprintf("end with exactly: %s", c.Arg)
 	case "startswith":

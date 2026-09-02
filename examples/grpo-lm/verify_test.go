@@ -124,7 +124,7 @@ func anySatisfiable(c constraint) bool {
 			b += "- item"
 		}
 		probes = append(probes, b)
-	case "minwords":
+	case "minwords", "exactwords":
 		s := ""
 		for i := 0; i < atoiOr(c.Arg, 0); i++ {
 			s += "word "
@@ -137,4 +137,30 @@ func anySatisfiable(c constraint) bool {
 		}
 	}
 	return false
+}
+
+// Calibration on the real model found eight of eight completions returning
+// correct JSON inside a ```json fence and scoring zero. The wrapper is not
+// the answer.
+func TestFencedJSONCounts(t *testing.T) {
+	c := constraint{"json", "name,city"}
+	for _, s := range []string{
+		"```json\n{\"name\":\"a\",\"city\":\"b\"}\n```",
+		"```\n{\"name\":\"a\",\"city\":\"b\"}\n```",
+		"{\"name\":\"a\",\"city\":\"b\"}",
+	} {
+		if !c.check(s) {
+			t.Errorf("fenced JSON rejected: %q", s)
+		}
+	}
+	if c.check("```json\n{\"name\":\"a\"}\n```") {
+		t.Error("fence stripping must not excuse a missing key")
+	}
+}
+
+func TestExactWords(t *testing.T) {
+	c := constraint{"exactwords", "3"}
+	if !c.check("one two three") || c.check("one two") || c.check("one two three four") {
+		t.Error("exactwords is not exact")
+	}
 }

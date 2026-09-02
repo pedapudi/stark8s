@@ -66,15 +66,44 @@ all-or-nothing, keeps a group's rewards spread out.
 
 ## Calibrate before you train
 
-Do not guess the band; measure it. The learner already reports
-`degenerateGroups` in every metrics record — the number of groups whose
-completions all scored alike and therefore contributed no gradient.
+Do not guess the band; measure it. This is not advice — it is what happened.
 
-Run one step and read it. If it sits at the group count, the task set is
-mismatched, and `perTask` in the same record says which way: a task averaging
-near 0 is too hard, near 1 too easy. Add or drop constraints and run again.
-In the CPU test the counter falls 2/4 → 0/4 as the stub improves, which is the
-shape you want to see.
+Sampling `gemma-4-E2B-it` on an L4 with the first version of this task set,
+scored by the checkers in `verify.go`:
+
+```
+task       mean  spread  per-constraint pass rate
+!headline  1.00    0.00   lines:1=8/8 maxwords:9=8/8 uppercase=8/8
+!record    0.00    0.00   json:name,city,founded=0/8
+!reply     1.00    0.00   startswith=8/8 endswith=8/8 minwords:12=8/8 maxwords:60=8/8
+!summary   1.00    0.00   bullets:3=8/8 maxwords:45=8/8 avoid:very=8/8
+
+degenerate groups: 4/4
+```
+
+Every group flat, so every advantage zero, so the run would have trained on
+nothing at all while looking perfectly healthy. Two separate causes, and they
+point in opposite directions:
+
+- **Three tasks saturated.** E2B simply does them, which is what the benchmark
+  numbers above should have predicted.
+- **One task scored zero for a bug in the reward, not a failure of the
+  model.** Every completion was correct JSON with the right keys, wrapped in a
+  ```` ```json ```` fence that the checker rejected. A reward bug is
+  indistinguishable from an incapable model from the outside, which is exactly
+  why measuring beats reasoning. `unfence` now strips the wrapper.
+
+Placing thresholds on the model's measured output distribution — `record` at
+14–17 words, `summary` at 22–32 — rather than on intuition took it to 2/4.
+Both remaining flats are tasks the model does consistently well.
+
+One caveat worth knowing: at `G=8` the per-task rate is noisy between
+calibration runs, because the model is consistent and eight samples is few. A
+constraint measured at 3/8 in one run came back 8/8 in the next. Calibrate
+with a larger group than you train with.
+
+The learner reports `degenerateGroups` in every metrics record for this
+reason, with `perTask` alongside to say which way a mismatched task is wrong.
 
 ## Memory, honestly
 
