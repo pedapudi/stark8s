@@ -1,0 +1,129 @@
+# GRPO as a graph.
+#
+# The shape is fixed when the Workload is submitted: the group size and the
+# task set are hyperparameters, and nothing branches on what a rollout came
+# back with. That is what separates this from a search tree or a rollout that
+# spawns according to a policy, which docs/ray-mapping.md lists as not
+# expressible.
+#
+#   prompts --batch--> rollout --completions--> reward --scored--> advantage
+#                         ^                                            |
+#                         \--------------weights--------------\   advantages
+#                              (Broadcast, feedback)           \        |
+#                                                               \-- learner
+#                                                    metrics, checkpoints (Retained)
+#
+# maxEpochs is the number of updates. An update at epoch e emits weights
+# stamped e+1, so the update at epoch 23 emits epoch 24, the engine drops it,
+# and the loop ends after exactly twenty-four updates. That is enough for this
+# task set to reach a mean reward above 0.9; a real run would set it far
+# higher.
+apiVersion: stark8s.io/v1alpha1
+kind: Workload
+metadata:
+  name: grpo
+spec:
+  operations:
+    - name: prompts
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo", "prompts"]
+
+    # Each replica owns whichever tasks hash to it, holds the current policy,
+    # and redraws its groups every time new weights arrive.
+    - name: rollout
+      slots: 1
+      scaling: {horizontal: {min: 2, max: 2}}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo", "-group=8", "rollout"]
+
+    # Stateless: scoring one completion needs nothing but the completion.
+    - name: reward
+      slots: 1
+      scaling: {horizontal: {min: 2, max: 2}}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo", "reward"]
+
+    - name: advantage
+      slots: 1
+      scaling: {horizontal: {min: 2, max: 2}}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo", "-group=8", "advantage"]
+
+    # The actor: one replica, because theta is one piece of state with one
+    # owner.
+    - name: learner
+      slots: 1
+      scaling: {horizontal: {min: 1, max: 1}}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo", "-group=8", "-lr=0.5", "-clip=0.2", "-kl=0.001", "learner"]
+
+  channels:
+    # Hash, not RoundRobin: a rollout replica has to own its tasks, because it
+    # redraws for them on every weights record. Spreading them evenly once
+    # would leave nobody responsible for a task on the next step.
+    - name: batch
+      from: prompts
+      to: rollout
+      partitioning: {mode: Hash, partitions: 8}
+
+    # A completion can be scored anywhere, so this one does spread evenly.
+    - name: completions
+      from: rollout
+      to: reward
+      partitioning: {mode: RoundRobin, partitions: 8}
+
+    # THE GROUP. Hash on the task, so every completion of one task reaches one
+    # advantage replica and the group statistic needs no shuffle of its own.
+    - name: scored
+      from: reward
+      to: advantage
+      partitioning: {mode: Hash, partitions: 8}
+
+    - name: advantages
+      from: advantage
+      to: learner
+      partitioning: {mode: Hash, partitions: 1}
+
+    # Broadcast, because every rollout replica needs the SAME theta; a
+    # partitioned channel would hand each replica a slice of the weights.
+    # Asynchronous, because the barrier this loop needs is per step and lives
+    # in the learner: a Synchronous edge between two different operations is
+    # not what that means.
+    - name: weights
+      from: learner
+      to: rollout
+      partitioning: {mode: Broadcast, partitions: 1}
+      feedback: {mode: Asynchronous, maxEpochs: 24}
+
+    - name: metrics
+      from: learner
+      durability: Retained
+
+    - name: checkpoints
+      from: learner
+      durability: Retained

@@ -1,0 +1,167 @@
+# GRPO over a language model, as a graph.
+#
+# The shape is examples/grpo exactly. What changed is inside the pods: rollout
+# and learner each run a sidecar holding the model, and the weights channel
+# carries a checkpoint reference rather than the weights themselves.
+#
+#   prompts --batch--> rollout --completions--> reward --scored--> advantage
+#                         ^                                            |
+#                         \--------------weights--------------\   advantages
+#                            (Broadcast, feedback: a URI)      \        |
+#                                                               \-- learner
+#                                                            metrics (Retained)
+#
+# maxEpochs is the number of updates: an update at epoch e emits a checkpoint
+# stamped e+1, and the one past the bound is dropped.
+#
+# THIS MANIFEST HAS NOT BEEN RUN. The graph is covered by the test in this
+# directory, which drives it on CPU against a stub model. Everything below the
+# graph — the accelerator requests, the sidecars and the model pull — is
+# written from the documented interfaces and is unverified. Read it as a
+# starting point, not as a tested configuration. In particular the L4 selector
+# is a guess: see the README on what E2B actually needs to train.
+apiVersion: stark8s.io/v1alpha1
+kind: Workload
+metadata:
+  name: grpo-lm
+spec:
+  operations:
+    - name: prompts
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo-lm", "prompts"]
+
+    # Two pods, each holding the model and owning whichever tasks hash to it.
+    # The worker is the SDK client; the sidecar does the generating.
+    - name: rollout
+      slots: 1
+      scaling: {horizontal: {min: 2, max: 2}}
+      template:
+        spec:
+          nodeSelector:
+            cloud.google.com/gke-accelerator: nvidia-l4
+          volumes:
+            - name: shm
+              emptyDir: {medium: Memory, sizeLimit: 2Gi}
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo-lm", "-group=8", "-generator=http://127.0.0.1:8100", "rollout"]
+            - name: generator
+              image: grpo-lm-sidecar:dev
+              command: ["python", "/sidecar/generate.py"]
+              ports: [{containerPort: 8100}]
+              env:
+                - name: MODEL
+                  value: google/gemma-4-E2B-it
+                - name: CHECKPOINT_PREFIX
+                  value: gs://REPLACE-ME/grpo-lm
+              volumeMounts: [{name: shm, mountPath: /dev/shm}]
+              resources:
+                limits: {nvidia.com/gpu: 1, memory: 24Gi}
+                requests: {cpu: "4", memory: 24Gi}
+
+    # Scoring is a program, so it needs no accelerator and no model.
+    - name: reward
+      slots: 1
+      scaling: {horizontal: {min: 2, max: 2}}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo-lm", "reward"]
+              resources:
+                requests: {cpu: "500m", memory: 512Mi}
+
+    - name: advantage
+      slots: 1
+      scaling: {horizontal: {min: 2, max: 2}}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo-lm", "-group=8", "advantage"]
+              resources:
+                requests: {cpu: "500m", memory: 512Mi}
+
+    # One replica, because the policy is one piece of state with one owner.
+    - name: learner
+      slots: 1
+      scaling: {horizontal: {min: 1, max: 1}}
+      template:
+        spec:
+          nodeSelector:
+            cloud.google.com/gke-accelerator: nvidia-l4
+          volumes:
+            - name: shm
+              emptyDir: {medium: Memory, sizeLimit: 2Gi}
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo-lm", "-group=8", "-trainer=http://127.0.0.1:8200", "learner"]
+            - name: trainer
+              image: grpo-lm-sidecar:dev
+              command: ["python", "/sidecar/train.py"]
+              ports: [{containerPort: 8200}]
+              env:
+                - name: MODEL
+                  value: google/gemma-4-E2B-it
+                - name: CHECKPOINT_PREFIX
+                  value: gs://REPLACE-ME/grpo-lm
+                - name: LORA                 # see the README on memory
+                  value: "1"
+              volumeMounts: [{name: shm, mountPath: /dev/shm}]
+              resources:
+                limits: {nvidia.com/gpu: 1, memory: 48Gi}
+                requests: {cpu: "8", memory: 48Gi}
+
+  channels:
+    # Hash, so a rollout replica owns its tasks and can redraw for them on
+    # every checkpoint. RoundRobin would leave nobody responsible next step.
+    - name: batch
+      from: prompts
+      to: rollout
+      partitioning: {mode: Hash, partitions: 8}
+
+    - name: completions
+      from: rollout
+      to: reward
+      partitioning: {mode: RoundRobin, partitions: 8}
+
+    # THE GROUP. Hash on the task, so a task's completions meet on one
+    # advantage replica and the group statistic needs no shuffle of its own.
+    - name: scored
+      from: reward
+      to: advantage
+      partitioning: {mode: Hash, partitions: 8}
+
+    - name: advantages
+      from: advantage
+      to: learner
+      partitioning: {mode: Hash, partitions: 1}
+
+    # Broadcast, because every rollout replica needs the same policy. The
+    # record is a reference — about a hundred bytes — because Emit marshals a
+    # value and buffers it whole, and E2B is ~10 GB of weights at bf16 (a LoRA
+    # adapter is far smaller, but still not a channel payload).
+    # sdk.EmitBlob would let the bytes travel pod to pod and remove the
+    # shared-storage requirement.
+    - name: weights
+      from: learner
+      to: rollout
+      partitioning: {mode: Broadcast, partitions: 1}
+      feedback: {mode: Asynchronous, maxEpochs: 200}
+
+    - name: metrics
+      from: learner
+      durability: Retained
