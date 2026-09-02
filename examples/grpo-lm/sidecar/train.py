@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL = os.environ.get("MODEL", "google/gemma-3-270m-it")
+MODEL = os.environ.get("MODEL", "google/gemma-4-E2B-it")
 PREFIX = os.environ["CHECKPOINT_PREFIX"].rstrip("/")
 LR = float(os.environ.get("LR", "1e-6"))
 CLIP = float(os.environ.get("CLIP", "0.2"))

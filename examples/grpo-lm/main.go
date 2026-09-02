@@ -14,11 +14,12 @@
 //
 // Three things differ, and each is a consequence of the model being real.
 //
-// The weights do not travel on the channel. A 270M model is about 540 MB at
-// bf16, and Emit JSON-marshals a value and buffers it whole on both sides.
-// The learner writes a checkpoint to shared storage and broadcasts a small
-// reference; rollout loads it. (sdk.EmitBlob would let the bytes travel pod to
-// pod instead, which would drop the shared-storage requirement.)
+// The weights do not travel on the channel. The model is gigabytes at bf16 and
+// even a LoRA adapter is tens of megabytes, while Emit JSON-marshals a value
+// and buffers it whole on both sides. The learner writes a checkpoint to
+// shared storage and broadcasts a small reference; rollout loads it.
+// (sdk.EmitBlob would let the bytes travel pod to pod instead, which would
+// drop the shared-storage requirement.)
 //
 // The model runs beside the worker, not inside it. The SDK is Go; generation
 // and training are not. Each pod runs the worker and a sidecar behind a

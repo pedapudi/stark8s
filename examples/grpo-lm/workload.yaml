@@ -16,9 +16,10 @@
 #
 # THIS MANIFEST HAS NOT BEEN RUN. The graph is covered by the test in this
 # directory, which drives it on CPU against a stub model. Everything below the
-# graph — the accelerator requests, the sidecars, the gated model pull — is
+# graph — the accelerator requests, the sidecars and the model pull — is
 # written from the documented interfaces and is unverified. Read it as a
-# starting point, not as a tested configuration.
+# starting point, not as a tested configuration. In particular the L4 selector
+# is a guess: see the README on what E2B actually needs to train.
 apiVersion: stark8s.io/v1alpha1
 kind: Workload
 metadata:
@@ -57,15 +58,13 @@ spec:
               ports: [{containerPort: 8100}]
               env:
                 - name: MODEL
-                  value: google/gemma-3-270m-it
+                  value: google/gemma-4-E2B-it
                 - name: CHECKPOINT_PREFIX
                   value: gs://REPLACE-ME/grpo-lm
-                - name: HF_TOKEN            # Gemma is a gated download
-                  valueFrom: {secretKeyRef: {name: hf-token, key: token}}
               volumeMounts: [{name: shm, mountPath: /dev/shm}]
               resources:
-                limits: {nvidia.com/gpu: 1, memory: 12Gi}
-                requests: {cpu: "2", memory: 12Gi}
+                limits: {nvidia.com/gpu: 1, memory: 24Gi}
+                requests: {cpu: "4", memory: 24Gi}
 
     # Scoring is a program, so it needs no accelerator and no model.
     - name: reward
@@ -116,15 +115,15 @@ spec:
               ports: [{containerPort: 8200}]
               env:
                 - name: MODEL
-                  value: google/gemma-3-270m-it
+                  value: google/gemma-4-E2B-it
                 - name: CHECKPOINT_PREFIX
                   value: gs://REPLACE-ME/grpo-lm
-                - name: HF_TOKEN
-                  valueFrom: {secretKeyRef: {name: hf-token, key: token}}
+                - name: LORA                 # see the README on memory
+                  value: "1"
               volumeMounts: [{name: shm, mountPath: /dev/shm}]
               resources:
-                limits: {nvidia.com/gpu: 1, memory: 24Gi}
-                requests: {cpu: "4", memory: 24Gi}
+                limits: {nvidia.com/gpu: 1, memory: 48Gi}
+                requests: {cpu: "8", memory: 48Gi}
 
   channels:
     # Hash, so a rollout replica owns its tasks and can redraw for them on
@@ -153,7 +152,8 @@ spec:
 
     # Broadcast, because every rollout replica needs the same policy. The
     # record is a reference — about a hundred bytes — because Emit marshals a
-    # value and buffers it whole, and 270M parameters at bf16 is ~540 MB.
+    # value and buffers it whole, and E2B is ~10 GB of weights at bf16 (a LoRA
+    # adapter is far smaller, but still not a channel payload).
     # sdk.EmitBlob would let the bytes travel pod to pod and remove the
     # shared-storage requirement.
     - name: weights

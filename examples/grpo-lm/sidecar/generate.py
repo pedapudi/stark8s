@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from vllm import LLM, SamplingParams
 
-MODEL = os.environ.get("MODEL", "google/gemma-3-270m-it")
+MODEL = os.environ.get("MODEL", "google/gemma-4-E2B-it")
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "256"))
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "1.0"))
 

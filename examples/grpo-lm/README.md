@@ -30,49 +30,74 @@ Ten loads is five delivered checkpoints across two rollout replicas; the sixth
 is the one `maxEpochs` drops.
 
 **Not verified:** everything that needs an accelerator. The manifest's GPU
-requests, the two sidecars in `sidecar/`, and the gated model pull have never
-been run. They are written from the documented interfaces. Read them as a
-starting point.
+requests, the two sidecars in `sidecar/`, and the model pull have never been
+run. They are written from the documented interfaces. Read them as a starting
+point.
 
 ## Choosing the model, and why the task follows from it
 
-`google/gemma-3-270m-it`, with `gemma-3-1b-it` as the step-up. Both are
-text-only, 32K context, BF16, and **gated** — the download needs accepted
-Gemma terms and a token, which is why the manifest mounts one as a secret.
+`google/gemma-4-E2B-it`: 2.3B effective parameters (5.1B with the per-layer
+embedding tables), 128K context, BF16, **Apache 2.0 and ungated** — no token
+and no terms click, which is why nothing here mounts a secret. E4B and 12B are
+the steps up. Gemma 4 has no 0.5B-class member; E2B is the smallest.
 
-The task is instruction-following with programmatically checkable constraints,
-and that choice is forced by the model rather than picked for convenience.
-
-GRPO's gradient is the *spread within a group*. If every completion in a group
-scores the same, the standard deviation is zero, every advantage is zero, and
-the update is exactly nothing. A task the model always fails gives no signal
-for the same reason as one it always passes.
-
-Small Gemmas cannot do grade-school maths. The 1B card reports MGSM **2.04**
-and carries no GSM8K row at all; the 270M reports no maths benchmark and sits
-at chance on ARC-c (28.2) and WinoGrande (52.3). Point GRPO at GSM8K with one
-of these and nearly every group returns all zeros. The run looks perfectly
+The selection criterion is not capability. GRPO's gradient is the *spread
+within a group*: if every completion scores the same, the standard deviation
+is zero, every advantage is zero, and the update is exactly nothing. That
+fails at **both** ends. A task the model never passes gives all-zero groups; a
+task it always passes gives all-one groups. Either way the run looks perfectly
 healthy — pods up, epochs advancing, metrics flowing — and learns nothing.
 
-What these models *are* good at is following instructions: IFEval **51.2** for
-270M, **80.2** for 1B. That is the range GRPO wants, because a model that gets
-some constraints right and others wrong produces groups with spread.
+Which end you are near depends entirely on the model, and the generation gap
+here is large. Gemma 3 at this size cannot do school maths at all: the 1B card
+reports MGSM **2.04** and carries no GSM8K row, and the 270M sits at chance on
+ARC-c (28.2) and WinoGrande (52.3). Gemma 4 E2B reports **AIME 2026 37.5%**,
+GPQA Diamond 43.4% and LiveCodeBench v6 44.0% — ahead of Gemma 3 27B on all
+three. So the risk inverts: with Gemma 3 a maths task starved the gradient
+because it was too hard; with Gemma 4 a grade-school one plausibly starves it
+because it is too easy.
 
-So the reward here is a program (`verify.go`): count the bullets, check the
-word budget, parse the JSON and compare its keys, test the exact suffix. No
-judge and no reward model enters the graph, and scoring the *fraction* of
-constraints met keeps rewards spread out within a group.
+This is why the reward here is a set of *tunable* checkable constraints rather
+than a fixed benchmark. Bullet counts, word budgets, exact suffixes, JSON keys
+— each is decided by reading the completion (`verify.go`), so no judge and no
+reward model enters the graph, and the difficulty is a dial rather than a
+property of a dataset. Scoring the fraction of constraints met, rather than
+all-or-nothing, keeps a group's rewards spread out.
 
-The learner reports `degenerateGroups` every step for exactly this reason. If
-it stays at the group count, the task is mismatched to the model and no amount
-of waiting will help.
+## Calibrate before you train
+
+Do not guess the band; measure it. The learner already reports
+`degenerateGroups` in every metrics record — the number of groups whose
+completions all scored alike and therefore contributed no gradient.
+
+Run one step and read it. If it sits at the group count, the task set is
+mismatched, and `perTask` in the same record says which way: a task averaging
+near 0 is too hard, near 1 too easy. Add or drop constraints and run again.
+In the CPU test the counter falls 2/4 → 0/4 as the stub improves, which is the
+shape you want to see.
+
+## Memory, honestly
+
+E2B is ~10 GB of weights at bf16. A full fine-tune also wants a frozen
+reference copy and AdamW state — two fp32 moments plus fp32 master weights,
+roughly another 60 GB — so it does not fit the single L4 the manifest asks
+for. Two ways out, and the manifest assumes the first:
+
+- **LoRA on the policy.** Optimizer state shrinks to the adapter, and the
+  frozen reference comes free: it is the base model with the adapter disabled,
+  so no second copy is resident. The checkpoint that travels the weights
+  channel becomes an adapter rather than a full model.
+- **A larger accelerator** (A100/H100 class) for a full fine-tune.
+
+The `nvidia-l4` node selector in the manifest is a placeholder, not a
+measurement.
 
 ## What the real model forces to change
 
-**The weights do not travel on the channel.** 270M parameters at bf16 is about
-540 MB, and `Emit` JSON-marshals a value and buffers it whole on both sides.
-The learner writes a checkpoint to shared storage and broadcasts a reference
-of about a hundred bytes; rollout loads it. `sdk.EmitBlob` would let the bytes
+**The weights do not travel on the channel.** E2B is ~10 GB at bf16 — and even
+a LoRA adapter is tens of megabytes — while `Emit` JSON-marshals a value and
+buffers it whole on both sides. The learner writes a checkpoint to shared
+storage and broadcasts a reference of about a hundred bytes; rollout loads it. `sdk.EmitBlob` would let the bytes
 travel pod to pod and remove the shared-storage requirement.
 
 **The model runs beside the worker, not inside it.** The SDK is Go and there
@@ -103,9 +128,8 @@ go test ./examples/grpo-lm/      # the graph, on CPU, against a stub
 ```
 
 On a cluster you would need, none of which is set up here: a GPU node pool
-with accelerator quota, a bucket for checkpoints with Workload Identity, an
-`hf-token` secret, and a sidecar image carrying vLLM and Transformers. Then
-watch it:
+with accelerator quota, a bucket for checkpoints with Workload Identity, and a
+sidecar image carrying vLLM and Transformers. Then watch it:
 
 ```sh
 kubectl -n <namespace> port-forward svc/grpo-lm-coordinator 18080:8080
