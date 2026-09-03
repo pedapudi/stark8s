@@ -1,0 +1,126 @@
+# GRPO over a real language model, on the graph.
+#
+#   prompts --batch--> rollout --completions--> reward --scored--> advantage
+#                         ^      (GPU+model)    (CPU only)             |
+#                         \-------------weights------------\      advantages
+#                            (Broadcast, feedback: a URI)   \           |
+#                                                            \----- learner
+#                                                       metrics (Retained)
+#
+# Two pods hold the model and want an accelerator. `reward` wants neither:
+# scoring a tour is arithmetic, so it runs on cheap CPU and takes its own
+# replica count. That split is the reason this is a graph and not a script.
+apiVersion: stark8s.io/v1alpha1
+kind: Workload
+metadata:
+  name: grpo-gemma
+spec:
+  operations:
+    - name: prompts
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              command: ["/grpo-gemma", "-slots=4", "prompts"]
+              resources:
+                requests: {cpu: "200m", memory: 256Mi}
+
+    - name: rollout
+      slots: 1
+      scaling: {horizontal: {min: 1, max: 1}}
+      template:
+        spec:
+          nodeSelector:
+            cloud.google.com/gke-accelerator: nvidia-l4
+          containers:
+            - name: main
+              image: stark8s:dev
+              command: ["/grpo-gemma", "-group=8", "-slots=4", "rollout"]
+              resources:
+                requests: {cpu: "500m", memory: 1Gi}
+            - name: model
+              image: grpo-sidecar:dev
+              command: ["python", "/work/serve.py"]
+              env:
+                - {name: ROLE, value: generator}
+                - {name: PORT, value: "8100"}
+              resources:
+                limits: {nvidia.com/gpu: 1, memory: 32Gi}
+                requests: {cpu: "6", memory: 32Gi}
+
+    # The point of the graph: no accelerator, own replica count.
+    - name: reward
+      slots: 1
+      scaling: {horizontal: {min: 4, max: 4}}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              command: ["/grpo-gemma", "reward"]
+              resources:
+                requests: {cpu: "500m", memory: 512Mi}
+
+    - name: advantage
+      slots: 1
+      scaling: {horizontal: {min: 2, max: 2}}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              command: ["/grpo-gemma", "-group=8", "advantage"]
+              resources:
+                requests: {cpu: "500m", memory: 512Mi}
+
+    - name: learner
+      slots: 1
+      scaling: {horizontal: {min: 1, max: 1}}
+      template:
+        spec:
+          nodeSelector:
+            cloud.google.com/gke-accelerator: nvidia-l4
+          containers:
+            - name: main
+              image: stark8s:dev
+              command: ["/grpo-gemma", "-group=8", "-slots=4", "-sidecar=http://127.0.0.1:8200", "learner"]
+              resources:
+                requests: {cpu: "500m", memory: 1Gi}
+            - name: model
+              image: grpo-sidecar:dev
+              command: ["python", "/work/serve.py"]
+              env:
+                - {name: ROLE, value: trainer}
+                - {name: PORT, value: "8200"}
+                - {name: CHECKPOINT_PREFIX, value: gs://REPLACE-ME/grpo-gemma}
+                - {name: LR, value: "1e-5"}
+              resources:
+                limits: {nvidia.com/gpu: 1, memory: 48Gi}
+                requests: {cpu: "8", memory: 48Gi}
+
+  channels:
+    - name: batch
+      from: prompts
+      to: rollout
+      partitioning: {mode: Hash, partitions: 8}
+    - name: completions
+      from: rollout
+      to: reward
+      partitioning: {mode: RoundRobin, partitions: 8}
+    - name: scored
+      from: reward
+      to: advantage
+      partitioning: {mode: Hash, partitions: 8}
+    - name: advantages
+      from: advantage
+      to: learner
+      partitioning: {mode: Hash, partitions: 1}
+    - name: weights
+      from: learner
+      to: rollout
+      partitioning: {mode: Broadcast, partitions: 1}
+      feedback: {mode: Asynchronous, maxEpochs: 12}
+    - name: metrics
+      from: learner
+      durability: Retained
