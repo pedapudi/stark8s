@@ -1,0 +1,157 @@
+# GRPO over a theorem prover, as a graph.
+#
+# The point of this example is not the learning — see examples/grpo for that.
+# It is that the two expensive stages want completely different hardware and
+# completely different replica counts, and the graph lets them have both.
+#
+#   prompts --batch--> rollout --completions--> reward --scored--> advantage
+#                         ^      (GPU)          (CPU x8)               |
+#                         \-------------weights------------\      advantages
+#                            (Broadcast, feedback: a URI)   \           |
+#                                                            \----- learner
+#                                                          metrics (Retained)
+#
+# Measured on one L4 and eight CPUs, 64 completions per step:
+#
+#   generation  (GPU)   178 s
+#   verification (CPU)  419 s serial, 73 s at 8-way   (5.74x)
+#
+# In one process those add: 597 s per step with the accelerator idle for 70%
+# of it. As separate operations the accelerator only generates, verification
+# scales on cheap CPU pods, and because `completions` is Pipelined rather than
+# Materialized the two overlap — a completion is verified while the next is
+# still being sampled.
+#
+# NOT RUN AS A WORKLOAD. The numbers above are measured, and so is the graph
+# (see the test in this directory), but this manifest has not been applied to a
+# cluster. The accelerator requests and the Lean image are written from the
+# measurements, not from a deployment.
+apiVersion: stark8s.io/v1alpha1
+kind: Workload
+metadata:
+  name: grpo-lean
+spec:
+  operations:
+    - name: prompts
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo-lean", "prompts"]
+
+    # The accelerator. One replica, because the GPU is the scarce thing and it
+    # is busy the whole time once verification stops blocking it.
+    - name: rollout
+      slots: 1
+      scaling: {horizontal: {min: 1, max: 1}}
+      template:
+        spec:
+          nodeSelector:
+            cloud.google.com/gke-accelerator: nvidia-l4
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo-lean", "-group=8", "rollout"]
+            - name: model
+              image: grpo-sidecar:dev
+              command: ["python", "/work/serve.py"]
+              env:
+                - {name: ROLE, value: generator}
+                - {name: PORT, value: "8100"}
+              resources:
+                limits: {nvidia.com/gpu: 1, memory: 24Gi}
+                requests: {cpu: "4", memory: 24Gi}
+
+    # The reason this example exists. No accelerator, and the replica count is
+    # the throughput dial: 419 s of verification at one replica, 73 s at eight.
+    # A monolith cannot make this trade because the verifier shares a process
+    # with the generator.
+    - name: reward
+      slots: 1
+      scaling: {horizontal: {min: 8, max: 8}}
+      template:
+        spec:
+          containers:
+            - name: main
+              # Carries a Mathlib checkout with prebuilt .olean files: 3.9 GB,
+              # fetched with `lake exe cache get` in 75 s rather than compiled.
+              image: lean-reward:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo-lean", "-lean=/work/mathlib4", "reward"]
+              resources:
+                requests: {cpu: "2", memory: 8Gi}
+                limits: {cpu: "2", memory: 8Gi}
+
+    - name: advantage
+      slots: 1
+      scaling: {horizontal: {min: 2, max: 2}}
+      template:
+        spec:
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo-lean", "-group=8", "advantage"]
+              resources:
+                requests: {cpu: "500m", memory: 512Mi}
+
+    - name: learner
+      slots: 1
+      scaling: {horizontal: {min: 1, max: 1}}
+      template:
+        spec:
+          nodeSelector:
+            cloud.google.com/gke-accelerator: nvidia-l4
+          containers:
+            - name: main
+              image: stark8s:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/grpo-lean", "-group=8", "-sidecar=http://127.0.0.1:8200", "learner"]
+            - name: model
+              image: grpo-sidecar:dev
+              command: ["python", "/work/serve.py"]
+              env:
+                - {name: ROLE, value: trainer}
+                - {name: PORT, value: "8200"}
+                - {name: CHECKPOINT_PREFIX, value: gs://REPLACE-ME/grpo-lean}
+                - {name: LR, value: "1e-5"}
+              resources:
+                limits: {nvidia.com/gpu: 1, memory: 48Gi}
+                requests: {cpu: "8", memory: 48Gi}
+
+  channels:
+    - name: batch
+      from: prompts
+      to: rollout
+      partitioning: {mode: Hash, partitions: 8}
+
+    # Pipelined, deliberately. Materialized would hold every completion until
+    # rollout completed, which in a training loop is never — and it would also
+    # destroy the overlap this example is about.
+    - name: completions
+      from: rollout
+      to: reward
+      partitioning: {mode: RoundRobin, partitions: 16}
+
+    - name: scored
+      from: reward
+      to: advantage
+      partitioning: {mode: Hash, partitions: 8}
+
+    - name: advantages
+      from: advantage
+      to: learner
+      partitioning: {mode: Hash, partitions: 1}
+
+    - name: weights
+      from: learner
+      to: rollout
+      partitioning: {mode: Broadcast, partitions: 1}
+      feedback: {mode: Asynchronous, maxEpochs: 200}
+
+    - name: metrics
+      from: learner
+      durability: Retained
