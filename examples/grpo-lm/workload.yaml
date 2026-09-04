@@ -33,13 +33,13 @@ spec:
             - name: main
               image: stark8s:dev
               imagePullPolicy: IfNotPresent
-              command: ["/grpo-lm", "prompts"]
+              command: ["/grpo-lm", "-group=8", "-slots=16", "-held=32", "-heldgroup=8", "-evalevery=3", "-basereps=5", "prompts"]
 
     # Two pods, each holding the model and owning whichever tasks hash to it.
     # The worker is the SDK client; the sidecar does the generating.
     - name: rollout
       slots: 1
-      scaling: {horizontal: {min: 2, max: 2}}
+      scaling: {horizontal: {min: 1, max: 1}}
       template:
         spec:
           nodeSelector:
@@ -51,16 +51,18 @@ spec:
             - name: main
               image: stark8s:dev
               imagePullPolicy: IfNotPresent
-              command: ["/grpo-lm", "-group=8", "-generator=http://127.0.0.1:8100", "rollout"]
+              command: ["/grpo-lm", "-group=8", "-slots=16", "-held=32", "-heldgroup=8", "-evalevery=3", "-basereps=5", "-generator=http://127.0.0.1:8100", "rollout"]
             - name: generator
-              image: grpo-lm-sidecar:dev
-              command: ["python", "/sidecar/generate.py"]
+              image: grpo-sidecar:dev
+              command: ["python", "/work/serve.py"]
               ports: [{containerPort: 8100}]
               env:
-                - name: MODEL
-                  value: google/gemma-4-E2B-it
-                - name: CHECKPOINT_PREFIX
-                  value: gs://REPLACE-ME/grpo-lm
+                # MODEL is the path baked into the sidecar image. Naming a hub
+                # repository here instead makes every pod start depend on an
+                # external download.
+                - {name: MODEL, value: /models/gemma}
+                - {name: ROLE, value: generator}
+                - {name: PORT, value: "8100"}
               volumeMounts: [{name: shm, mountPath: /dev/shm}]
               resources:
                 limits: {nvidia.com/gpu: 1, memory: 24Gi}
@@ -89,7 +91,7 @@ spec:
             - name: main
               image: stark8s:dev
               imagePullPolicy: IfNotPresent
-              command: ["/grpo-lm", "-group=8", "advantage"]
+              command: ["/grpo-lm", "-group=8", "-slots=16", "-held=32", "-heldgroup=8", "-evalevery=3", "-basereps=5", "advantage"]
               resources:
                 requests: {cpu: "500m", memory: 512Mi}
 
@@ -108,18 +110,17 @@ spec:
             - name: main
               image: stark8s:dev
               imagePullPolicy: IfNotPresent
-              command: ["/grpo-lm", "-group=8", "-trainer=http://127.0.0.1:8200", "learner"]
+              command: ["/grpo-lm", "-group=8", "-slots=16", "-held=32", "-heldgroup=8", "-evalevery=3", "-basereps=5", "-trainer=http://127.0.0.1:8200", "learner"]
             - name: trainer
-              image: grpo-lm-sidecar:dev
-              command: ["python", "/sidecar/train.py"]
+              image: grpo-sidecar:dev
+              command: ["python", "/work/serve.py"]
               ports: [{containerPort: 8200}]
               env:
-                - name: MODEL
-                  value: google/gemma-4-E2B-it
-                - name: CHECKPOINT_PREFIX
-                  value: gs://REPLACE-ME/grpo-lm
-                - name: LORA                 # see the README on memory
-                  value: "1"
+                - {name: MODEL, value: /models/gemma}
+                - {name: ROLE, value: trainer}
+                - {name: PORT, value: "8200"}
+                - {name: CHECKPOINT_PREFIX, value: gs://REPLACE-ME/grpo-lm}
+                - {name: LR, value: "1e-5"}
               volumeMounts: [{name: shm, mountPath: /dev/shm}]
               resources:
                 limits: {nvidia.com/gpu: 1, memory: 48Gi}
@@ -160,7 +161,11 @@ spec:
       from: learner
       to: rollout
       partitioning: {mode: Broadcast, partitions: 1}
-      feedback: {mode: Asynchronous, maxEpochs: 200}
+      feedback: {mode: Asynchronous, maxEpochs: 30}
+
+    - name: eval
+      from: rollout
+      durability: Retained
 
     - name: metrics
       from: learner

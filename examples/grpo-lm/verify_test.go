@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 func TestConstraintsDecideByReading(t *testing.T) {
 	cases := []struct {
@@ -72,24 +76,79 @@ func TestScoreGivesPartialCredit(t *testing.T) {
 	}
 }
 
-// Every constraint the task set uses must be one the checker implements, or a
-// prompt would ask for something that silently always scores zero.
-func TestTaskSetIsCheckable(t *testing.T) {
-	for _, id := range sortedTaskIDs(tasks) {
-		tk := tasks[id]
+// Every constraint a generated instance can carry must be one the checker
+// implements, or a prompt would ask for something that silently always scores
+// zero. Instances are generated, so this samples the generator rather than
+// enumerating a fixed set.
+func TestGeneratedInstancesAreCheckable(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 200; i++ {
+		tk := instance(fmt.Sprintf("probe-%d", i))
 		if len(tk.Constraints) == 0 {
-			t.Errorf("%s: no constraints", id)
-		}
-		for _, c := range tk.Constraints {
-			// A constraint the checker does not know always returns false;
-			// prove each kind can be satisfied by something.
-			if !anySatisfiable(c) {
-				t.Errorf("%s: constraint %s is never satisfiable — unknown kind?", id, c)
-			}
+			t.Fatalf("%s: no constraints", tk.ID)
 		}
 		if tk.prompt() == "" {
-			t.Errorf("%s: empty prompt", id)
+			t.Fatalf("%s: empty prompt", tk.ID)
 		}
+		for _, c := range tk.Constraints {
+			seen[c.Kind] = true
+			if !anySatisfiable(c) {
+				t.Errorf("%s: constraint %s is never satisfiable — unknown kind?", tk.ID, c)
+			}
+		}
+	}
+	for _, want := range []string{"exactwords", "avoid", "include"} {
+		if !seen[want] {
+			t.Errorf("generator never produced a %q constraint", want)
+		}
+	}
+}
+
+// The held-out set must not overlap anything the run trains on, or the
+// measurement is of memorization.
+func TestHeldOutIsDisjointFromTraining(t *testing.T) {
+	h := map[string]bool{}
+	for _, tk := range held(32) {
+		h[tk.ID] = true
+	}
+	for step := int32(0); step < 200; step++ {
+		for _, tk := range trainBatch(step, 16) {
+			if h[tk.ID] {
+				t.Fatalf("training instance %s is also in the held-out set", tk.ID)
+			}
+		}
+	}
+}
+
+// Grading the word count is what keeps a group's rewards spread out. If a
+// near miss scored the same as a wild miss, the only signal left would be the
+// two binary constraints.
+func TestWordCountIsGradedByDistance(t *testing.T) {
+	c := constraint{"exactwords", "20"}
+	exact := strings.Repeat("alpha ", 20)
+	near := strings.Repeat("alpha ", 18)
+	far := strings.Repeat("alpha ", 5)
+	e, n, f := c.partial(exact), c.partial(near), c.partial(far)
+	if e != 1 {
+		t.Errorf("exact = %v, want 1", e)
+	}
+	if !(e > n && n > f) {
+		t.Errorf("not ordered by distance: exact=%v near=%v far=%v", e, n, f)
+	}
+}
+
+// A word must match as a word. Substring matching would fail an avoid("the")
+// constraint on the word "theatre", which the model could never diagnose.
+func TestAvoidMatchesWholeWordsOnly(t *testing.T) {
+	c := constraint{"avoid", "the"}
+	if !c.check("A theatre opened on Tuesday") {
+		t.Error("avoid(the) rejected a sentence containing only \"theatre\"")
+	}
+	if c.check("A shop on the corner") {
+		t.Error("avoid(the) accepted a sentence containing \"the\"")
+	}
+	if !c.check("Grandstand seating, thereabouts") {
+		t.Error("avoid(the) rejected words that merely contain the letters")
 	}
 }
 
@@ -124,6 +183,8 @@ func anySatisfiable(c constraint) bool {
 			b += "- item"
 		}
 		probes = append(probes, b)
+	case "include":
+		probes = append(probes, "some text "+c.Arg+" more text")
 	case "minwords", "exactwords":
 		s := ""
 		for i := 0; i < atoiOr(c.Arg, 0); i++ {
