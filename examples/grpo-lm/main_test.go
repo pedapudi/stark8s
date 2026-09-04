@@ -42,6 +42,7 @@ func specs() []v1alpha1.Channel {
 			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionBroadcast, Partitions: 1},
 			Feedback:     &v1alpha1.Feedback{Mode: v1alpha1.FeedbackAsynchronous, MaxEpochs: testSteps}},
 		{Name: "metrics", From: "learner"},
+		{Name: "eval", From: "rollout"},
 	}
 }
 
@@ -62,11 +63,9 @@ func (m *stubModel) Generate(ctx context.Context, prompt string, n int, seed int
 	m.mu.Unlock()
 	// Recover which task this prompt belongs to, so the stub can produce
 	// something the real checker will actually score.
-	var tk task
-	for _, id := range sortedTaskIDs(tasks) {
-		if tasks[id].prompt() == prompt {
-			tk = tasks[id]
-		}
+	tk, ok := taskIndex[prompt]
+	if !ok {
+		return nil, fmt.Errorf("stub saw an unknown prompt")
 	}
 	rng := rand.New(rand.NewSource(seed))
 	out := make([]string, n)
@@ -109,94 +108,40 @@ func (m *stubModel) Step(ctx context.Context, batch []trainSample, step int32) (
 // compose writes a completion that satisfies exactly the constraints marked
 // good, so the stub exercises the real checker rather than a shortcut.
 func compose(tk task, good map[string]bool) string {
-	body := "Answer: the order ships on Tuesday and arrives within three working days after that"
-	bullets, lines := 0, 0
-	suffix, prefix := "", ""
-	jsonKeys := ""
-	forceLong, forceShort, avoid, upper := false, false, "", false
+	// The generated tasks carry exactly three constraint kinds, so the stub
+	// only has to be able to hit or miss each of them deliberately.
+	target, avoid, need := 0, "", ""
+	hitWords := true
 	for _, c := range tk.Constraints {
 		ok := good[c.String()]
 		switch c.Kind {
-		case "bullets":
-			if ok {
-				bullets = atoiOr(c.Arg, 0)
-			} else {
-				bullets = atoiOr(c.Arg, 0) + 1
-			}
-		case "lines":
-			if ok {
-				lines = atoiOr(c.Arg, 0)
-			} else {
-				lines = atoiOr(c.Arg, 0) + 1
-			}
-		case "maxwords":
-			forceLong = !ok
-		case "minwords":
-			forceShort = !ok
-		case "endswith":
-			if ok {
-				suffix = c.Arg
-			}
-		case "startswith":
-			if ok {
-				prefix = c.Arg
-			}
+		case "exactwords":
+			target = atoiOr(c.Arg, 20)
+			hitWords = ok
 		case "avoid":
 			if !ok {
 				avoid = c.Arg
 			}
-		case "json":
+		case "include":
 			if ok {
-				jsonKeys = c.Arg
+				need = c.Arg
 			}
-		case "uppercase":
-			upper = ok
 		}
 	}
-	if jsonKeys != "" {
-		parts := []string{}
-		for _, k := range splitCSV(jsonKeys) {
-			parts = append(parts, fmt.Sprintf("%q:%q", strings.TrimSpace(k), "x"))
-		}
-		return "{" + strings.Join(parts, ",") + "}"
+	if !hitWords {
+		target += 3
 	}
-	var b strings.Builder
-	if prefix != "" {
-		b.WriteString(prefix + " ")
-	}
-	switch {
-	case bullets > 0:
-		for i := 0; i < bullets; i++ {
-			if i > 0 {
-				b.WriteString("\n")
-			}
-			b.WriteString("- point")
-		}
-	case lines > 0:
-		for i := 0; i < lines; i++ {
-			if i > 0 {
-				b.WriteString("\n")
-			}
-			b.WriteString("Cycling Lanes Open Downtown")
-		}
-	case upper:
-		b.WriteString("Cycling Lanes Open Downtown Today")
-	default:
-		b.WriteString(body)
-	}
-	if forceShort {
-		return strings.Fields(b.String())[0]
-	}
-	if forceLong {
-		b.WriteString(strings.Repeat(" filler", 80))
+	var words []string
+	if need != "" {
+		words = append(words, need)
 	}
 	if avoid != "" {
-		b.WriteString(" " + avoid)
+		words = append(words, avoid)
 	}
-	if suffix != "" {
-		b.WriteString(" " + suffix)
+	for len(words) < target {
+		words = append(words, "alpha")
 	}
-	return b.String()
+	return strings.Join(words[:max(target, len(words))], " ")
 }
 
 type rig struct {
@@ -243,22 +188,22 @@ func TestGraphTrainsAgainstAStubModel(t *testing.T) {
 	model := &stubModel{skill: 0.15}
 
 	r.run("prompts", "prompts-0", nil, []string{"batch"}, nil, nil,
-		handlers("prompts", testGroup, model, model))
+		handlers("prompts", testCfg, model, model))
 	for i := 0; i < 2; i++ {
 		r.run("rollout", fmt.Sprintf("rollout-%d", i),
-			[]string{"batch", "weights"}, []string{"completions"},
+			[]string{"batch", "weights"}, []string{"completions", "eval"},
 			[]string{"weights"}, nil,
-			handlers("rollout", testGroup, model, model))
+			handlers("rollout", testCfg, model, model))
 		r.run("reward", fmt.Sprintf("reward-%d", i),
 			[]string{"completions"}, []string{"scored"}, nil, nil,
-			handlers("reward", testGroup, model, model))
+			handlers("reward", testCfg, model, model))
 		r.run("advantage", fmt.Sprintf("advantage-%d", i),
 			[]string{"scored"}, []string{"advantages"}, nil, nil,
-			handlers("advantage", testGroup, model, model))
+			handlers("advantage", testCfg, model, model))
 	}
 	r.run("learner", "learner-0", []string{"advantages"},
 		[]string{"weights", "metrics"}, nil, []string{"weights"},
-		handlers("learner", testGroup, model, model))
+		handlers("learner", testCfg, model, model))
 
 	deadline := time.Now().Add(120 * time.Second)
 	for time.Now().Before(deadline) {
@@ -301,11 +246,11 @@ func TestGraphTrainsAgainstAStubModel(t *testing.T) {
 	if last.Checkpoint == "" {
 		t.Error("last metric carries no checkpoint reference")
 	}
-	if len(last.PerTask) != len(tasks) {
-		t.Errorf("perTask has %d entries, want %d", len(last.PerTask), len(tasks))
+	if len(last.PerTask) != testCfg.slots {
+		t.Errorf("perTask has %d entries, want %d", len(last.PerTask), testCfg.slots)
 	}
 	t.Logf("reward %.3f -> %.3f over %d steps; %d checkpoint loads; final degenerate groups %d/%d",
-		first.RewardMean, last.RewardMean, testSteps, len(loaded), last.Degenerate, len(tasks))
+		first.RewardMean, last.RewardMean, testSteps, len(loaded), last.Degenerate, testCfg.slots)
 }
 
 // A group whose completions all score the same must contribute no gradient,
@@ -337,3 +282,23 @@ func metricAt(t *testing.T, recs []coordinator.Record, i int) metric {
 	}
 	return m
 }
+
+// testCfg keeps the in-process graph small: two fresh instances a step and a
+// two-instance held-out set, which is enough to exercise every path.
+var testCfg = runCfg{group: testGroup, slots: 2, heldN: 2, heldG: 2, evalEvery: 1, baseReps: 1}
+
+// taskIndex lets the stub recover a task from the prompt it was handed. The
+// set of tasks a run can produce is finite and known, so building the index up
+// front is exact.
+var taskIndex = func() map[string]task {
+	m := map[string]task{}
+	for s := 0; s <= testSteps+2; s++ {
+		for _, tk := range trainBatch(int32(s), testCfg.slots) {
+			m[tk.prompt()] = tk
+		}
+	}
+	for _, tk := range held(testCfg.heldN) {
+		m[tk.prompt()] = tk
+	}
+	return m
+}()

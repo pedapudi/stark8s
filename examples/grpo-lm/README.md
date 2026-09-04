@@ -1,170 +1,154 @@
-# grpo-lm: post-training a language model with GRPO
+# grpo-lm: post-training that improves on data it never saw
 
-[examples/grpo](../grpo) with the table replaced by a real model. The graph is
-the same shape; what changed is inside the pods.
+GRPO over Gemma 4 E2B against verifiable constraints. Each instance asks for
+one sentence about some subject, subject to three requirements a program can
+check: an exact word count, a word that must not appear, and a term that must
+appear. The reward is that checker. Nothing calls a judge, so it cannot drift
+and cannot be gamed by pleasing a scorer.
+
+The point of this example is the measurement. Held-out constraint satisfaction
+rose from **0.145 to 0.220** over 30 steps, against a base band measured five
+times on the same instances, on a set the training never touched.
 
 ```
 prompts --batch--> rollout --completions--> reward --scored--> advantage
-                      ^                                            |
-                      \--------------weights--------------\   advantages
-                         (Broadcast, feedback: a URI)      \        |
-                                                            \-- learner
-                                                        metrics (Retained)
+                      ^      (1x L4)         (2x CPU)               |
+                      \-------------weights------------\       advantages
+                         (Broadcast, feedback: a URI)   \            |
+                                                         \----- learner
+                              eval (Retained)         metrics (Retained)
+                                                                 (1x L4)
 ```
 
-## What is verified and what is not
+## Measuring learning rather than fitting
 
-**Verified, by `go test ./examples/grpo-lm/`:** the graph. The coordinator,
-the segments over HTTP, the Hash partition that forms a group, the Broadcast
-feedback edge carrying the checkpoint reference, the two counted barriers, the
-epoch arithmetic that ends the run, and every reward checker. The test drives
-the whole workload on CPU against a stub model that improves each time it is
-told to load a checkpoint, so a rising reward proves the reference travelled
-the edge and was acted on.
+Two designs each look like they measure learning and do not. Both were run on
+this model before this one:
 
-```
-reward 0.174 -> 0.854 over 6 steps; 10 checkpoint loads; degenerate groups 2/4 -> 0/4
-```
+- **A fixed pool of tasks.** Train reward rose 0.805 to 0.861 while held-out
+  reward fell 0.845 to 0.831. The model fit the pool.
+- **A fresh instance every step, scored on itself.** Reward fell 0.813 to
+  0.742, and nothing in that number distinguishes a worse policy from a harder
+  draw, because every step scores different problems.
 
-Ten loads is five delivered checkpoints across two rollout replicas; the sixth
-is the one `maxEpochs` drops.
+So this example does both at once. Training draws fresh instances every step,
+so there is nothing to memorize. Measurement uses a fixed set of 32 instances,
+disjoint from every training tag, scored with identical instances at every
+evaluation, so a change in the number is a change in the policy.
 
-**Not verified:** everything that needs an accelerator. The manifest's GPU
-requests, the two sidecars in `sidecar/`, and the model pull have never been
-run. They are written from the documented interfaces. Read them as a starting
-point.
+The base band is part of the design rather than an afterthought. Step 0 always
+samples the untrained policy, and the evaluation runs five times there, which
+gives the spread any later number has to clear.
 
-## Choosing the model, and why the task follows from it
+## The result
 
-`google/gemma-4-E2B-it`: 2.3B effective parameters (5.1B with the per-layer
-embedding tables), 128K context, BF16, **Apache 2.0 and ungated** — no token
-and no terms click, which is why nothing here mounts a secret. E4B and 12B are
-the steps up. Gemma 4 has no 0.5B-class member; E2B is the smallest.
+One L4 for `rollout`, one for `learner`, two CPU replicas each for `reward` and
+`advantage`. 16 fresh instances per step, 8 completions each; the held-out set
+is 32 instances at 8 completions, so every row below is 256 samples.
 
-The selection criterion is not capability. GRPO's gradient is the *spread
-within a group*: if every completion scores the same, the standard deviation
-is zero, every advantage is zero, and the update is exactly nothing. That
-fails at **both** ends. A task the model never passes gives all-zero groups; a
-task it always passes gives all-one groups. Either way the run looks perfectly
-healthy — pods up, epochs advancing, metrics flowing — and learns nothing.
+| step | all constraints met | graded reward | exact word count | includes term |
+|---|---|---|---|---|
+| base (5 reps) | **0.145 ± 0.025** | 0.822 ± 0.009 | 0.150 | 0.932 |
+| 3 | 0.203 | 0.839 | 0.203 | 0.922 |
+| 6 | 0.164 | 0.851 | 0.176 | 0.941 |
+| 9 | 0.199 | 0.851 | 0.203 | 0.938 |
+| 12 | 0.160 | 0.844 | 0.168 | 0.918 |
+| 15 | 0.152 | 0.861 | 0.156 | 0.965 |
+| 18 | 0.238 | 0.865 | 0.258 | 0.922 |
+| 21 | 0.234 | 0.853 | 0.242 | 0.914 |
+| 24 | 0.211 | 0.868 | 0.223 | 0.961 |
+| 27 | 0.215 | 0.869 | 0.238 | 0.949 |
 
-Which end you are near depends entirely on the model, and the generation gap
-here is large. Gemma 3 at this size cannot do school maths at all: the 1B card
-reports MGSM **2.04** and carries no GSM8K row, and the 270M sits at chance on
-ARC-c (28.2) and WinoGrande (52.3). Gemma 4 E2B reports **AIME 2026 37.5%**,
-GPQA Diamond 43.4% and LiveCodeBench v6 44.0% — ahead of Gemma 3 27B on all
-three. So the risk inverts: with Gemma 3 a maths task starved the gradient
-because it was too hard; with Gemma 4 a grade-school one plausibly starves it
-because it is too easy.
+Averaged over the last three evaluations, held-out satisfaction is 0.220,
+which is 3.1 standard deviations above the base band. Pooling the counts —
+185 of 1280 base samples against 169 of 768 final samples — gives a
+two-proportion `z` of 4.38.
 
-This is why the reward here is a set of *tunable* checkable constraints rather
-than a fixed benchmark. Bullet counts, word budgets, exact suffixes, JSON keys
-— each is decided by reading the completion (`verify.go`), so no judge and no
-reward model enters the graph, and the difficulty is a dial rather than a
-property of a dataset. Scoring the fraction of constraints met, rather than
-all-or-nothing, keeps a group's rewards spread out.
+The improvement is where the headroom was. Exact word count went from 0.150 to
+0.238, a relative gain of about 60%. The other two constraints did not pay for
+it: the required term held between 0.91 and 0.97 throughout, and the forbidden
+word was avoided in every one of the 3,584 completions scored. That check
+matters, because the cheapest way to hit a word count is to stop writing
+sentences, and the model did not.
 
-## Calibrate before you train
+Training reward on fresh instances moved 0.833 to 0.875 over the same 30 steps,
+which agrees with the held-out curve. No step had more than one of its 16
+groups without gradient.
 
-Do not guess the band; measure it. This is not advice — it is what happened.
+## Calibrate before spending an accelerator
 
-Sampling `gemma-4-E2B-it` on an L4 with the first version of this task set,
-scored by the checkers in `verify.go`:
-
-```
-task       mean  spread  per-constraint pass rate
-!headline  1.00    0.00   lines:1=8/8 maxwords:9=8/8 uppercase=8/8
-!record    0.00    0.00   json:name,city,founded=0/8
-!reply     1.00    0.00   startswith=8/8 endswith=8/8 minwords:12=8/8 maxwords:60=8/8
-!summary   1.00    0.00   bullets:3=8/8 maxwords:45=8/8 avoid:very=8/8
-
-degenerate groups: 4/4
-```
-
-Every group flat, so every advantage zero, so the run would have trained on
-nothing at all while looking perfectly healthy. Two separate causes, and they
-point in opposite directions:
-
-- **Three tasks saturated.** E2B simply does them, which is what the benchmark
-  numbers above should have predicted.
-- **One task scored zero for a bug in the reward, not a failure of the
-  model.** Every completion was correct JSON with the right keys, wrapped in a
-  ```` ```json ```` fence that the checker rejected. A reward bug is
-  indistinguishable from an incapable model from the outside, which is exactly
-  why measuring beats reasoning. `unfence` now strips the wrapper.
-
-Placing thresholds on the model's measured output distribution — `record` at
-14–17 words, `summary` at 22–32 — rather than on intuition took it to 2/4.
-Both remaining flats are tasks the model does consistently well.
-
-One caveat worth knowing: at `G=8` the per-task rate is noisy between
-calibration runs, because the model is consistent and eight samples is few. A
-constraint measured at 3/8 in one run came back 8/8 in the next. Calibrate
-with a larger group than you train with.
-
-The learner reports `degenerateGroups` in every metrics record for this
-reason, with `perTask` alongside to say which way a mismatched task is wrong.
-
-## Memory, honestly
-
-E2B is ~10 GB of weights at bf16. A full fine-tune also wants a frozen
-reference copy and AdamW state — two fp32 moments plus fp32 master weights,
-roughly another 60 GB — so it does not fit the single L4 the manifest asks
-for. Two ways out, and the manifest assumes the first:
-
-- **LoRA on the policy.** Optimizer state shrinks to the adapter, and the
-  frozen reference comes free: it is the base model with the adapter disabled,
-  so no second copy is resident. The checkpoint that travels the weights
-  channel becomes an adapter rather than a full model.
-- **A larger accelerator** (A100/H100 class) for a full fine-tune.
-
-The `nvidia-l4` node selector in the manifest is a placeholder, not a
-measurement.
-
-## What the real model forces to change
-
-**The weights do not travel on the channel.** E2B is ~10 GB at bf16 — and even
-a LoRA adapter is tens of megabytes — while `Emit` JSON-marshals a value and
-buffers it whole on both sides. The learner writes a checkpoint to shared
-storage and broadcasts a reference of about a hundred bytes; rollout loads it. `sdk.EmitBlob` would let the bytes
-travel pod to pod and remove the shared-storage requirement.
-
-**The model runs beside the worker, not inside it.** The SDK is Go and there
-is no Python client. Each pod runs the worker plus a sidecar behind a
-localhost HTTP contract:
+A task the model always satisfies and a task it never satisfies both produce
+groups with no spread, zero advantages, and no gradient. The run looks healthy
+either way. So the binary has a `score` mode that reads completions and reports
+how often each constraint is met, and the first version of this task failed
+that check:
 
 ```
-POST /load      {"checkpoint": uri}                        -> 204
-POST /generate  {"prompt": str, "n": int, "seed": int}     -> {"completions": [...]}
-POST /step      {"step": int, "samples": [...]}            -> {"checkpoint", "objective", "kl"}
+instances=24 completions=192 mean reward=0.935
+constraint        met
+avoid          100.0%
+exactwords      15.1%
+include         90.1%
 ```
 
-The worker stays the SDK client and keeps the loop protocol. `engine.go` has
-the interface and the HTTP clients; the test substitutes a stub. If this
-pattern recurs, a thin Python SDK client would be the better answer — the
-coordinator protocol is HTTP and JSON — but it would have to reimplement the
-epoch and completion protocol, which is the subtle part.
+Mean reward 0.935 with an exact-count rate of 15% means partial credit was
+doing nearly all the work. Credit for a near miss was scaled to the word budget
+— two words out of twenty scored 0.9 — so the reward was already near its
+ceiling and had almost nothing left to give. Scaling it to a fixed tolerance of
+four words instead dropped the base to 0.806, and the strict rate of 14.6% is
+what the training then had room to move.
 
-**Reloading the engine dominates a step.** Every rollout replica loads a fresh
-checkpoint after every update. A real system swaps weights into the running
-inference engine in place; `sidecar/generate.py` does the simple, slow thing
-and says so.
+The saturated version would have trained on almost nothing while every metric
+looked fine. Rescoring the same 192 completions cost nothing, because the
+calibration sampling had already been saved.
+
+## What this does and does not show
+
+It shows that GRPO on this graph improves a policy on instances it was never
+trained on, at a margin well outside the base band, without damage to the
+constraints that were already satisfied.
+
+It does not show that the group-relative baseline is what did it. The
+comparison is against the untrained policy rather than against the same
+pipeline with the advantages shuffled or zeroed. What is established is that
+the updates moved the policy the right way; whether GRPO's particular baseline
+is responsible remains untested.
+
+Nor does it generalize past this task family. Held-out here means unseen
+combinations of subject, word budget, forbidden word and required term. A model
+better at hitting a word count is not thereby better at anything else.
 
 ## Running it
 
 ```sh
-go test ./examples/grpo-lm/      # the graph, on CPU, against a stub
+go test ./examples/grpo-lm/
 ```
 
-On a cluster you would need, none of which is set up here: a GPU node pool
-with accelerator quota, a bucket for checkpoints with Workload Identity, and a
-sidecar image carrying vLLM and Transformers. Then watch it:
+The test drives the whole graph in-process against a stub model whose skill is
+a parameter, so every path runs on CPU in a few seconds.
+
+For the cluster run, build the worker image from the repository `Dockerfile`
+and the sidecar image from [examples/sidecar](../sidecar). Set
+`CHECKPOINT_PREFIX` in `workload.yaml` to a bucket the pods can write, then
+apply. Base weights are baked into the sidecar image and `MODEL` points at that
+path: naming a hub repository there instead makes every pod start depend on an
+external download.
+
+To calibrate before training, dump the held-out prompts, sample them against a
+bare sidecar, and score the result:
 
 ```sh
-kubectl -n <namespace> port-forward svc/grpo-lm-coordinator 18080:8080
-curl -s 'http://127.0.0.1:18080/channels/metrics/records?after=0'
+grpo-lm -held=24 dump > prompts.json     # {tag: prompt}
+# ... sample each prompt n times against /generate ...
+grpo-lm score < completions.json         # {tag: [completion, ...]}
 ```
 
-`metrics` carries the mean reward, the per-task breakdown, the KL, the
-checkpoint URI and the degenerate-group count for every step, and is
-`Retained`, so it is readable while training is still in flight.
+One operational note that cost a run. The worker waits for its sidecar to
+accept a connection before consuming anything. A worker that starts first takes
+a segment, fails its request, and exits. The container restarts inside a pod
+that is still alive, and the coordinator returns in-flight segments to the
+pending set only when a pod is gone, so those records are never redelivered.
+Here the wait paid off for a different reason. A duplicated `env:` key in
+the manifest left the learner's sidecar listening on the generator's port, so
+the learner blocked visibly instead of training against a model with no
+optimizer attached.

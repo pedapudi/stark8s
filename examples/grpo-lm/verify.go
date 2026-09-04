@@ -81,7 +81,10 @@ func (c constraint) check(text string) bool {
 		return strings.HasPrefix(strings.TrimSpace(text), c.Arg)
 
 	case "avoid":
-		return !strings.Contains(strings.ToLower(text), strings.ToLower(c.Arg))
+		return !containsWord(text, c.Arg)
+
+	case "include":
+		return containsWord(text, c.Arg)
 
 	case "json":
 		var m map[string]json.RawMessage
@@ -192,12 +195,60 @@ func describe(c constraint) string {
 		return fmt.Sprintf("begin with exactly: %s", c.Arg)
 	case "avoid":
 		return fmt.Sprintf("never use the word %q", c.Arg)
+	case "include":
+		return fmt.Sprintf("use the word %q somewhere", c.Arg)
 	case "json":
 		return fmt.Sprintf("reply with a JSON object having exactly these keys: %s", c.Arg)
 	case "uppercase":
-		return "capitalise the first letter of every word"
+		return "capitalize the first letter of every word"
 	}
 	return c.String()
+}
+
+// containsWord matches on word boundaries. Substring matching would count
+// "the" inside "theatre" and "and" inside "grandstand", so a model could fail
+// an avoid-constraint by writing an ordinary sentence and never learn why.
+func containsWord(text, word string) bool {
+	w := strings.ToLower(word)
+	for _, f := range strings.Fields(strings.ToLower(text)) {
+		if strings.Trim(f, ".,;:!?\"'()[]") == w {
+			return true
+		}
+	}
+	return false
+}
+
+// partial grades a constraint that has a near-miss. An exact word count is the
+// only one here that does: 19 words against a budget of 20 is most of the way
+// there, and scoring it zero throws away the gradient that would close the
+// gap. The binary constraints stay binary because there is no meaningful
+// notion of nearly avoiding a word.
+func (c constraint) partial(text string) float64 {
+	if c.Kind != "exactwords" {
+		if c.check(text) {
+			return 1
+		}
+		return 0
+	}
+	want, err := strconv.Atoi(c.Arg)
+	if err != nil || want <= 0 {
+		return 0
+	}
+	got := len(strings.Fields(text))
+	d := got - want
+	if d < 0 {
+		d = -d
+	}
+	// Scale the credit to a fixed tolerance rather than to the budget. Against
+	// the budget, a 20-word target gives 0.9 for being two words out, and
+	// calibration showed the base model already sitting at 0.935 mean reward
+	// while hitting the count exactly only 15% of the time: the reward had
+	// almost no room left to reward anything.
+	const tol = 4
+	if d >= tol {
+		return 0
+	}
+	return 1 - float64(d)/float64(tol)
 }
 
 // score is the fraction of the task's constraints the completion satisfies,
@@ -211,13 +262,24 @@ func (t task) score(text string) (float64, map[string]bool) {
 	detail := map[string]bool{}
 	hit := 0.0
 	for _, c := range t.Constraints {
-		ok := c.check(text)
-		detail[c.String()] = ok
-		if ok {
-			hit++
-		}
+		detail[c.String()] = c.check(text)
+		hit += c.partial(text)
 	}
 	return hit / float64(len(t.Constraints)), detail
+}
+
+// strict reports whether the completion met every constraint. The graded score
+// is what training needs, because partial credit is what keeps a group's
+// rewards spread and the gradient alive. This is what a reader needs, because
+// "reward rose" can mean the model got closer to a word count it still misses.
+// Both are recorded; they answer different questions.
+func (t task) strict(text string) bool {
+	for _, c := range t.Constraints {
+		if !c.check(text) {
+			return false
+		}
+	}
+	return len(t.Constraints) > 0
 }
 
 // sortedTaskIDs keeps every operation's iteration order stable, so a run does
@@ -231,7 +293,7 @@ func sortedTaskIDs(m map[string]task) []string {
 	return out
 }
 
-// advantages centres one group's rewards and scales them by their spread.
+// advantages centers one group's rewards and scales them by their spread.
 // This is the whole of GRPO's baseline: the group mean stands in for a value
 // network, which is why there is no critic anywhere in the graph.
 //
