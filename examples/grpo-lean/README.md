@@ -106,10 +106,22 @@ CPU replicas for `reward` and two for `advantage`. Read back from the Retained
 | 7 | 0.471 | 29 | 7 |
 
 Mean reward rises from 0.362 to 0.471, and steps 2 through 7 increase
-monotonically. Six values land in ascending order by chance with probability
-1/720, so the trend is unlikely to be noise. Eight steps is still a short run,
-and the honest claim is a trend in the right direction rather than a converged
-result.
+monotonically.
+
+The monotone run is weaker evidence than it looks. Consecutive steps are not
+independent samples — the policy at step k+1 is the policy at step k plus one
+update — so the series is a walk, and walks produce ascending runs far more
+often than shuffled values do. A driftless walk with this step-to-step scale
+yields a six-long ascending run 6% of the time, against the 0.14% that treating
+the values as exchangeable would suggest.
+
+The stronger evidence is a base-policy comparison that falls out of the scaling
+sweep. Step 0 always samples the base model, because no checkpoint has been
+loaded yet. The five runs therefore give five independent measurements of the
+base policy on the same 17 statements under the same reward: 0.362, 0.367,
+0.345, 0.358, 0.344 — a mean of 0.355 and a standard deviation of 0.010. Step 7 at
+0.471 is 11 standard deviations above that. The policy changed, and it changed
+in the direction the reward points.
 
 What moved is worth reading carefully, because the proved count barely changed:
 25 to 29 of 136. Total reward per step is `1.0 * proved` plus whatever the
@@ -122,6 +134,24 @@ and it is not the same thing as learning to prove.
 Groups with no gradient also rose, 3 to 7. As the model concentrates on one
 tier, more groups become uniform within themselves, so the gradient thins as
 the reward improves. A longer run would want more tiers or harder statements.
+
+## What this run does not establish
+
+**Nothing here is held out.** All 17 statements are trained on and the reward is
+measured on the same 17. The rise is therefore consistent with the policy
+fitting this set rather than getting better at Lean, and the two cannot be told
+apart without statements the training never saw.
+
+**No ablation isolates GRPO.** The comparison above is against the base policy,
+not against the same pipeline with the advantages shuffled or zeroed. It shows
+that the updates moved the policy toward the reward; it does not show that the
+group-relative baseline is what did it, as against any gradient signal of
+roughly that size.
+
+**The statements are one-tactic goals.** Every one is closed by a single
+`ring`, `simp`, `linarith` or `positivity`. Improvement here should not be read
+as improvement on proof search, and there is no reason to expect it to carry to
+a benchmark of competition problems.
 
 ## What else falls out of declaring the edge
 
