@@ -1,64 +1,127 @@
-# grpo-lean: why the stages want different machines
+# grpo-lean: the stages want different machines
 
-GRPO over a theorem prover. The reward is the Lean kernel: a proof compiles or
-it does not, so there is no judge, no reward model, and nothing to hack.
+GRPO over a theorem prover. The reward is the Lean kernel, so there is no
+judge, no reward model, and nothing to hack: a tactic closes the goal or the
+compiler says why it did not.
 
-This example exists for one reason, and it is not the learning — see
-[examples/grpo](../grpo) for that. It is that the two expensive stages want
-**different hardware and different replica counts**, and a graph is what lets
-them have both.
+The example exists because its two expensive stages want **different hardware
+at different replica counts**. Generation needs an accelerator and finishes in
+seconds. Verification needs no accelerator, costs about twelve seconds of CPU
+per completion, and is embarrassingly parallel. A graph is what lets each have
+what it wants.
 
 ```
 prompts --batch--> rollout --completions--> reward --scored--> advantage
-                      ^      (1x GPU)       (8x CPU)               |
-                      \-------------weights------------\      advantages
-                         (Broadcast, feedback: a URI)   \           |
+                      ^      (1x L4)         (Nx CPU)               |
+                      \-------------weights------------\       advantages
+                         (Broadcast, feedback: a URI)   \            |
                                                          \----- learner
                                                        metrics (Retained)
+                                                                 (1x L4)
 ```
 
-## The measurement
+## Scaling, measured on the graph
 
-One L4 and eight CPUs, 64 completions per step, real Lean 4 with Mathlib:
+One step of the real workload — 17 statements, 8 completions each, 136 proofs
+through the kernel — with only the `reward` replica count changed:
 
-| stage | hardware | cost |
+| reward replicas | step wall s | speedup |
 |---|---|---|
-| generation | GPU | **178 s** for 64 completions (2.8 s each) |
-| verification | CPU | **419 s** serial (6.5 s each) |
+| 1 | 1768 | 1.00x |
+| 2 | 992 | 1.78x |
+| 4 | 553 | 3.20x |
+| 8 | 311 | 5.69x |
 
-Verification is more than twice the cost of generation, and it does not want
-an accelerator at all. In one process those add:
+Those are end-to-end step times, and the speedup is sublinear because part of a
+step does not scale with the reward count. Fitting `wall = C/R + T` separates
+the two: `C = 1653 s` of serial verification and `T = 131 s` for the advantage
+stage, the training step and the checkpoint upload, at `R^2 = 0.998`. The
+verification work itself is therefore close to linear in the replica count, and
+`T` is what caps the end-to-end gain. Verification is 93% of a single-replica
+step and 58% of an eight-replica one, at 12.2 s per proof serially.
 
-```
-monolith:  178 s generate  +  419 s verify  =  597 s per step
-                              ^^^^^^^^^^^^ accelerator idle for 70% of the step
-```
+Generation is the other side of the trade, and it is not the expensive part
+here: the accelerator produced all 136 completions in **16 to 18 seconds** in
+every configuration. Left in one process with the verifier, that accelerator
+would sit idle for almost the whole step. The replica count on a CPU-only
+operation is what buys it back. Nothing in that trade is available to a single
+process without hand-rolling a work queue, a scheduler, and a pool of machines
+that are not the machine the model is on.
 
-Verification is embarrassingly parallel — each completion is independent — so
-as its own operation it takes a replica count:
+One caveat on the per-proof cost. The twelve seconds is mostly
+`import Mathlib`, identical warm or cold, so a persistent process with Mathlib
+already loaded would cut it — at the cost of holding state in an operation that
+is otherwise stateless. The scaling argument survives that change, because the
+work stays CPU-bound, independent per completion, and off the accelerator.
 
-```
-workers   wall s  proofs/s  speedup  per-proof s
-      1    418.9      0.15    1.00x        6.54
-      2    176.2      0.36    2.38x        2.75
-      4     94.2      0.68    4.45x        1.47
-      8     72.9      0.88    5.74x        1.14
-```
+## A binary reward trains on nothing
 
-At eight-way the step becomes `178 + 73`, and because `completions` is
-`Pipelined` rather than `Materialized` the two overlap — a completion is
-verified while the next is still being sampled — so it tends toward
-`max(178, 73)`. The accelerator stops waiting.
+A proof compiles or it does not, so an eight-completion group collapses to
+all-zero or all-one, every advantage is `(r - mean) / std = 0`, and GRPO trains
+on nothing while every pod, epoch and metric looks healthy.
 
-Nothing in that trade is available to a single process without hand-rolling a
-work queue, a scheduler and a pool of machines that are not the machine the
-model is on. That is the thing the graph replaces.
+That is not hypothetical. Sampling `gemma-4-E2B-it` over 17 statements, 8
+completions each, and running all 136 through the kernel:
 
-Two details behind the numbers. Scaling flattens after four workers (4.45x to
-5.74x) because Lean is not purely CPU-bound at this size. And the 6.5 s is
-almost entirely `import Mathlib`, identical warm or cold — a persistent REPL
-with Mathlib already loaded would cut it, at the cost of putting state in an
-operation that is otherwise stateless.
+| reward | groups with no gradient |
+|---|---|
+| binary: proved or not | 15 of 17 |
+| graded, plain prompt | 5 of 17 |
+| graded, prompt naming the tactics | 2 of 17 |
+
+So the reward reports what the compiler said, in tiers:
+
+| kernel output | reward |
+|---|---|
+| compiles, no `sorry` | 1.0 |
+| `unsolved goals` — a well-formed tactic that did not close it | 0.4 |
+| `unknown identifier` / `unknown constant` — an invented lemma | 0.1 |
+| `unexpected token` — not Lean | 0.0 |
+
+The tiers are not a judgment about proof quality; each is a distinct thing the
+compiler reported, and they order the ways a candidate can be wrong. A tactic
+that parses and leaves goals open is nearer a proof than one naming a lemma
+that does not exist, which is nearer than text that is not Lean at all.
+
+The prompt names the available tactics for the same reason. Without that line
+the model reaches for lemma names it invents — `mul_nonneg_mul_nonneg`,
+`nonneg_of_square` — and almost never for the automation that closes these
+goals.
+
+## The run
+
+Eight steps to `Succeeded` on one L4 for `rollout`, one L4 for `learner`, eight
+CPU replicas for `reward` and two for `advantage`. Read back from the Retained
+`metrics` channel:
+
+| step | mean reward | proved / 136 | groups with no gradient |
+|---|---|---|---|
+| 0 | 0.362 | 25 | 3 |
+| 1 | 0.356 | 26 | 4 |
+| 2 | 0.343 | 21 | 3 |
+| 3 | 0.367 | 25 | 4 |
+| 4 | 0.389 | 25 | 4 |
+| 5 | 0.396 | 25 | 5 |
+| 6 | 0.444 | 29 | 5 |
+| 7 | 0.471 | 29 | 7 |
+
+Mean reward rises from 0.362 to 0.471, and steps 2 through 7 increase
+monotonically. Six values land in ascending order by chance with probability
+1/720, so the trend is unlikely to be noise. Eight steps is still a short run,
+and the honest claim is a trend in the right direction rather than a converged
+result.
+
+What moved is worth reading carefully, because the proved count barely changed:
+25 to 29 of 136. Total reward per step is `1.0 * proved` plus whatever the
+remaining completions earned, so the non-proved mass rose from 24.2 to 35.1
+while proofs added four. The model learned mostly to emit **well-formed tactics
+that fail** rather than to prove more theorems, moving from the 0.0 and 0.1
+tiers into the 0.4 tier. That is real progress up the reward the graph defines,
+and it is not the same thing as learning to prove.
+
+Groups with no gradient also rose, 3 to 7. As the model concentrates on one
+tier, more groups become uniform within themselves, so the gradient thins as
+the reward improves. A longer run would want more tiers or harder statements.
 
 ## What else falls out of declaring the edge
 
@@ -66,69 +129,36 @@ operation that is otherwise stateless.
 programs. Because the graph declares which operations talk to which, the
 controller writes a NetworkPolicy per edge: a reward pod may reach the
 coordinator and the pods that produce for it, and nothing else. The isolation
-is not added, it is a consequence of the declaration.
+is a consequence of the declaration.
 
-**The barriers, and only where GRPO needs them.** `completions` is Pipelined,
-so nothing waits. The two places GRPO must wait — for all `G` rewards of
-a prompt, and for every prompt before a step — are counted in application
-code, because `Materialized` seals on producer completion and in a training
-loop no operation ever completes.
+**Barriers only where GRPO needs them.** `completions` is Pipelined, so nothing
+waits; a completion is verified while the next is still being sampled. GRPO must wait
+in exactly two places: for all `G` rewards of a statement, and for every
+statement before a step. Both are counted in application code, because
+`Materialized` seals on producer completion and in a training loop no operation
+ever completes.
 
-## What this example does *not* show
+**Wait for the sidecar before consuming.** A worker that starts first takes a
+segment, fails its request to a port nothing is listening on, and exits. The
+container restarts inside a pod that is still alive, and the coordinator
+returns in-flight segments to the pending set only when a pod is gone, so those
+records are never redelivered. The worker therefore dials the sidecar port and
+blocks until it answers, which is exact because the sidecar binds only after
+the weights are on the device.
 
-**It does not learn — but the first measurement of that was wrong, and the
-correction is the more useful result.**
+## The rule this example earns
 
-Sampling `gemma-4-E2B-it` on eight Lean-Workbook problems, eight completions
-each, and running all 64 through the kernel gave `0/64` and eight degenerate
-groups out of eight. The obvious reading is that a 2B model cannot prove these.
+An earlier version of this reward read `0/64` with every group degenerate,
+which looks like a 2B model failing at proofs. Categorizing the completions
+showed 67% truncated and 0% with a wrong theorem header: the prompt asked the
+model to restate the goal inside a 256-token budget, and the header consumed
+it. `unexpected end of input` was in the error output all along.
 
-Categorising the 64 completions says otherwise:
-
-```
-across 64 completions:
-  truncated         43  (67%)
-  header wrong       0  ( 0%)
-  header ok         49  (77%)
-```
-
-The prompt asked the model to reproduce the theorem statement verbatim — up to
-224 characters — and then prove it, inside a 256-token budget. The header alone
-consumes most of that. Note the second row: whenever a theorem line was
-emitted, it was character-perfect. The model was not failing at restatement, it
-was running out of tokens mid-proof. `unexpected end of input` was in the error
-output all along.
-
-So `0/64` was a measurement of the harness rather than of the model. Two
-changes follow, and both are in the prompt rather than the graph:
-
-- **Ask for the tactic alone.** The statement is already known, so
-  splice the generated tactic into it and compile that. Nothing is spent
-  re-emitting a header, and 80 tokens is ample.
-- **Budget tokens against the longest statement**, or truncation silently
-  becomes the dominant failure mode.
-
-The general rule this example earns: **when a verifiable reward reads zero,
-suspect the harness before the model.** A reward that cannot distinguish "wrong
-proof" from "cut off mid-proof" is not yet a reward.
-
-The binary-reward warning still stands on its own merits. A proof compiles or
-it does not, so a group collapses to all-zero or all-one and GRPO trains on
-nothing while every pod, epoch and metric looks healthy. Watch the
-degenerate-group count before the reward curve.
-
-This example carries the scaling measurement. [examples/grpo](../grpo) carries
-the learning result. They are separate because at 2B they cannot be the same
-example.
-
-## What is measured and what is not
-
-Measured on hardware: the per-proof verification cost, the eight-way scaling
-table above, and the 64-completion breakdown that overturned the `0/64`
-reading. Provided but not run end to end: the full loop in `main.go`. The
-generator and trainer sidecar is the one
-[examples/grpo-gemma](../grpo-gemma) runs on a real accelerator, and that
-example's twelve-step run is the evidence that the loop protocol closes.
+**When a verifiable reward reads zero, suspect the harness before the model.**
+A reward that cannot distinguish a wrong proof from one cut off mid-proof is
+not yet a reward. Two things follow, and both are in the prompt rather than the
+graph: ask for the tactic alone, since the statement is already known to the
+graph; and budget tokens against the longest thing the model must emit.
 
 ## Running it
 
@@ -136,13 +166,21 @@ example's twelve-step run is the evidence that the loop protocol closes.
 go test ./examples/grpo-lean/
 ```
 
-Three images. The worker image from the repository `Dockerfile`, which
-contains `/grpo-lean`. The sidecar image from [examples/sidecar](../sidecar),
-shared with `grpo-gemma`. And a reward image carrying a Mathlib checkout with
-prebuilt `.olean` files: `lake exe cache get` fetches them in 75 s, against
-hours to compile, for a 3.9 GB image. Pin the toolchain to the one the
-statements target; a mismatch fails proofs that are correct.
+Three images. The worker image from the repository `Dockerfile`, which contains
+`/grpo-lean`. The sidecar image from [examples/sidecar](../sidecar), shared with
+[examples/grpo-gemma](../grpo-gemma). And a reward image carrying a Mathlib
+checkout with prebuilt `.olean` files, which `lake exe cache get` fetches in
+75 s — against hours to compile — for a 3.9 GB image. Pin the toolchain to the
+one the statements target; a mismatch fails proofs that are correct.
 
-`problems.go` holds eight statements inline so the example runs without a
-dataset download. The measured runs used Lean-Workbook statements in the same
-shape, and swapping the source is a change to that file alone.
+`problems.go` holds 17 statements inline so the example runs without a dataset
+download. Every statement was compiled against Mathlib v4.8.0 with a reference
+tactic before being added, because a statement that does not parse scores zero
+for every completion and reads as a model failure. The whole set is used rather
+than a selection from it: choosing which goals to train on by how the reward
+comes out is how a measurement stops measuring anything.
+
+One decision worth knowing about. The reward scores the **first line** of the
+completion after stripping any code fence. Over 136 completions the first line
+and the full indented block scored identically, so nothing is lost, and taking
+the whole completion would let trailing prose fail an otherwise correct proof.

@@ -21,7 +21,7 @@ import (
 // verification runs on cheap CPU pods while the accelerator only ever
 // generates.
 type verifier interface {
-	Verify(ctx context.Context, proof string) (bool, string)
+	Score(ctx context.Context, statement, tactic string) (float64, string)
 }
 
 // leanVerifier shells out to a Mathlib checkout. `import Mathlib` dominates the
@@ -32,15 +32,32 @@ type leanVerifier struct {
 	Timeout time.Duration
 }
 
-func (v leanVerifier) Verify(ctx context.Context, proof string) (bool, string) {
-	src := "import Mathlib\nset_option maxHeartbeats 200000\n" + unfence(proof) + "\n"
+// Score compiles the candidate and grades what the kernel said about it.
+//
+// A binary reward is what this task offers by default, and it is the reason
+// the first attempt trained on nothing: a proof compiles or it does not, so an
+// eight-completion group collapses to all-zero or all-one and GRPO sees no
+// gradient. Measured over 136 completions from a 2B model, 15 of 17 groups
+// were degenerate under a binary reward and 2 of 17 under the tiers below.
+//
+// The tiers are not a judgement about proof quality. Each one is a distinct
+// thing the compiler reported, and they order the ways a candidate can be
+// wrong: a tactic that parses and leaves goals open is nearer a proof than one
+// naming a lemma that does not exist, which is nearer than text that is not
+// Lean at all.
+func (v leanVerifier) Score(ctx context.Context, statement, tactic string) (float64, string) {
+	if tactic == "" {
+		return 0, "empty"
+	}
+	src := "import Mathlib\nset_option maxHeartbeats 200000\n" +
+		statement + " := by\n  " + tactic + "\n"
 	f, err := os.CreateTemp(v.Root, "cand-*.lean")
 	if err != nil {
-		return false, err.Error()
+		return 0, "harness: " + err.Error()
 	}
 	defer os.Remove(f.Name())
 	if _, err := f.WriteString(src); err != nil {
-		return false, err.Error()
+		return 0, "harness: " + err.Error()
 	}
 	f.Close()
 
@@ -54,12 +71,30 @@ func (v leanVerifier) Verify(ctx context.Context, proof string) (bool, string) {
 	cmd.Dir = v.Root
 	out, err := cmd.CombinedOutput()
 	text := string(out)
+	if cctx.Err() != nil {
+		return 0, "timeout"
+	}
+	return classify(text, err == nil)
+}
+
+// classify turns one compiler run into a reward. It is separate from the
+// process handling so it can be tested without a Lean toolchain.
+func classify(text string, exitOK bool) (float64, string) {
 	// A proof that leaves `sorry` type-checks and proves nothing, so the exit
 	// code alone is not the answer.
-	if err != nil || strings.Contains(text, "error") || strings.Contains(text, "sorry") {
-		return false, firstLine(text)
+	if exitOK && !strings.Contains(text, "error") && !strings.Contains(text, "sorry") {
+		return 1.0, "proved"
 	}
-	return true, ""
+	switch {
+	case strings.Contains(text, "unsolved goals"):
+		return 0.4, "unsolved"
+	case strings.Contains(text, "unknown identifier"),
+		strings.Contains(text, "unknown constant"):
+		return 0.1, "unknown-lemma"
+	case strings.Contains(text, "unexpected token"):
+		return 0.0, "parse-error"
+	}
+	return 0.1, "other-error"
 }
 
 // unfence strips a markdown code fence. A model asked for Lean very often

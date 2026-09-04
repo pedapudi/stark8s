@@ -39,8 +39,11 @@ type completion struct {
 	Index     int     `json:"index"`
 	Statement string  `json:"statement"`
 	Text      string  `json:"text"`
-	Reward    float64 `json:"reward,omitempty"`
-	Err       string  `json:"err,omitempty"`
+	Reward    float64 `json:"reward"`
+	// Cat is what the kernel said: proved, unsolved, unknown-lemma,
+	// parse-error, timeout. It is the reward's explanation, and it is what
+	// tells a flat curve apart from a broken harness.
+	Cat string `json:"cat,omitempty"`
 }
 
 type sample struct {
@@ -54,7 +57,11 @@ type group struct {
 	// Proved travels with the group because the advantages cannot recover it:
 	// a group where every completion proves the goal and a group where none
 	// does both centre to all-zero.
-	Proved  int      `json:"proved"`
+	Proved int `json:"proved"`
+	// Sum is the group's total graded reward. Neither it nor Proved survives
+	// the advantages: a group where every completion proves the goal and one
+	// where none does both centre to all-zero.
+	Sum     float64  `json:"sum"`
 	Samples []sample `json:"samples"`
 }
 
@@ -182,6 +189,7 @@ func main() {
 
 	case "rollout":
 		owned := map[string]bool{}
+		drawn := 0
 		draw := func(w *sdk.Worker, id string) error {
 			p, ok := byID(id)
 			if !ok {
@@ -204,6 +212,13 @@ func main() {
 					return err
 				}
 			}
+			drawn++
+			// The generation and verification stages run on different machines
+			// at different replica counts, so the interesting quantity is how
+			// long the graph spends in each. This line closes the generation
+			// window; the learner's step line closes the verification one.
+			log.Printf("epoch %d: generated %d completions (%d/%d statements)",
+				w.Epoch(), len(out.Completions), drawn, len(problems))
 			return nil
 		}
 		h.OnRecord = func(ctx context.Context, w *sdk.Worker, r sdk.Record) error {
@@ -228,6 +243,7 @@ func main() {
 					keys = append(keys, k)
 				}
 				sort.Strings(keys)
+				drawn = 0
 				for _, k := range keys {
 					if err := draw(w, k); err != nil {
 						return err
@@ -246,16 +262,12 @@ func main() {
 			if err := json.Unmarshal(r.Value, &c); err != nil {
 				return err
 			}
-			// One line, unfenced. A tactic block that runs past the first line
-			// is out of scope here, and taking the whole completion would let
-			// trailing prose fail an otherwise correct proof.
+			// One line, unfenced. Taking the whole completion would let
+			// trailing prose fail an otherwise correct proof; over 136
+			// completions the first line and the full block scored
+			// identically, so nothing is lost by the narrower rule.
 			tactic := firstLine(unfence(c.Text))
-			ok, msg := v.Verify(ctx, source(problem{Statement: c.Statement}, tactic))
-			if ok {
-				c.Reward = 1
-			} else {
-				c.Err = msg
-			}
+			c.Reward, c.Cat = v.Score(ctx, c.Statement, tactic)
 			return w.Emit("scored", c.Slot, c)
 		}
 
@@ -287,7 +299,8 @@ func main() {
 			gr := group{Slot: c.Slot, Samples: make([]sample, len(cs))}
 			for i, c := range cs {
 				gr.Samples[i] = sample{Prompt: prompt(p), Completion: c.Text, Advantage: adv[i]}
-				if c.Reward > 0 {
+				gr.Sum += c.Reward
+				if c.Reward == 1.0 {
 					gr.Proved++
 				}
 			}
@@ -309,9 +322,10 @@ func main() {
 			delete(open, r.Epoch)
 
 			var batch []sample
-			proved, attempted, deg := 0, 0, 0
+			proved, attempted, deg, sum := 0, 0, 0, 0.0
 			for _, gg := range groups {
 				proved += gg.Proved
+				sum += gg.Sum
 				flat := true
 				for _, s := range gg.Samples {
 					attempted++
@@ -332,10 +346,10 @@ func main() {
 				return err
 			}
 			m := metric{Step: r.Epoch, Proved: proved, Attempted: attempted,
-				RewardMean: float64(proved) / float64(max(attempted, 1)),
+				RewardMean: sum / float64(max(attempted, 1)),
 				Degenerate: deg, Checkpoint: res.Checkpoint}
-			log.Printf("step %d proved=%d/%d degenerate=%d/%d ckpt=%s",
-				m.Step, proved, attempted, deg, len(groups), res.Checkpoint)
+			log.Printf("step %d reward=%.3f proved=%d/%d degenerate=%d/%d ckpt=%s",
+				m.Step, m.RewardMean, proved, attempted, deg, len(groups), res.Checkpoint)
 			if err := w.Emit("metrics", fmt.Sprintf("step-%03d", r.Epoch), m); err != nil {
 				return err
 			}
