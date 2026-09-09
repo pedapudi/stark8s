@@ -143,6 +143,50 @@ grpo-lm -held=24 dump > prompts.json     # {tag: prompt}
 grpo-lm score < completions.json         # {tag: [completion, ...]}
 ```
 
+## Running a checkpoint
+
+`try.py` loads the base model, applies a checkpoint this example produced, and
+prints what it writes. It needs a machine with an NVIDIA GPU and nothing from
+the graph.
+
+```sh
+pip install torch torchvision transformers peft pillow "jinja2>=3.1"
+python try.py --adapter ./step-029 --compare -n 24
+```
+
+Three of those dependencies are easy to miss. Gemma 4 is a multimodal
+checkpoint, so its processor imports the vision stack even when the run only
+ever passes text: without `torchvision` the processor fails to import at all,
+and without `pillow` it refuses to construct. And `apply_chat_template` needs
+`jinja2` 3.1 or newer, which is ahead of what some distributions ship.
+
+`--compare` is the useful mode. A low-rank adapter is extra weights over a
+frozen base, so both policies fit in one process and `disable_adapter()`
+switches between them: the untrained and post-trained samples come from one
+model load, seconds apart. It ends with an aggregate, because the effect is
+statistical and small samples mislead:
+
+```
+--- untrained ---
+     words [min 17, median 18, max 21] · target 21 · |error| [min 0, median 3, max 4] · exact 2/24
+--- post-trained ---
+     words [min 18, median 20, max 24] · target 21 · |error| [min 0, median 1, max 3] · exact 5/24
+```
+
+Median error falls from 3 to 1 and exact hits rise from 2 to 5. Note the
+post-trained maximum is *worse* — 24 words against 21. Judged on spread alone
+the model looks sloppier; judged on distance from what was asked, that 24 is an
+error of three where the untrained model's tidier-looking 17 is an error of
+four. The target is read from `exactly N words` in the prompt; without one,
+only the raw spread prints.
+
+At `-n 4` the difference is not visible. Use 16 or more.
+
+`--repl` keeps the model loaded and asks for prompts, which is worth it because
+a cold start moves 1951 tensors to the device. The script sets
+`HF_HUB_OFFLINE=1` so a cached model is not re-checked against the hub on every
+invocation; `--online` restores the check.
+
 One operational note that cost a run. The worker waits for its sidecar to
 accept a connection before consuming anything. A worker that starts first takes
 a segment, fails its request, and exits. The container restarts inside a pod
