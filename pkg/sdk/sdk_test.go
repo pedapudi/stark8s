@@ -434,3 +434,111 @@ func TestCombineModeIdempotence(t *testing.T) {
 		}
 	}
 }
+
+func TestSynchronousLoopDoesNotStallOnIdlePods(t *testing.T) {
+	const supersteps = 8
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "graph", From: "seed", To: "rank", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4}},
+		{Name: "contrib", From: "rank", To: "rank",
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackSynchronous, MaxEpochs: supersteps}},
+	})
+	defer stop()
+
+	h.run(h.worker("seed", "seed-0", nil, []string{"graph"}), Handlers{
+		Source: func(ctx context.Context, w *Worker) error { return w.Emit("graph", "only", 1.0) },
+	})
+	for _, inst := range []string{"rank-0", "rank-1"} {
+		w := h.worker("rank", inst, []string{"graph", "contrib"}, []string{"contrib"})
+		w.SetFeedback([]string{"contrib"}, []string{"contrib"})
+		keys := map[string]bool{}
+		h.run(w, Handlers{
+			OnRecord: func(ctx context.Context, w *Worker, r Record) error {
+				keys[r.Key] = true
+				return nil
+			},
+			OnEpochEnd: func(ctx context.Context, w *Worker, epoch int32) error {
+				for k := range keys {
+					if err := w.Emit("contrib", k, 1.0); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		})
+	}
+	h.waitComplete("seed")
+	if err := h.co.Seal("graph"); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	h.waitComplete("rank")
+	if elapsed, budget := time.Since(start), supersteps*time.Second; elapsed > budget {
+		t.Fatalf("%d supersteps took %v, over the %v budget", supersteps, elapsed, budget)
+	}
+}
+
+func TestUnfetchableSegmentFailsInsteadOfHanging(t *testing.T) {
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "s", From: "produce", To: "consume", Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 1}},
+	})
+	defer stop()
+
+	// A segment announced by a pod that is no longer serving it. The
+	// coordinator still queues it, and nothing can ever fetch it.
+	if err := h.co.Announce("s", "produce", []coordinator.SegmentAnnouncement{{
+		ID: "seg-gone", Channel: "s", Records: 1, Bytes: 2,
+		Holder: "127.0.0.1:1", Producer: "produce-0",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	errc := make(chan error, 1)
+	w := h.worker("consume", "consume-0", []string{"s"}, nil)
+	go func() { errc <- w.Run(h.ctx, Handlers{}) }()
+	select {
+	case err := <-errc:
+		if err == nil || !strings.Contains(err.Error(), "seg-gone") {
+			t.Fatalf("Run returned %v, want an error naming the segment it could not fetch", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned: a segment that cannot be fetched hangs the worker instead of failing it")
+	}
+}
+
+func TestLargeRecordsFlushOnBytes(t *testing.T) {
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "big", From: "a", To: "b", Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 1}},
+		{Name: "small", From: "a", To: "b", Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 1}},
+	})
+	defer stop()
+	w := h.worker("a", "a-0", nil, []string{"big", "small"})
+
+	// Ten records of 1 MiB each: 10 MiB buffered, nowhere near the 500
+	// records the count threshold waits for.
+	value := strings.Repeat("x", 1<<20)
+	for i := 0; i < 10; i++ {
+		if err := w.Emit("big", fmt.Sprintf("k%d", i), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(w.unannounced["big"]); n < 2 {
+		t.Fatalf("10 MiB in 10 records produced %d segments, want at least 2: the buffer grows without bound until it holds %d records", n, flushRecords)
+	}
+
+	// Small records still flush on the count alone, at exactly the same
+	// point as before.
+	for i := 0; i < flushRecords-1; i++ {
+		if err := w.Emit("small", "k", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(w.unannounced["small"]); n != 0 {
+		t.Fatalf("%d small records produced %d segments, want none before the %dth", flushRecords-1, n, flushRecords)
+	}
+	if err := w.Emit("small", "k", 0); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(w.unannounced["small"]); n != 1 {
+		t.Fatalf("%d small records produced %d segments, want exactly 1", flushRecords, n)
+	}
+}
