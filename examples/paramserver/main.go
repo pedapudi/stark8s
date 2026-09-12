@@ -19,8 +19,7 @@
 // imposes no barrier. The round barrier is the server's own rule — it holds a
 // round open until every shard has reported — because the engine's
 // Synchronous barrier cannot serve a loop whose producer and consumer are
-// different operations. docs/ray-mapping.md says why, and main_test.go pins
-// the behaviour down.
+// different operations. main_test.go covers the behavior.
 //
 // Rounds are counted by the record epoch, and round 0 is registration: a
 // worker emits an empty gradient for each shard it has just received, and

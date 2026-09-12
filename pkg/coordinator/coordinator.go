@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 )
 
 // PodTTL is how long a pod may stay silent before it is considered gone.
@@ -48,6 +48,12 @@ type operation struct {
 	pods map[string]*pod
 	// owner maps "partitions/p" -> pod name.
 	owner map[string]string
+	// pinned holds the owner keys whose owner has actually been handed a
+	// segment. A consumer accumulates in-memory state for the partitions it
+	// has processed, so a pinned partition stays with its owner for as long
+	// as that owner is alive; an unpinned one carries no state anywhere and
+	// is redistributed freely as the pod pool grows.
+	pinned map[string]bool
 	// completed latches completion so an operation scaled to zero stays
 	// complete. It is set once inputs are drained and every live pod has
 	// reported done, and cleared as soon as an inbound channel has runnable
@@ -65,6 +71,61 @@ func (o *operation) liveIDs() []string {
 }
 
 func ownerKey(partitions, p int) string { return fmt.Sprintf("%d/%d", partitions, p) }
+
+// balanceHash spreads the partitions of the operation's hash channels with
+// partition count n over its live pods.
+//
+// A partition that has been handed work is pinned: its owner may hold state
+// derived from the records it processed, so moving it would silently corrupt
+// the result and it is left where it is until the owner expires. Every other
+// partition carries no state anywhere, so it is (re)assigned here, least
+// loaded pod first, counting pinned partitions as load already carried. A
+// pod that registers after the first one therefore still receives a share
+// instead of finding every partition taken.
+//
+// The result is a function of the live pods and the pinned partitions alone,
+// so repeated calls that change neither return the same assignment and
+// ownership does not flap. Balancing is per partition count because the
+// assignment for one count must not depend on the assignment for another,
+// which is what makes that fixed point reachable; two hash channels with
+// equal partition counts into one operation share these keys and so stay
+// co-partitioned.
+func (o *operation) balanceHash(n int) {
+	ids := o.liveIDs()
+	if len(ids) == 0 {
+		return
+	}
+	live := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		live[id] = true
+	}
+	load := make(map[string]int, len(ids))
+	var free []int
+	for p := 0; p < n; p++ {
+		k := ownerKey(n, p)
+		owner, owned := o.owner[k]
+		if owned && !live[owner] {
+			delete(o.owner, k)
+			delete(o.pinned, k)
+			owned = false
+		}
+		if owned && o.pinned[k] {
+			load[owner]++
+			continue
+		}
+		free = append(free, p)
+	}
+	for _, p := range free {
+		best := ids[0]
+		for _, id := range ids[1:] {
+			if load[id] < load[best] {
+				best = id
+			}
+		}
+		o.owner[ownerKey(n, p)] = best
+		load[best]++
+	}
+}
 
 // segment is the coordinator's record of one announced segment.
 type segment struct {
@@ -100,7 +161,7 @@ type segment struct {
 func (s *segment) key() string { return s.holder + "/" + s.id }
 
 type channel struct {
-	spec v1alpha1.Channel
+	spec graph.Channel
 
 	sealed     bool
 	produced   int64
@@ -135,20 +196,20 @@ func (c *channel) partitions() int { return int(c.spec.Partitioning.Partitions) 
 func (c *channel) external() bool { return c.spec.To == "" }
 
 func (c *channel) broadcast() bool {
-	return c.spec.Partitioning.Mode == v1alpha1.PartitionBroadcast
+	return c.spec.Partitioning.Mode == graph.PartitionBroadcast
 }
 
-func (c *channel) feedbackMode() v1alpha1.FeedbackMode {
+func (c *channel) feedbackMode() graph.FeedbackMode {
 	if c.spec.Feedback == nil {
 		return ""
 	}
-	if c.spec.Feedback.Mode == v1alpha1.FeedbackAsynchronous {
-		return v1alpha1.FeedbackAsynchronous
+	if c.spec.Feedback.Mode == graph.FeedbackAsynchronous {
+		return graph.FeedbackAsynchronous
 	}
-	return v1alpha1.FeedbackSynchronous
+	return graph.FeedbackSynchronous
 }
 
-func (c *channel) synchronous() bool { return c.feedbackMode() == v1alpha1.FeedbackSynchronous }
+func (c *channel) synchronous() bool { return c.feedbackMode() == graph.FeedbackSynchronous }
 
 // Coordinator holds the control-plane state of one workload.
 type Coordinator struct {
@@ -180,7 +241,7 @@ func New(selfAddr string) *Coordinator {
 func (co *Coordinator) op(name string) *operation {
 	o, ok := co.ops[name]
 	if !ok {
-		o = &operation{pods: map[string]*pod{}, owner: map[string]string{}}
+		o = &operation{pods: map[string]*pod{}, owner: map[string]string{}, pinned: map[string]bool{}}
 		co.ops[name] = o
 	}
 	return o
@@ -197,7 +258,7 @@ func (co *Coordinator) get(name string) (*channel, error) {
 // Configure declares channels. Existing channels keep their state so the
 // controller can call this on every reconcile; new channels are created and
 // channels absent from the list are left untouched.
-func (co *Coordinator) Configure(specs []v1alpha1.Channel) {
+func (co *Coordinator) Configure(specs []graph.Channel) {
 	co.mu.Lock()
 	defer co.mu.Unlock()
 	for _, s := range specs {
@@ -205,13 +266,13 @@ func (co *Coordinator) Configure(specs []v1alpha1.Channel) {
 			s.Partitioning.Partitions = 1
 		}
 		if s.Partitioning.Mode == "" {
-			s.Partitioning.Mode = v1alpha1.PartitionRoundRobin
+			s.Partitioning.Mode = graph.PartitionRoundRobin
 		}
 		if s.To == "" {
-			s.Durability = v1alpha1.DurabilityRetained
+			s.Durability = graph.DurabilityRetained
 		}
 		if s.Feedback != nil && s.Feedback.Mode == "" {
-			s.Feedback.Mode = v1alpha1.FeedbackSynchronous
+			s.Feedback.Mode = graph.FeedbackSynchronous
 		}
 		if c, ok := co.channels[s.Name]; ok {
 			c.spec = s
@@ -236,10 +297,10 @@ func (co *Coordinator) Configure(specs []v1alpha1.Channel) {
 }
 
 // Topology returns the declared channels.
-func (co *Coordinator) Topology() []v1alpha1.Channel {
+func (co *Coordinator) Topology() []graph.Channel {
 	co.mu.Lock()
 	defer co.mu.Unlock()
-	out := make([]v1alpha1.Channel, 0, len(co.channels))
+	out := make([]graph.Channel, 0, len(co.channels))
 	for _, n := range co.channelNames() {
 		out = append(out, co.channels[n].spec)
 	}
@@ -307,7 +368,7 @@ func (co *Coordinator) Released(podName string) []string {
 	co.expireAll()
 	var out []string
 	for _, c := range co.channels {
-		if c.spec.Durability == v1alpha1.DurabilityRetained {
+		if c.spec.Durability == graph.DurabilityRetained {
 			continue
 		}
 		for k, s := range c.all {
@@ -347,6 +408,7 @@ func (co *Coordinator) expireConsumer(opName string, o *operation, id string) {
 	for k, owner := range o.owner {
 		if owner == id {
 			delete(o.owner, k)
+			delete(o.pinned, k)
 		}
 	}
 	for _, c := range co.channels {
@@ -516,9 +578,9 @@ func (c *channel) enqueue(s *segment) {
 // partitionOf computes the partition of a record the way producer pods do.
 func (c *channel) partitionOf(r Record) int32 {
 	switch c.spec.Partitioning.Mode {
-	case v1alpha1.PartitionBroadcast:
+	case graph.PartitionBroadcast:
 		return 0
-	case v1alpha1.PartitionHash:
+	case graph.PartitionHash:
 		return int32(HashPartition(r.Key, c.partitions()))
 	default:
 		p := int32(c.rr % uint64(c.partitions()))
@@ -631,33 +693,13 @@ func (co *Coordinator) seal(c *channel) {
 //
 // RoundRobin partitions have no key affinity so they are rebalanced freely
 // across live pods. Hash partitions carry key affinity so ownership is
-// sticky and shared across the operation's channels: a partition stays with
-// its first owner until that owner expires.
+// sticky and shared across the operation's channels, but only once the owner
+// has been handed work for the partition: see balanceHash.
 func (c *channel) assigned(o *operation, id string) []int {
-	ids := o.liveIDs()
-	idx := sort.SearchStrings(ids, id)
 	var out []int
 	n := c.partitions()
-	if c.spec.Partitioning.Mode == v1alpha1.PartitionHash {
-		for p := 0; p < n; p++ {
-			k := ownerKey(n, p)
-			if _, ok := o.owner[k]; ok {
-				continue
-			}
-			best, bestN := "", int(^uint(0)>>1)
-			for _, cid := range ids {
-				cnt := 0
-				for _, owner := range o.owner {
-					if owner == cid {
-						cnt++
-					}
-				}
-				if cnt < bestN {
-					best, bestN = cid, cnt
-				}
-			}
-			o.owner[k] = best
-		}
+	if c.spec.Partitioning.Mode == graph.PartitionHash {
+		o.balanceHash(n)
 		for p := 0; p < n; p++ {
 			if o.owner[ownerKey(n, p)] == id {
 				out = append(out, p)
@@ -665,9 +707,11 @@ func (c *channel) assigned(o *operation, id string) []int {
 		}
 		return out
 	}
+	ids := o.liveIDs()
 	if len(ids) == 0 {
 		return nil
 	}
+	idx := sort.SearchStrings(ids, id)
 	for p := 0; p < n; p++ {
 		if p%len(ids) == idx {
 			out = append(out, p)
@@ -740,7 +784,7 @@ func (c *channel) inflightRecords() int64 {
 func (c *channel) quiet() bool { return c.pending() == 0 && len(c.inflight) == 0 }
 
 func (c *channel) gated() bool {
-	return c.spec.Delivery == v1alpha1.DeliveryMaterialized && !c.sealed
+	return c.spec.Delivery == graph.DeliveryMaterialized && !c.sealed
 }
 
 // Consume returns up to max segments pending on the partitions the pod owns.
@@ -803,6 +847,12 @@ func (co *Coordinator) Consume(name, opName, podName string, max int) (*ConsumeR
 					n++
 				}
 				if len(work.Segments) > 0 {
+					// The pod is about to process records of this partition
+					// and may keep state derived from them, so its ownership
+					// stops being provisional here.
+					if c.spec.Partitioning.Mode == graph.PartitionHash {
+						o.pinned[ownerKey(c.partitions(), p)] = true
+					}
 					resp.Work = append(resp.Work, work)
 				}
 			}
@@ -850,7 +900,7 @@ func (co *Coordinator) Ack(name string, acks []SegmentAck) error {
 		} else {
 			s.released = true
 		}
-		if s.released && s.data != nil && c.spec.Durability != v1alpha1.DurabilityRetained {
+		if s.released && s.data != nil && c.spec.Durability != graph.DurabilityRetained {
 			s.data = nil
 			delete(c.all, s.key())
 		}
@@ -919,7 +969,7 @@ func (co *Coordinator) EpochDone(name, podName string, epoch int32) error {
 // with sealed inputs is finished.
 func (co *Coordinator) settle() {
 	for _, c := range co.channels {
-		if c.sealed || c.feedbackMode() != v1alpha1.FeedbackAsynchronous {
+		if c.sealed || c.feedbackMode() != graph.FeedbackAsynchronous {
 			continue
 		}
 		members := co.cycleMembers(c)
@@ -1079,14 +1129,14 @@ func (co *Coordinator) operationMetrics(name string) OperationMetrics {
 						continue
 					}
 					k := c.spec.Name + "/" + fmt.Sprint(p)
-					if c.spec.Partitioning.Mode == v1alpha1.PartitionHash {
+					if c.spec.Partitioning.Mode == graph.PartitionHash {
 						k = "hash/" + ownerKey(c.partitions(), p)
 					}
 					runnable[k] = true
 				}
 			}
 		}
-		if c.spec.Durability != v1alpha1.DurabilityRetained {
+		if c.spec.Durability != graph.DurabilityRetained {
 			for _, s := range c.all {
 				if s.data == nil && !s.released && s.op == name {
 					om.HoldsUnconsumed = true

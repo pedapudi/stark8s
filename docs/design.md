@@ -185,10 +185,65 @@ implemented; the durability attribute on channels is the hook for the second
 (a `Retained` channel can be replayed to a restarted consumer, but the
 restart itself is not automated).
 
+## Large payloads
+
+The transport is already reference-based. A producer writes its records into
+a file on its own disk and announces only the location; the coordinator holds
+an identifier, a channel, a partition, an epoch, two counts and a holder
+address, and consumers fetch the bytes pod to pod. What was not
+reference-based was the payload inside a record. `Emit` JSON-encodes every
+value into the segment, and a consumer decodes the whole segment before it
+handles the first record, so a large value is encoded, written, read and
+decoded in full, and buffered whole on both sides.
+
+`EmitBlob(channel, key, reader)` streams a payload into a file of its own
+beside the segments and emits an ordinary record whose value is a small
+handle: the blob's identifier, the holder's address, and the size. The
+consumer calls `OpenBlob(record)` and receives an `io.ReadCloser` streaming
+from the holder. The payload is never JSON-encoded, and neither side holds it
+in memory: the producer copies the reader to disk, the holder copies the file
+to the response, and the consumer reads the response as a stream. The record
+carrying the handle is partitioned, stamped with an epoch, buffered, flushed,
+delivered and acknowledged exactly like any other record, so the whole
+protocol above applies to it unchanged.
+
+**The lifetime rule: a blob lives exactly as long as the segment carrying the
+record that references it.** The blob file is written before the record is
+buffered, so the blob exists by the time anyone can learn of it. When the
+record is flushed, the blob is bound to the segment it landed in. The blob is
+deleted when the coordinator reports that segment released, which happens
+only after every consumer delivered the segment has acknowledged it — for a
+`Broadcast` channel, every consumer replica. A worker acknowledges a segment
+only after the record handler returns, so `OpenBlob` is guaranteed to succeed
+for the duration of the handler that received the record. A reader kept past
+the return of the handler may find the blob gone. A transfer already in
+progress is not truncated by a release, because the holder has the file open
+for the length of the copy and the bytes survive the unlink until it closes;
+it is a fetch started after the release that fails, with a 404 naming the
+blob. An unreachable holder fails the same way within seconds rather than
+blocking the consumer.
+
+What this is not. It is not a distributed object store. A blob lives on the
+one pod that produced it and dies with that pod: if the producer is deleted
+before its consumers have read, the blob is unfetchable, exactly as a segment
+of that pod would be, and the same limitation in the failure model applies —
+the producing task is not re-executed. There is no reference counting across
+channels or across pods; the counting that exists is local, covering the case
+where several of a producer's own segments refer to one blob, and a handle
+received from upstream must therefore not be forwarded to another channel,
+since that blob's lifetime is bound to the upstream segment and not to the
+new one. To pass a payload on, open it and emit it again. There is no
+locality-aware scheduling: nothing tries to place a consumer near the pod
+holding the blobs it will read. Blob bytes are invisible to the coordinator,
+so a channel carrying blobs looks small in the backlog metrics that drive
+scaling, and a blob emitted to a channel with no consuming operation has no
+segment to be bound to and is held until the pod exits.
+
 ## Out of scope
 
 - Scheduling across workloads (gang scheduling, queueing, quotas). A
   Workload's pods are ordinary pods; a scheduler such as Volcano or Kueue
   can manage them by label.
-- Data formats. Records are opaque JSON values with a string key.
+- Data formats. Records are opaque JSON values with a string key; a payload
+  too large to belong in one is passed by reference, as described above.
 - Exactly-once processing.

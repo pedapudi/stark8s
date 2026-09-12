@@ -28,12 +28,10 @@ not of the maths:
 
 **The round barrier lives in the server, not in the channel.** `weights` is an
 `Asynchronous` feedback channel, which carries the round number per record and
-imposes no barrier at all. The server supplies the barrier by holding a round
-open until it has a gradient from every shard. The engine's own `Synchronous`
-barrier cannot do this job, because it treats a channel that is empty because
-its producer has not sent anything yet as a finished epoch;
-[docs/ray-mapping.md](../../docs/ray-mapping.md#loops-across-two-operations)
-says what goes wrong and `main_test.go` pins the behaviour down.
+imposes no barrier. The server supplies the barrier by holding a round open
+until it has a gradient from every shard. A `Synchronous` feedback channel
+cannot supply this barrier because an empty channel is quiescent even when its
+producer has not sent the round's records. `main_test.go` covers this behavior.
 
 **Round 0 is registration.** A worker that has just received a shard sends an
 empty gradient for it, and the server broadcasts the initial weights only once
@@ -59,6 +57,5 @@ closed-form least-squares solution, that every worker saw every round's
 weights, that the server received one gradient per shard in every round, and
 that the loop stopped at the bound.
 
-In a cluster, `kubectl apply -f examples/paramserver/workload.yaml` against the
-`stark8s:dev` image, then `hack/results.sh paramserver checkpoints` for the
-trajectory.
+The workload manifest supplies a cluster configuration, but this example has
+only been verified by the in-process test.

@@ -58,8 +58,8 @@ spec:
       partitioning: {mode: Hash, partitions: 4}
       delivery: Materialized
 
-    # ray.get(ps.get_weights.remote()) — every worker needs the SAME weights,
-    # so Broadcast rather than a partitioned channel. Marking it feedback is
+    # Every worker needs the same weights, so this uses Broadcast rather than
+    # a partitioned channel. Marking it feedback is
     # what makes it a training loop instead of a single pass.
     - name: weights
       from: server
@@ -67,7 +67,7 @@ spec:
       partitioning: {mode: Broadcast, partitions: 1}
       feedback: {mode: Asynchronous, maxEpochs: 41}
 
-    # ps.apply_gradients.remote(g) — every worker sends to the one server, so
+    # Every worker sends gradients to the one server, so
     # the partition count is 1 and every gradient lands on the single owner.
     - name: gradients
       from: worker

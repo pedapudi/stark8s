@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 	"github.com/pedapudi/stark8s/pkg/sdk"
 )
@@ -44,7 +44,7 @@ type harness struct {
 	wg   sync.WaitGroup
 }
 
-func newHarness(t *testing.T, specs []v1alpha1.Channel) (*harness, context.CancelFunc) {
+func newHarness(t *testing.T, specs []graph.Channel) (*harness, context.CancelFunc) {
 	t.Helper()
 	seg := httptest.NewServer(nil)
 	co := coordinator.New(strings.TrimPrefix(seg.URL, "http://"))
@@ -112,16 +112,16 @@ func (h *harness) channel(name string) coordinator.ChannelMetrics {
 // --- the test ---------------------------------------------------------------
 
 func TestParameterServerTrains(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
+	h, stop := newHarness(t, []graph.Channel{
 		{Name: "shards", From: "data", To: "worker",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: testShards},
-			Delivery:     v1alpha1.DeliveryMaterialized},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: testShards},
+			Delivery:     graph.DeliveryMaterialized},
 		{Name: "weights", From: "server", To: "worker",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionBroadcast, Partitions: 1},
-			Feedback:     &v1alpha1.Feedback{Mode: v1alpha1.FeedbackAsynchronous, MaxEpochs: testRounds + 1}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionBroadcast, Partitions: 1},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackAsynchronous, MaxEpochs: testRounds + 1}},
 		{Name: "gradients", From: "worker", To: "server",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 1}},
-		{Name: "checkpoints", From: "server", Durability: v1alpha1.DurabilityRetained},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 1}},
+		{Name: "checkpoints", From: "server", Durability: graph.DurabilityRetained},
 	})
 	defer stop()
 
@@ -316,10 +316,10 @@ func closedForm() []float64 {
 // producer at all.
 func TestSynchronousFeedbackDoesNotWaitForAnotherOperation(t *testing.T) {
 	const maxEpochs = 3
-	h, stop := newHarness(t, []v1alpha1.Channel{
+	h, stop := newHarness(t, []graph.Channel{
 		{Name: "gradients", From: "worker", To: "server",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 1},
-			Feedback:     &v1alpha1.Feedback{Mode: v1alpha1.FeedbackSynchronous, MaxEpochs: maxEpochs}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 1},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackSynchronous, MaxEpochs: maxEpochs}},
 	})
 	defer stop()
 
