@@ -5,7 +5,9 @@
 package v1alpha1
 
 import (
+	"github.com/pedapudi/stark8s/api/graph"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -21,111 +23,6 @@ const (
 	// Streaming semantics; realised as a Deployment.
 	CompletionNever Completion = "Never"
 )
-
-// PartitioningMode says how records on a channel are split across the
-// consuming operation's replicas.
-type PartitioningMode string
-
-const (
-	// PartitionHash routes each record by hash of its key. Records with equal
-	// keys always reach the same consumer replica.
-	PartitionHash PartitioningMode = "Hash"
-	// PartitionRoundRobin spreads records evenly with no key affinity.
-	PartitionRoundRobin PartitioningMode = "RoundRobin"
-	// PartitionBroadcast delivers every record to every consumer replica.
-	PartitionBroadcast PartitioningMode = "Broadcast"
-)
-
-// Delivery says when records become visible to the consumer.
-type Delivery string
-
-const (
-	// DeliveryPipelined delivers records as soon as they are produced. The
-	// consumer may start before the producer finishes.
-	DeliveryPipelined Delivery = "Pipelined"
-	// DeliveryMaterialized withholds all records until the channel is sealed
-	// (the producer has completed). This is a stage barrier: the consumer is
-	// not even started until the producer finishes.
-	DeliveryMaterialized Delivery = "Materialized"
-)
-
-// Durability says what happens to records after they are consumed.
-type Durability string
-
-const (
-	// DurabilityEphemeral discards records once acknowledged.
-	DurabilityEphemeral Durability = "Ephemeral"
-	// DurabilityRetained keeps records after acknowledgement so the channel
-	// can be replayed or read externally (for example a result channel).
-	DurabilityRetained Durability = "Retained"
-)
-
-// Partitioning describes how a channel splits records across consumers.
-type Partitioning struct {
-	// +kubebuilder:default=RoundRobin
-	// +kubebuilder:validation:Enum=Hash;RoundRobin;Broadcast
-	Mode PartitioningMode `json:"mode,omitempty"`
-	// Partitions is the number of partitions for Hash and RoundRobin modes.
-	// The consuming operation should not have more replicas than partitions.
-	// +kubebuilder:default=8
-	// +kubebuilder:validation:Minimum=1
-	Partitions int32 `json:"partitions,omitempty"`
-}
-
-// FeedbackMode says how a loop is synchronised.
-type FeedbackMode string
-
-const (
-	// FeedbackSynchronous runs the loop as bulk-synchronous supersteps: one
-	// global epoch, and epoch e+1 is delivered only after every consumer has
-	// finished epoch e. Suited to iterative algorithms such as PageRank.
-	FeedbackSynchronous FeedbackMode = "Synchronous"
-	// FeedbackAsynchronous runs the loop without a barrier. The epoch is
-	// carried per record and incremented each time the record crosses the
-	// feedback channel, so each key iterates on its own schedule. Suited to
-	// agent loops where each conversation is an independent thread.
-	FeedbackAsynchronous FeedbackMode = "Asynchronous"
-)
-
-// Feedback marks a channel as closing a cycle and defines the loop it drives.
-// Records on a feedback channel carry an epoch.
-type Feedback struct {
-	// +kubebuilder:default=Synchronous
-	// +kubebuilder:validation:Enum=Synchronous;Asynchronous
-	Mode FeedbackMode `json:"mode,omitempty"`
-	// MaxEpochs bounds the loop. Synchronous: when the consuming operation
-	// finishes epoch MaxEpochs-1 the channel is sealed. Asynchronous: a
-	// record whose epoch reaches MaxEpochs is diverted to Overflow, or
-	// dropped and counted when Overflow is empty.
-	// +kubebuilder:validation:Minimum=1
-	MaxEpochs int32 `json:"maxEpochs"`
-	// Overflow names a channel that receives records exceeding MaxEpochs on
-	// an Asynchronous loop. It must be a channel with no consumer or one
-	// consumed by another operation.
-	Overflow string `json:"overflow,omitempty"`
-}
-
-// Channel is a directed information flow between two operations. It is the
-// only kind of edge in the graph.
-type Channel struct {
-	Name string `json:"name"`
-	// From is the producing operation. Empty means records are produced from
-	// outside the workload through the exchange API.
-	From string `json:"from,omitempty"`
-	// To is the consuming operation. Empty means records are read from outside
-	// the workload through the exchange API; such channels are always retained.
-	To string `json:"to,omitempty"`
-	// +kubebuilder:default={mode:RoundRobin,partitions:8}
-	Partitioning Partitioning `json:"partitioning,omitempty"`
-	// +kubebuilder:default=Pipelined
-	// +kubebuilder:validation:Enum=Pipelined;Materialized
-	Delivery Delivery `json:"delivery,omitempty"`
-	// +kubebuilder:default=Ephemeral
-	// +kubebuilder:validation:Enum=Ephemeral;Retained
-	Durability Durability `json:"durability,omitempty"`
-	// Feedback is set on the channel that closes a cycle.
-	Feedback *Feedback `json:"feedback,omitempty"`
-}
 
 // HorizontalScaling bounds replica count and names the signals that drive it.
 type HorizontalScaling struct {
@@ -164,6 +61,72 @@ type Scaling struct {
 	Vertical   *VerticalScaling  `json:"vertical,omitempty"`
 }
 
+// EgressDestination names somewhere outside the workload that an operation is
+// allowed to open connections to.
+type EgressDestination string
+
+const (
+	// EgressMetadata is the instance metadata server on its link-local
+	// address, over plain HTTP. It is how a pod obtains an identity token for
+	// the account it runs as, which everything else outside the cluster tends
+	// to need first.
+	EgressMetadata EgressDestination = "Metadata"
+	// EgressInternet is HTTPS to addresses outside the cluster. The private
+	// ranges are excluded, so this grants no reach to other pods or services.
+	EgressInternet EgressDestination = "Internet"
+)
+
+// EgressRule grants one operation access to one destination outside the
+// workload.
+//
+// It is a struct holding a single field rather than a bare destination so
+// that a narrower grant can be expressed later, by adding an explicit CIDR or
+// a port list here, without changing the shape of anything already written.
+type EgressRule struct {
+	// To names the destination.
+	// +kubebuilder:validation:Enum=Metadata;Internet
+	To EgressDestination `json:"to"`
+}
+
+// SegmentStorage sizes the local volume that holds the segments an
+// operation's pods produce. It is per pod, not per operation: every replica
+// gets a volume this size and requests this much disk, so an operation that
+// produces a total spread over N replicas needs roughly a total/N here, and
+// the cluster is asked for Size times the replica count.
+//
+// How much has to fit depends on the outbound channels:
+//
+//   - Ephemeral: a segment is deleted once every consumer has acknowledged
+//     it, so the volume has to hold the peak unacknowledged output. On a
+//     Materialized channel that is the replica's whole output, since the
+//     consumer is not started until the channel seals.
+//   - Retained with a consumer: the coordinator never releases retained
+//     segments back to their producer, so the volume has to hold everything
+//     the replica produces for as long as its pod runs.
+//   - No consumer at all: nothing reaches this volume. The coordinator forces
+//     such a channel to Retained and the worker posts its records to the
+//     coordinator instead of writing a segment, so Size does nothing for an
+//     operation whose only output is a terminal channel.
+//
+// Sizing the volume is a scheduling statement, not a durability one. Segments
+// live and die with the pod holding them: an operation that completes is
+// scaled to zero, and retained segments go with it.
+//
+// Declaring it is what tells the scheduler the pods need disk. Left unset the
+// volume is a bare emptyDir with no size, and its capacity is whatever the
+// cluster's defaults allow.
+type SegmentStorage struct {
+	// Size is the capacity of the segment volume. The controller sets it as
+	// the volume's sizeLimit and as a floor under the first container's
+	// ephemeral-storage request, which is what the scheduler places the pod
+	// by. No limit is set: a pod's ephemeral-storage limit is charged the
+	// volume together with every container's writable layer and logs, so a
+	// limit equal to Size would evict the pod before the volume filled. A
+	// template whose containers do add up to a limit keeps it, and one that
+	// does not exceed Size is rejected rather than raised.
+	Size resource.Quantity `json:"size"`
+}
+
 // Operation is a vertex of the graph: one logical computation backed by its
 // own pool of pods.
 type Operation struct {
@@ -182,6 +145,34 @@ type Operation struct {
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
 	Slots int32 `json:"slots,omitempty"`
+	// TickInterval makes the operation run on a clock as well as on its
+	// input: every replica calls its Tick handler this often, between passes
+	// over its inbound channels. It suits an operation that polls a feed, a
+	// queue or an API on a schedule while taking what to poll for from a
+	// channel. Leave it unset for an operation driven only by records.
+	//
+	// The handler runs on the same goroutine as record processing, so this is
+	// a floor on the period rather than a guarantee: a long batch of records
+	// delays the next tick.
+	TickInterval *metav1.Duration `json:"tickInterval,omitempty"`
+	// Egress lists what this operation may reach outside the workload.
+	//
+	// The default is nothing. Operation pods are otherwise allowed to reach
+	// only the coordinator, DNS, and the segment port of pods in the same
+	// workload, which is what keeps one operation off another operation's
+	// channels. An operation that has to read a feed, call an API or fetch an
+	// identity token says so here, and the grant applies to that operation
+	// alone; its neighbours are unaffected.
+	//
+	// Declaring it per operation rather than per workload keeps the grant
+	// visible in the graph, so a reader can see which vertices reach outside
+	// and a reviewer sees the widening in the same change as the code that
+	// needs it.
+	Egress []EgressRule `json:"egress,omitempty"`
+	// Segments sizes the local volume this operation's pods keep their
+	// produced segments in. A pod template that declares its own volume named
+	// stark8s-segments sizes it instead, and the two cannot both be set.
+	Segments *SegmentStorage `json:"segments,omitempty"`
 }
 
 // CoordinatorSpec configures the per-workload coordinator that tracks
@@ -194,7 +185,7 @@ type CoordinatorSpec struct {
 // WorkloadSpec is the graph.
 type WorkloadSpec struct {
 	Operations  []Operation     `json:"operations"`
-	Channels    []Channel       `json:"channels,omitempty"`
+	Channels    []graph.Channel `json:"channels,omitempty"`
 	Coordinator CoordinatorSpec `json:"coordinator,omitempty"`
 }
 
@@ -294,8 +285,8 @@ func (s *WorkloadSpec) OperationByName(name string) *Operation {
 }
 
 // Inbound returns the channels consumed by the named operation.
-func (s *WorkloadSpec) Inbound(op string) []Channel {
-	var out []Channel
+func (s *WorkloadSpec) Inbound(op string) []graph.Channel {
+	var out []graph.Channel
 	for _, c := range s.Channels {
 		if c.To == op {
 			out = append(out, c)
@@ -305,8 +296,8 @@ func (s *WorkloadSpec) Inbound(op string) []Channel {
 }
 
 // Outbound returns the channels produced by the named operation.
-func (s *WorkloadSpec) Outbound(op string) []Channel {
-	var out []Channel
+func (s *WorkloadSpec) Outbound(op string) []graph.Channel {
+	var out []graph.Channel
 	for _, c := range s.Channels {
 		if c.From == op {
 			out = append(out, c)

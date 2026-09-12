@@ -8,8 +8,9 @@
 //	operation       -> Deployment (<workload>-<operation>) whatever its
 //	                   completion rule, plus a ServiceAccount of the same name,
 //	                   labelled stark8s.io/workload and stark8s.io/operation,
-//	                   with STARK8S_* environment, a segment volume, and the
-//	                   segment port injected into every pod
+//	                   with STARK8S_* environment, a segment volume sized by
+//	                   segments.size, and the segment port injected into
+//	                   every pod
 //	channels        -> pushed to the coordinator as topology; sealed when the
 //	                   coordinator reports their producing operation complete
 //	scaling         -> replicas = clamp(ceil(runnableTasks / slots), min, max)
@@ -47,6 +48,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -56,6 +58,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/api/v1alpha1"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
@@ -78,6 +81,12 @@ const (
 
 	pollInterval = 3 * time.Second
 )
+
+// minSegmentSize is the smallest segments.size Validate accepts. Quantities
+// without a unit suffix are bytes, so `size: 50` asks for fifty bytes; the
+// floor is there to catch that slip rather than to say anything about how much
+// a real workload needs.
+var minSegmentSize = resource.MustParse("1Mi")
 
 // Reconciler reconciles Workloads.
 type Reconciler struct {
@@ -203,6 +212,57 @@ func Validate(s *v1alpha1.WorkloadSpec) error {
 		// Zero is the unset value and means one slot.
 		if o.Slots < 0 {
 			return fmt.Errorf("operation %q: slots must be at least 1", o.Name)
+		}
+		if o.TickInterval != nil && o.TickInterval.Duration < 0 {
+			return fmt.Errorf("operation %q: tickInterval must not be negative", o.Name)
+		}
+		for _, e := range o.Egress {
+			switch e.To {
+			case v1alpha1.EgressMetadata, v1alpha1.EgressInternet:
+			default:
+				// Rejected here rather than ignored, so that a typo is a
+				// failure to admit the workload instead of a pod that cannot
+				// open a connection for reasons nothing explains.
+				return fmt.Errorf("operation %q: unknown egress destination %q, want one of %q or %q",
+					o.Name, e.To, v1alpha1.EgressMetadata, v1alpha1.EgressInternet)
+			}
+		}
+		if o.Segments != nil {
+			if o.Segments.Size.Sign() <= 0 {
+				return fmt.Errorf("operation %q: segments.size must be greater than zero", o.Name)
+			}
+			// A bare number is bytes, so a missing unit suffix asks for a
+			// volume no segment can fit in, and the kubelet evicts the pod as
+			// soon as the directory exists. Refuse it rather than emit a pod
+			// that crash-loops on eviction.
+			if o.Segments.Size.Cmp(minSegmentSize) < 0 {
+				return fmt.Errorf("operation %q: segments.size %s is below %s; a size without a unit suffix is bytes", o.Name, &o.Segments.Size, &minSegmentSize)
+			}
+			// The controller leaves a pre-declared segment volume alone, so
+			// segments.size would silently not apply to it.
+			for _, v := range o.Template.Spec.Volumes {
+				if v.Name == segmentVolumeName {
+					return fmt.Errorf("operation %q: segments.size and a pod template volume named %q both size the segment volume; declare one or the other", o.Name, segmentVolumeName)
+				}
+			}
+			// The pod's ephemeral-storage limit is charged the segment volume
+			// together with every container's writable layer and logs, so a
+			// budget that only just covers the volume evicts the pod before
+			// the volume can fill. Raising the limit to fit would produce a
+			// pod the cluster may refuse; the contradiction is the user's to
+			// resolve.
+			if lim, ok := podEphemeralStorageLimit(&o.Template.Spec); ok && lim.Cmp(o.Segments.Size) <= 0 {
+				return fmt.Errorf("operation %q: segments.size %s leaves nothing under the pod's ephemeral-storage limit of %s, which is charged the segment volume together with every container's writable layer and logs", o.Name, &o.Segments.Size, &lim)
+			}
+			// The request goes on the first container, and Kubernetes refuses a
+			// container whose request exceeds its own limit. The pod's budget
+			// can clear segments.size on the strength of its other containers
+			// while this one cannot carry the request.
+			if len(o.Template.Spec.Containers) > 0 {
+				if lim, ok := o.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceEphemeralStorage]; ok && lim.Cmp(o.Segments.Size) < 0 {
+					return fmt.Errorf("operation %q: segments.size %s exceeds the %s ephemeral-storage limit on container %q, which carries the request", o.Name, &o.Segments.Size, &lim, o.Template.Spec.Containers[0].Name)
+				}
+			}
 		}
 	}
 	chans := map[string]bool{}
@@ -447,7 +507,7 @@ func mustRunIdle(spec *v1alpha1.WorkloadSpec, op *v1alpha1.Operation) bool {
 		return true
 	}
 	for _, c := range inbound {
-		if c.Delivery != v1alpha1.DeliveryMaterialized {
+		if c.Delivery != graph.DeliveryMaterialized {
 			return true
 		}
 	}
@@ -463,7 +523,7 @@ func (r *Reconciler) reconcileOperation(ctx context.Context, wl *v1alpha1.Worklo
 	// until that channel is sealed. Feedback channels are excluded because
 	// they seal only when the loop terminates.
 	for _, c := range wl.Spec.Inbound(op.Name) {
-		if c.Delivery == v1alpha1.DeliveryMaterialized && c.Feedback == nil && !metrics.channels[c.Name].Sealed {
+		if c.Delivery == graph.DeliveryMaterialized && c.Feedback == nil && !metrics.channels[c.Name].Sealed {
 			return st, nil
 		}
 	}
@@ -564,6 +624,9 @@ func (r *Reconciler) podTemplate(wl *v1alpha1.Workload, op *v1alpha1.Operation) 
 		{Name: coordinator.EnvFeedbackOut, Value: strings.Join(fbOut, ",")},
 		{Name: coordinator.EnvSegmentDir, Value: SegmentDir},
 	}
+	if op.TickInterval != nil && op.TickInterval.Duration > 0 {
+		env = append(env, corev1.EnvVar{Name: coordinator.EnvTickInterval, Value: op.TickInterval.Duration.String()})
+	}
 	hasVolume := false
 	for _, v := range tpl.Spec.Volumes {
 		if v.Name == segmentVolumeName {
@@ -571,9 +634,14 @@ func (r *Reconciler) podTemplate(wl *v1alpha1.Workload, op *v1alpha1.Operation) 
 		}
 	}
 	if !hasVolume {
+		dir := &corev1.EmptyDirVolumeSource{}
+		if op.Segments != nil {
+			size := op.Segments.Size.DeepCopy()
+			dir.SizeLimit = &size
+		}
 		tpl.Spec.Volumes = append(tpl.Spec.Volumes, corev1.Volume{
 			Name:         segmentVolumeName,
-			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			VolumeSource: corev1.VolumeSource{EmptyDir: dir},
 		})
 	}
 	for i := range tpl.Spec.Containers {
@@ -598,9 +666,88 @@ func (r *Reconciler) podTemplate(wl *v1alpha1.Workload, op *v1alpha1.Operation) 
 			if !hasPort {
 				c.Ports = append(c.Ports, corev1.ContainerPort{ContainerPort: coordinator.SegmentPort, Name: "segments"})
 			}
+			if op.Segments != nil {
+				requestEphemeralStorage(c, op.Segments.Size)
+			}
 		}
 	}
 	return tpl
+}
+
+// podEphemeralStorageLimit reports the ephemeral-storage limit the kubelet
+// would enforce over the whole pod, and whether one is set at all. A container
+// naming no limit contributes nothing rather than leaving the budget
+// unbounded, so a lone sidecar with a small limit caps the pod.
+//
+// It follows the kubelet's arithmetic. Containers that run at the same time
+// add up: the regular containers, and the init containers marked restartable,
+// which are sidecars and stay up alongside them. A plain init container has
+// finished before any of those start, so it only has to fit on its own and
+// contributes as a floor rather than a summand.
+func podEphemeralStorageLimit(spec *corev1.PodSpec) (resource.Quantity, bool) {
+	total, set := resource.Quantity{}, false
+	add := func(c corev1.Container) {
+		if lim, ok := c.Resources.Limits[corev1.ResourceEphemeralStorage]; ok {
+			total.Add(lim)
+			set = true
+		}
+	}
+	sidecar := func(c corev1.Container) bool {
+		return c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways
+	}
+	for _, c := range spec.InitContainers {
+		if sidecar(c) {
+			add(c)
+		}
+	}
+	for _, c := range spec.Containers {
+		add(c)
+	}
+	for _, c := range spec.InitContainers {
+		if sidecar(c) {
+			continue
+		}
+		// Presence is what arms the kubelet's check, so a limit of zero
+		// counts as set even though it raises nothing.
+		if lim, ok := c.Resources.Limits[corev1.ResourceEphemeralStorage]; ok {
+			set = true
+			if lim.Cmp(total) > 0 {
+				total = lim.DeepCopy()
+			}
+		}
+	}
+	return total, set
+}
+
+// requestEphemeralStorage raises the container's ephemeral-storage request to
+// at least size, so that the scheduler places the pod where that much disk
+// exists and the eviction ranking, which sorts by usage over request, does not
+// treat the pod as though it were using disk it never asked for.
+//
+// A template already asking for at least size keeps what it has, so the field
+// is a floor rather than an override. That includes a template that names only
+// a limit: Kubernetes defaults an absent request to the container's limit, so
+// writing a smaller request here would lower the reservation the pod would
+// otherwise have been scheduled against.
+//
+// It deliberately sets no limit. The volume's own sizeLimit already caps the
+// segments, and the kubelet charges a pod's ephemeral-storage limit the volume
+// together with every container's writable layer and logs, so a limit equal to
+// size would evict the pod before the volume could ever reach it. A template
+// that names its own limit keeps it, and Validate rejects a pod budget that
+// does not exceed size.
+func requestEphemeralStorage(c *corev1.Container, size resource.Quantity) {
+	have, ok := c.Resources.Requests[corev1.ResourceEphemeralStorage]
+	if !ok {
+		have, ok = c.Resources.Limits[corev1.ResourceEphemeralStorage]
+	}
+	if ok && have.Cmp(size) >= 0 {
+		return
+	}
+	if c.Resources.Requests == nil {
+		c.Resources.Requests = corev1.ResourceList{}
+	}
+	c.Resources.Requests[corev1.ResourceEphemeralStorage] = size.DeepCopy()
 }
 
 // ensureServiceAccounts creates one ServiceAccount per operation. The
@@ -686,6 +833,60 @@ func edgePolicyName(wl *v1alpha1.Workload, channel string) string {
 	return wl.Name + "-edge-" + channel
 }
 
+// egressPolicyName is the policy that carries one operation's declared reach
+// outside the workload.
+func egressPolicyName(wl *v1alpha1.Workload, op string) string {
+	return wl.Name + "-egress-" + op
+}
+
+// metadataCIDR is the link-local address the instance metadata server answers
+// on. It is the same address across the cloud providers that offer one.
+const metadataCIDR = "169.254.169.254/32"
+
+// privateRanges are the addresses an Internet grant must not reach. The three
+// RFC 1918 blocks cover cluster pod and service networks on every deployment
+// this has been used on. Link-local is excluded as well, so that asking for
+// the internet does not also hand over the metadata server: that is a
+// separate destination and has to be asked for by name.
+//
+// A cluster whose pod or service network sits outside these ranges would need
+// its own block listed here. Nothing in the API can discover that, so it is
+// stated rather than derived.
+var privateRanges = []string{
+	"10.0.0.0/8",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"169.254.0.0/16",
+}
+
+// egressRulesFor turns an operation's declared destinations into policy
+// rules. An operation that declares none gets none, which leaves it with
+// exactly the rules the shared operations policy already grants.
+func egressRulesFor(op v1alpha1.Operation) []networkingv1.NetworkPolicyEgressRule {
+	tcp := corev1.ProtocolTCP
+	http := intstr.FromInt(80)
+	https := intstr.FromInt(443)
+	var out []networkingv1.NetworkPolicyEgressRule
+	for _, e := range op.Egress {
+		switch e.To {
+		case v1alpha1.EgressMetadata:
+			out = append(out, networkingv1.NetworkPolicyEgressRule{
+				To:    []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: metadataCIDR}}},
+				Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &http}},
+			})
+		case v1alpha1.EgressInternet:
+			out = append(out, networkingv1.NetworkPolicyEgressRule{
+				To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{
+					CIDR:   "0.0.0.0/0",
+					Except: append([]string(nil), privateRanges...),
+				}}},
+				Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &https}},
+			})
+		}
+	}
+	return out
+}
+
 func (r *Reconciler) ensureNetworkPolicies(ctx context.Context, wl *v1alpha1.Workload) error {
 	workloadPods := metav1.LabelSelector{MatchLabels: map[string]string{LabelWorkload: wl.Name, LabelRole: RoleOperation}}
 	coordinatorPods := metav1.LabelSelector{MatchLabels: coordinatorLabels(wl)}
@@ -739,6 +940,36 @@ func (r *Reconciler) ensureNetworkPolicies(ctx context.Context, wl *v1alpha1.Wor
 		return err
 	}
 
+	// One policy per operation that declared egress. Network policies are
+	// additive, so this grants the extra destinations to that operation's
+	// pods alone and leaves the shared operations policy above untouched. An
+	// operation that declared nothing gets no policy here and so keeps
+	// exactly the reach it had before this field existed.
+	wantEgress := map[string]bool{}
+	for i := range wl.Spec.Operations {
+		op := wl.Spec.Operations[i]
+		rules := egressRulesFor(op)
+		if len(rules) == 0 {
+			continue
+		}
+		wantEgress[op.Name] = true
+		selector := metav1.LabelSelector{MatchLabels: map[string]string{
+			LabelWorkload: wl.Name, LabelRole: RoleOperation, LabelOperation: op.Name,
+		}}
+		np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: egressPolicyName(wl, op.Name), Namespace: wl.Namespace}}
+		if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, np, func() error {
+			np.Labels = map[string]string{LabelWorkload: wl.Name, LabelOperation: op.Name}
+			np.Spec = networkingv1.NetworkPolicySpec{
+				PodSelector: selector,
+				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
+				Egress:      rules,
+			}
+			return controllerutil.SetControllerReference(wl, np, r.Scheme())
+		}); err != nil {
+			return err
+		}
+	}
+
 	// One policy per edge: the consumer's pods may open the producer's
 	// segment port.
 	wanted := map[string]bool{}
@@ -773,8 +1004,17 @@ func (r *Reconciler) ensureNetworkPolicies(ctx context.Context, wl *v1alpha1.Wor
 	}
 	for i := range list.Items {
 		np := &list.Items[i]
-		ch, isEdge := np.Labels[LabelChannel]
-		if !isEdge || wanted[ch] {
+		if ch, isEdge := np.Labels[LabelChannel]; isEdge {
+			if wanted[ch] {
+				continue
+			}
+		} else if op, isEgress := np.Labels[LabelOperation]; isEgress {
+			// An operation that gave up its egress declaration loses the
+			// policy, so the grant does not outlive the spec that asked for it.
+			if wantEgress[op] {
+				continue
+			}
+		} else {
 			continue
 		}
 		if err := r.Delete(ctx, np); client.IgnoreNotFound(err) != nil {

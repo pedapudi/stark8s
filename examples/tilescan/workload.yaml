@@ -31,8 +31,8 @@ spec:
               imagePullPolicy: IfNotPresent
               command: ["/tilescan", "plan"]
     # The task pool. The replica count follows the runnable partitions of
-    # "tiles". A Ray cluster does the same thing by adding workers when the
-    # pending-task queue grows.
+    # "tiles". A task runtime can do the same thing by adding workers when
+    # the pending-task queue grows.
     - name: scan
       slots: 1
       scaling:

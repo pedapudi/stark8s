@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 	"github.com/pedapudi/stark8s/pkg/sdk"
 )
@@ -23,15 +23,15 @@ import (
 var allPlantedCells = []string{"17,19", "20,22", "28,30", "3,1", "31,31", "5,4", "9,10"}
 
 // channels mirrors workload.yaml.
-func channels() []v1alpha1.Channel {
-	return []v1alpha1.Channel{
+func channels() []graph.Channel {
+	return []graph.Channel{
 		{Name: "calib", From: "plan", To: "scan",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionBroadcast, Partitions: 1}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionBroadcast, Partitions: 1}},
 		{Name: "tiles", From: "plan", To: "scan",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 8}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 8}},
 		{Name: "hits", From: "scan", To: "reduce",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 4},
-			Delivery:     v1alpha1.DeliveryMaterialized},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4},
+			Delivery:     graph.DeliveryMaterialized},
 		{Name: "regions", From: "reduce"},
 	}
 }

@@ -8,6 +8,7 @@ RUN CGO_ENABLED=0 go build -o /out/controller ./cmd/controller \
  && CGO_ENABLED=0 go build -o /out/wordcount ./examples/wordcount \
  && CGO_ENABLED=0 go build -o /out/pagerank ./examples/pagerank \
  && CGO_ENABLED=0 go build -o /out/agent-loop ./examples/agent-loop \
+ && CGO_ENABLED=0 go build -o /out/paramserver ./examples/paramserver \
  && CGO_ENABLED=0 go build -o /out/tilescan ./examples/tilescan
 
 FROM gcr.io/distroless/static-debian12

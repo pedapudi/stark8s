@@ -2,10 +2,9 @@
 // the per-chunk results into a summary.
 //
 // Programs that hand work to a pool of workers and then collect the answers
-// are usually written with futures and a shared object store. A driver holds
-// the array, computes a calibration table once, submits one task per chunk,
-// waits for every task, and reassembles what comes back. Ray and Dask are the
-// runtimes people write this against, and it looks like this:
+// are often written with futures and a shared object store. A driver holds the
+// array, computes a calibration table once, submits one task per chunk, waits
+// for every task, and reassembles what comes back. The program looks like this:
 //
 //	shared = put(background_profile)        # one copy in the object store
 //	jobs   = [scan.remote(tile, shared) for tile in tiles]
@@ -34,8 +33,8 @@
 // of that channel decides when the reduction is complete. No list of futures
 // exists anywhere, and no process waits on one.
 //
-// put(shared) becomes a Broadcast channel, and it costs more here. Ray hands
-// every task a pointer into a shared-memory object store, so one copy serves
+// put(shared) becomes a Broadcast channel, and it costs more here. A runtime
+// can hand every task a pointer into shared memory, so one copy serves
 // a whole node. A Broadcast channel gives each consuming replica its own
 // copy, and this model has no pass-by-reference to fall back on. For a small
 // table the difference is invisible. For a large one it is the first thing to
@@ -44,9 +43,9 @@
 // Task size becomes record size. Cost here is charged per record, so one
 // record carries a whole tile: 16 tile results cost 16 records, where one
 // record per cell would cost 1024. Deciding how much work rides in a record
-// is the same decision as deciding how much work goes in a Ray task.
+// is the same decision as deciding how much work goes in a task.
 //
-// Input readiness becomes the handler's problem. A Ray task names its inputs
+// Input readiness becomes the handler's problem. A task names its inputs
 // and does not start until they exist. Here scan consumes two channels,
 // nothing orders one against the other, and a tile can arrive before the
 // calibration table it needs. The scanner type below holds such tiles and
