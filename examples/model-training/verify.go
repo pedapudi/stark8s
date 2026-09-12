@@ -1,0 +1,325 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+// The reward is a deterministic program.
+//
+// A constraint is something a checker can decide by reading the completion:
+// how many bullets it has, whether it stayed under a word budget, whether it
+// parses as JSON with the keys that were asked for. Nothing here calls a
+// external judge, so its behavior remains stable across runs.
+//
+// This is also what makes the task suitable for a small model at all. GRPO's
+// gradient comes from variance *within* a group: if every completion scores
+// the same, the standard deviation is zero, every advantage is zero and the
+// update is exactly nothing. A task the model always fails produces no signal
+// for the same reason a task it always passes does. Scoring the fraction of
+// constraints met, rather than all-or-nothing, keeps a group's rewards spread
+// out and keeps the gradient alive.
+type constraint struct {
+	Kind string `json:"kind"`
+	Arg  string `json:"arg,omitempty"`
+}
+
+func (c constraint) String() string {
+	if c.Arg == "" {
+		return c.Kind
+	}
+	return c.Kind + ":" + c.Arg
+}
+
+// check reports whether one completion satisfies one constraint.
+func (c constraint) check(text string) bool {
+	switch c.Kind {
+	case "bullets":
+		n, err := strconv.Atoi(c.Arg)
+		if err != nil {
+			return false
+		}
+		return countBullets(text) == n
+
+	case "lines":
+		n, err := strconv.Atoi(c.Arg)
+		if err != nil {
+			return false
+		}
+		return len(nonEmptyLines(text)) == n
+
+	case "maxwords":
+		n, err := strconv.Atoi(c.Arg)
+		if err != nil {
+			return false
+		}
+		return len(strings.Fields(text)) <= n
+
+	case "minwords":
+		n, err := strconv.Atoi(c.Arg)
+		if err != nil {
+			return false
+		}
+		return len(strings.Fields(text)) >= n
+
+	case "exactwords":
+		n, err := strconv.Atoi(c.Arg)
+		if err != nil {
+			return false
+		}
+		return len(strings.Fields(text)) == n
+
+	case "endswith":
+		return strings.HasSuffix(strings.TrimSpace(text), c.Arg)
+
+	case "startswith":
+		return strings.HasPrefix(strings.TrimSpace(text), c.Arg)
+
+	case "avoid":
+		return !containsWord(text, c.Arg)
+
+	case "include":
+		return containsWord(text, c.Arg)
+
+	case "json":
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(unfence(text)), &m); err != nil {
+			return false
+		}
+		want := strings.Split(c.Arg, ",")
+		if len(m) != len(want) {
+			return false
+		}
+		for _, k := range want {
+			if _, ok := m[strings.TrimSpace(k)]; !ok {
+				return false
+			}
+		}
+		return true
+
+	case "uppercase":
+		// Every word begins with a capital.
+		for _, w := range strings.Fields(text) {
+			r := []rune(w)
+			if len(r) > 0 && !strings.ContainsRune("ABCDEFGHIJKLMNOPQRSTUVWXYZ", r[0]) {
+				return false
+			}
+		}
+		return len(strings.Fields(text)) > 0
+	}
+	return false
+}
+
+// unfence strips a markdown code fence. A model asked for JSON very often
+// returns correct JSON inside ```json ... ```, and rejecting that measures the
+// wrapper rather than the answer — which reads exactly like a model that
+// cannot do the task. Calibration on the real model found this: eight of eight
+// completions were perfect JSON and all eight scored zero.
+func unfence(text string) string {
+	t := strings.TrimSpace(text)
+	if !strings.HasPrefix(t, "```") {
+		return t
+	}
+	if i := strings.IndexByte(t, '\n'); i >= 0 {
+		t = t[i+1:]
+	}
+	if j := strings.LastIndex(t, "```"); j >= 0 {
+		t = t[:j]
+	}
+	return strings.TrimSpace(t)
+}
+
+func countBullets(text string) int {
+	n := 0
+	for _, l := range nonEmptyLines(text) {
+		t := strings.TrimSpace(l)
+		if strings.HasPrefix(t, "- ") || strings.HasPrefix(t, "* ") {
+			n++
+		}
+	}
+	return n
+}
+
+func nonEmptyLines(text string) []string {
+	var out []string
+	for _, l := range strings.Split(text, "\n") {
+		if strings.TrimSpace(l) != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// task is one prompt and the constraints its completion has to satisfy.
+type task struct {
+	ID          string       `json:"id"`
+	Instruction string       `json:"instruction"`
+	Constraints []constraint `json:"constraints"`
+}
+
+// prompt renders what the model is asked. The constraints are stated in the
+// prompt as well as checked, because the point is to teach the model to
+// follow instructions it can read, not to guess a hidden rubric.
+func (t task) prompt() string {
+	var b strings.Builder
+	b.WriteString(t.Instruction)
+	b.WriteString("\n\nFollow every requirement:\n")
+	for _, c := range t.Constraints {
+		b.WriteString("- ")
+		b.WriteString(describe(c))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func describe(c constraint) string {
+	switch c.Kind {
+	case "bullets":
+		return fmt.Sprintf("use exactly %s bullet points, each starting with \"- \"", c.Arg)
+	case "lines":
+		return fmt.Sprintf("write exactly %s lines", c.Arg)
+	case "maxwords":
+		return fmt.Sprintf("use at most %s words in total", c.Arg)
+	case "minwords":
+		return fmt.Sprintf("use at least %s words in total", c.Arg)
+	case "exactwords":
+		return fmt.Sprintf("use exactly %s words in total", c.Arg)
+	case "endswith":
+		return fmt.Sprintf("end with exactly: %s", c.Arg)
+	case "startswith":
+		return fmt.Sprintf("begin with exactly: %s", c.Arg)
+	case "avoid":
+		return fmt.Sprintf("never use the word %q", c.Arg)
+	case "include":
+		return fmt.Sprintf("use the word %q somewhere", c.Arg)
+	case "json":
+		return fmt.Sprintf("reply with a JSON object having exactly these keys: %s", c.Arg)
+	case "uppercase":
+		return "capitalize the first letter of every word"
+	}
+	return c.String()
+}
+
+// containsWord matches on word boundaries. Substring matching would count
+// "the" inside "theatre" and "and" inside "grandstand", so a model could fail
+// an avoid-constraint by writing an ordinary sentence and never learn why.
+func containsWord(text, word string) bool {
+	w := strings.ToLower(word)
+	for _, f := range strings.Fields(strings.ToLower(text)) {
+		if strings.Trim(f, ".,;:!?\"'()[]") == w {
+			return true
+		}
+	}
+	return false
+}
+
+// partial grades a constraint that has a near-miss. An exact word count is the
+// only one here that does: 19 words against a budget of 20 is most of the way
+// there, and scoring it zero throws away the gradient that would close the
+// gap. The binary constraints stay binary because there is no meaningful
+// notion of nearly avoiding a word.
+func (c constraint) partial(text string) float64 {
+	if c.Kind != "exactwords" {
+		if c.check(text) {
+			return 1
+		}
+		return 0
+	}
+	want, err := strconv.Atoi(c.Arg)
+	if err != nil || want <= 0 {
+		return 0
+	}
+	got := len(strings.Fields(text))
+	d := got - want
+	if d < 0 {
+		d = -d
+	}
+	// Scale the credit to a fixed tolerance rather than to the budget. Against
+	// the budget, a 20-word target gives 0.9 for being two words out, and
+	// calibration showed the base model already sitting at 0.935 mean reward
+	// while hitting the count exactly only 15% of the time: the reward had
+	// almost no room left to reward anything.
+	const tol = 4
+	if d >= tol {
+		return 0
+	}
+	return 1 - float64(d)/float64(tol)
+}
+
+// score is the fraction of the task's constraints the completion satisfies,
+// and the per-constraint detail behind it. The detail is carried through the
+// graph so a reader can see which requirement the model is still failing,
+// which is the thing worth watching during a run.
+func (t task) score(text string) (float64, map[string]bool) {
+	if len(t.Constraints) == 0 {
+		return 0, nil
+	}
+	detail := map[string]bool{}
+	hit := 0.0
+	for _, c := range t.Constraints {
+		detail[c.String()] = c.check(text)
+		hit += c.partial(text)
+	}
+	return hit / float64(len(t.Constraints)), detail
+}
+
+// strict reports whether the completion met every constraint. The graded score
+// is what training needs, because partial credit is what keeps a group's
+// rewards spread and the gradient alive. This is what a reader needs, because
+// "reward rose" can mean the model got closer to a word count it still misses.
+// Both are recorded; they answer different questions.
+func (t task) strict(text string) bool {
+	for _, c := range t.Constraints {
+		if !c.check(text) {
+			return false
+		}
+	}
+	return len(t.Constraints) > 0
+}
+
+// sortedTaskIDs keeps every operation's iteration order stable, so a run does
+// not depend on Go's map ordering.
+func sortedTaskIDs(m map[string]task) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// advantages centers one group's rewards and scales them by their spread.
+// This is the whole of GRPO's baseline: the group mean stands in for a value
+// network, which is why there is no critic anywhere in the graph.
+//
+// It is the same function as in examples/grpo. Examples in this repository are
+// self-contained, and this one is four lines of definition.
+func advantages(rewards []float64) []float64 {
+	n := float64(len(rewards))
+	mean := 0.0
+	for _, r := range rewards {
+		mean += r / n
+	}
+	varsum := 0.0
+	for _, r := range rewards {
+		varsum += (r - mean) * (r - mean)
+	}
+	std := math.Sqrt(varsum / n)
+	out := make([]float64, len(rewards))
+	for i, r := range rewards {
+		if std < 1e-8 {
+			// Every completion scored the same, so the group says nothing
+			// about which is better and contributes no gradient. The learner
+			// counts these: a run where every group is flat is learning
+			// nothing, however healthy it looks.
+			out[i] = 0
+			continue
+		}
+		out[i] = (r - mean) / std
+	}
+	return out
+}

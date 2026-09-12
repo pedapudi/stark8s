@@ -234,6 +234,12 @@ func TestGRPOLearnsTheTasks(t *testing.T) {
 	if got != testSteps {
 		t.Fatalf("updates = %d, want %d", got, testSteps)
 	}
+	wantCompletions := int64(len(tasks) * testGroup * testSteps)
+	for _, channel := range r.co.Metrics().Channels {
+		if channel.Name == "completions" && channel.Produced != wantCompletions {
+			t.Fatalf("completion records = %d, want %d; rollout replicas duplicated assigned tasks", channel.Produced, wantCompletions)
+		}
+	}
 
 	// Every step reported a metric, and the reward rose.
 	recs, _, err := r.co.Records("metrics", "", 0, 0)
