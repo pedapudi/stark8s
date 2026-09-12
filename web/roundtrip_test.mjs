@@ -37,7 +37,7 @@ const expected = {
     apiVersion: 'stark8s.io/v1alpha1', kind: 'Workload', metadata: { name: 'wordcount' },
     spec: {
       operations: [
-        { name: 'read', template: { spec: { containers: [container(['/wordcount', 'read'])] } } },
+        { name: 'read', template: { spec: { containers: [{ ...container(['/wordcount', 'read']), env: [{ name: 'STARK8S_WORDCOUNT_REPEAT', value: '200' }] }] } } },
         { name: 'map', slots: 2, scaling: { horizontal: { min: 1, max: 4 } }, template: { spec: { containers: [container(['/wordcount', 'map'])] } } },
         { name: 'reduce', slots: 2, scaling: { horizontal: { min: 1, max: 3 } }, template: { spec: { containers: [container(['/wordcount', 'reduce'])] } } },
       ],

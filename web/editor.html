@@ -1851,6 +1851,8 @@ spec:
               image: stark8s:dev
               imagePullPolicy: IfNotPresent
               command: ["/wordcount", "read"]
+              env:
+                - {name: STARK8S_WORDCOUNT_REPEAT, value: "200"}
     - name: map
       slots: 2
       scaling:
