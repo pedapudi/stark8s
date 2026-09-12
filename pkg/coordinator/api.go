@@ -25,6 +25,8 @@ const (
 	ControlPort = 8080
 	// SegmentPort is where every worker pod (and the coordinator) serves
 	// segments: GET /segments/{id} returns the segment's records as JSON.
+	// Worker pods also serve GET /blobs/{id}, the pass-by-reference payload
+	// of a record, as a byte stream. The coordinator never sees either.
 	SegmentPort = 8090
 
 	// OperationHeader names the calling operation. When token verification
