@@ -32,8 +32,8 @@ type HorizontalScaling struct {
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
 	Max int32 `json:"max,omitempty"`
-	// CPUUtilizationPercent creates a HorizontalPodAutoscaler on CPU. Only
-	// applies to operations with completion Never. Zero disables it.
+	// CPUUtilizationPercent is retained for compatibility. Automatic horizontal
+	// scaling is disabled because operation pods may hold local state or output.
 	CPUUtilizationPercent int32 `json:"cpuUtilizationPercent,omitempty"`
 }
 
@@ -46,8 +46,9 @@ const (
 	VerticalAuto    VerticalScalingMode = "Auto"
 )
 
-// VerticalScaling requests a VerticalPodAutoscaler for the operation. It is
-// ignored when the VPA API is not installed in the cluster.
+// VerticalScaling requests initial resource sizing for a Never operation when
+// the VerticalPodAutoscaler API is installed. Auto is retained for
+// compatibility but disabled because it can evict a stateful pod.
 type VerticalScaling struct {
 	// +kubebuilder:default=Off
 	// +kubebuilder:validation:Enum=Off;Initial;Auto
@@ -109,8 +110,8 @@ type EgressRule struct {
 //     operation whose only output is a terminal channel.
 //
 // Sizing the volume is a scheduling statement, not a durability one. Segments
-// live and die with the pod holding them: an operation that completes is
-// scaled to zero, and retained segments go with it.
+// live and die with the pod holding them, so a completed producer of retained
+// internal segments remains running.
 //
 // Declaring it is what tells the scheduler the pods need disk. Left unset the
 // volume is a bare emptyDir with no size, and its capacity is whatever the
@@ -140,8 +141,7 @@ type Operation struct {
 	Template corev1.PodTemplateSpec `json:"template"`
 	// +kubebuilder:default={horizontal:{min:1,max:1}}
 	Scaling Scaling `json:"scaling,omitempty"`
-	// Slots is how many partitions one replica processes concurrently. The
-	// controller sizes the replica count as runnable tasks divided by slots.
+	// Slots is how many partitions one replica processes concurrently.
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
 	Slots int32 `json:"slots,omitempty"`
@@ -204,6 +204,8 @@ const (
 type OperationStatus struct {
 	Name     string         `json:"name"`
 	Phase    OperationPhase `json:"phase"`
+	Reason   string         `json:"reason,omitempty"`
+	Message  string         `json:"message,omitempty"`
 	Replicas int32          `json:"replicas"`
 	Ready    int32          `json:"ready"`
 	// RunnableTasks is the number of partitions with unconsumed input.
@@ -220,12 +222,16 @@ type ChannelStatus struct {
 	Pending  int64  `json:"pending"`
 	InFlight int64  `json:"inFlight"`
 	Produced int64  `json:"produced"`
+	// Acknowledged counts records accepted as processed by consumers.
+	Acknowledged int64 `json:"acknowledged,omitempty"`
 	// Epoch is the current superstep of a Synchronous feedback channel.
 	Epoch int32 `json:"epoch,omitempty"`
 	// Overflowed counts records diverted or dropped at the loop bound.
 	Overflowed int64 `json:"overflowed,omitempty"`
-	// Lost counts segments whose holder pod expired before consumption.
+	// Lost counts records whose holder pod expired before consumption.
 	Lost int64 `json:"lost,omitempty"`
+	// LatestDeliveryFailure preserves the most recent failed segment fetch.
+	LatestDeliveryFailure string `json:"latestDeliveryFailure,omitempty"`
 }
 
 // WorkloadPhase is the lifecycle state of the whole graph.
@@ -241,6 +247,7 @@ const (
 // WorkloadStatus is the observed state of the graph.
 type WorkloadStatus struct {
 	Phase      WorkloadPhase     `json:"phase,omitempty"`
+	Reason     string            `json:"reason,omitempty"`
 	Message    string            `json:"message,omitempty"`
 	Operations []OperationStatus `json:"operations,omitempty"`
 	Channels   []ChannelStatus   `json:"channels,omitempty"`

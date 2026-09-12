@@ -12,6 +12,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -19,7 +20,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -47,6 +50,9 @@ func newFakeCoordinator(t *testing.T) *fakeCoordinator {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(f.metrics)
+	})
+	mux.HandleFunc(coordinator.PathOperations, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc(coordinator.PathChannels+"/", func(w http.ResponseWriter, r *http.Request) {
 		rest := strings.TrimPrefix(r.URL.Path, coordinator.PathChannels+"/")
@@ -77,11 +83,12 @@ func (f *fakeCoordinator) sealedChannels() []string {
 }
 
 type harness struct {
-	t   *testing.T
-	c   client.Client
-	r   *Reconciler
-	co  *fakeCoordinator
-	key types.NamespacedName
+	t      *testing.T
+	c      client.Client
+	r      *Reconciler
+	co     *fakeCoordinator
+	key    types.NamespacedName
+	events *record.FakeRecorder
 }
 
 func container() corev1.PodTemplateSpec {
@@ -101,14 +108,16 @@ func newHarness(t *testing.T, wl *v1alpha1.Workload) *harness {
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&v1alpha1.Workload{}).WithObjects(wl).Build()
 	co := newFakeCoordinator(t)
+	events := record.NewFakeRecorder(100)
 	r := &Reconciler{
 		Client:              c,
 		CoordinatorImage:    "coord:test",
 		ControllerNamespace: "stark8s-system",
 		CoordinatorURL:      func(*v1alpha1.Workload) string { return co.URL },
 		HTTP:                co.Client(),
+		Recorder:            events,
 	}
-	return &harness{t: t, c: c, r: r, co: co, key: client.ObjectKeyFromObject(wl)}
+	return &harness{t: t, c: c, r: r, co: co, key: client.ObjectKeyFromObject(wl), events: events}
 }
 
 func (h *harness) reconcile() *v1alpha1.Workload {
@@ -215,20 +224,18 @@ func TestWaitingUntilInboundMaterializedSealed(t *testing.T) {
 
 func TestReplicasFromRunnableTasksAndSlots(t *testing.T) {
 	h := newHarness(t, mapReduce())
-	// No metrics yet: source and pipelined consumer at min (one).
-	h.reconcile()
-	for _, name := range []string{"wc-read", "wc-map"} {
-		d, _ := h.deployment(name)
-		if replicas(d) != 1 {
-			t.Fatalf("%s replicas %d before metrics, want 1", name, replicas(d))
-		}
-	}
-	// Five runnable partitions over two slots: three replicas.
-	h.co.set(coordinator.Metrics{Operations: []coordinator.OperationMetrics{{Name: "map", RunnableTasks: 5}}})
+	// Membership is established at the configured maximum before work starts.
 	h.reconcile()
 	d, _ := h.deployment("wc-map")
-	if replicas(d) != 3 {
-		t.Fatalf("map replicas %d, want ceil(5/2)=3", replicas(d))
+	if replicas(d) != 4 {
+		t.Fatalf("map replicas %d before metrics, want max 4", replicas(d))
+	}
+	// Runnable work does not alter membership during the attempt.
+	h.co.set(coordinator.Metrics{Operations: []coordinator.OperationMetrics{{Name: "map", RunnableTasks: 5}}})
+	h.reconcile()
+	d, _ = h.deployment("wc-map")
+	if replicas(d) != 4 {
+		t.Fatalf("map replicas %d with work, want 4", replicas(d))
 	}
 	// Clamped to max.
 	h.co.set(coordinator.Metrics{Operations: []coordinator.OperationMetrics{{Name: "map", RunnableTasks: 50}}})
@@ -237,12 +244,54 @@ func TestReplicasFromRunnableTasksAndSlots(t *testing.T) {
 	if replicas(d) != 4 {
 		t.Fatalf("map replicas %d, want max 4", replicas(d))
 	}
-	// Back to idle: min, which is one.
+	// Empty input does not prove that pods hold no application state or output.
 	h.co.set(coordinator.Metrics{Operations: []coordinator.OperationMetrics{{Name: "map", RunnableTasks: 0}}})
 	h.reconcile()
 	d, _ = h.deployment("wc-map")
-	if replicas(d) != 1 {
-		t.Fatalf("map replicas %d when idle, want 1", replicas(d))
+	if replicas(d) != 4 {
+		t.Fatalf("map replicas %d when idle, want 4", replicas(d))
+	}
+}
+
+func TestAutomaticScaleDownIsDisabled(t *testing.T) {
+	wl := mapReduce()
+	wl.Spec.Operations[1].Completion = v1alpha1.CompletionNever
+	wl.Spec.Operations[1].Scaling.Horizontal.CPUUtilizationPercent = 70
+	wl.Spec.Operations[1].Scaling.Vertical = &v1alpha1.VerticalScaling{Mode: v1alpha1.VerticalAuto}
+	h := newHarness(t, wl)
+	got := h.reconcile()
+	d, _ := h.deployment("wc-map")
+	if replicas(d) != 4 {
+		t.Fatalf("map replicas %d, want fixed membership of 4", replicas(d))
+	}
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+	err := h.c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "wc-map"}, hpa)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("unsafe horizontal autoscaler exists or lookup failed: %v", err)
+	}
+	if !strings.Contains(got.Status.Message, "automatic scaling disabled") {
+		t.Fatalf("workload message %q does not explain fixed scaling", got.Status.Message)
+	}
+}
+
+func TestDeliveryFailureRemainsInStatusAfterQueueDrains(t *testing.T) {
+	h := newHarness(t, mapReduce())
+	h.co.set(coordinator.Metrics{
+		Channels: []coordinator.ChannelMetrics{{
+			Name: "lines", Sealed: true, Acknowledged: 4,
+			LatestDeliveryFailure: "fetch from holder timed out",
+		}},
+		Operations: []coordinator.OperationMetrics{{Name: "map"}},
+	})
+	wl := h.reconcile()
+	status := h.opStatus(wl, "map")
+	if status.Reason != "DeliveryFailureRecorded" || !strings.Contains(status.Message, "holder timed out") {
+		t.Fatalf("map status %+v", status)
+	}
+	if len(wl.Status.Channels) == 0 ||
+		wl.Status.Channels[0].LatestDeliveryFailure != "fetch from holder timed out" ||
+		wl.Status.Channels[0].Acknowledged != 4 {
+		t.Fatalf("channel status %+v", wl.Status.Channels)
 	}
 }
 
@@ -259,8 +308,8 @@ func TestCompleteScalesToZeroUnlessHoldingSegments(t *testing.T) {
 	})
 	wl := h.reconcile()
 	d, _ := h.deployment("wc-map")
-	if replicas(d) != 3 {
-		t.Fatalf("map replicas %d while holding segments, want 3", replicas(d))
+	if replicas(d) != 4 {
+		t.Fatalf("map replicas %d while holding segments, want 4", replicas(d))
 	}
 	st := h.opStatus(wl, "map")
 	if st.Phase != v1alpha1.OperationRunning || !st.HoldsUnconsumed {
@@ -295,6 +344,84 @@ func TestCompleteScalesToZeroUnlessHoldingSegments(t *testing.T) {
 	}
 	if wl.Status.Phase != v1alpha1.WorkloadSucceeded {
 		t.Fatalf("workload phase %q, want Succeeded", wl.Status.Phase)
+	}
+}
+
+func TestLostRecordsFailWorkload(t *testing.T) {
+	h := newHarness(t, mapReduce())
+	h.co.set(coordinator.Metrics{Operations: []coordinator.OperationMetrics{{Name: "map"}}})
+	h.reconcile()
+	h.co.set(coordinator.Metrics{
+		Channels: []coordinator.ChannelMetrics{
+			{Name: "lines", Sealed: true, Lost: 7},
+			{Name: "shuffle", Sealed: true},
+			{Name: "totals", Sealed: true},
+		},
+		Operations: []coordinator.OperationMetrics{
+			{Name: "read", Complete: true},
+			{Name: "map", Complete: true},
+			{Name: "reduce", Complete: true},
+		},
+	})
+	wl := h.reconcile()
+	if wl.Status.Phase != v1alpha1.WorkloadFailed {
+		t.Fatalf("workload phase %q, want Failed", wl.Status.Phase)
+	}
+	for _, want := range []string{"lines", "7 records"} {
+		if !strings.Contains(wl.Status.Message, want) {
+			t.Errorf("failure message %q does not contain %q", wl.Status.Message, want)
+		}
+	}
+	d, _ := h.deployment("wc-map")
+	if replicas(d) != 4 {
+		t.Fatalf("loss reconciliation changed map replicas to %d", replicas(d))
+	}
+	if got := h.co.sealedChannels(); len(got) != 0 {
+		t.Fatalf("loss reconciliation sealed channels: %v", got)
+	}
+}
+
+func TestFeedbackOverflowDoesNotFailWorkload(t *testing.T) {
+	wl := mapReduce()
+	wl.Spec.Channels[0].Feedback = &graph.Feedback{
+		Mode: graph.FeedbackAsynchronous, MaxEpochs: 2, Overflow: "totals",
+	}
+	h := newHarness(t, wl)
+	h.co.set(coordinator.Metrics{
+		Channels: []coordinator.ChannelMetrics{
+			{Name: "lines", Sealed: true, Overflowed: 7},
+			{Name: "shuffle", Sealed: true},
+			{Name: "totals", Sealed: true},
+		},
+		Operations: []coordinator.OperationMetrics{
+			{Name: "read", Complete: true},
+			{Name: "map", Complete: true},
+			{Name: "reduce", Complete: true},
+		},
+	})
+	got := h.reconcile()
+	if got.Status.Phase != v1alpha1.WorkloadSucceeded {
+		t.Fatalf("workload phase %q after declared overflow, want Succeeded", got.Status.Phase)
+	}
+}
+
+func TestCompletedProducerKeepsRetainedInternalSegments(t *testing.T) {
+	wl := mapReduce()
+	wl.Spec.Channels[1].Durability = graph.DurabilityRetained
+	h := newHarness(t, wl)
+	h.co.set(coordinator.Metrics{Operations: []coordinator.OperationMetrics{{Name: "map"}}})
+	h.reconcile()
+	h.co.set(coordinator.Metrics{
+		Channels:   []coordinator.ChannelMetrics{{Name: "lines", Sealed: true}, {Name: "shuffle"}},
+		Operations: []coordinator.OperationMetrics{{Name: "map", Complete: true}},
+	})
+	got := h.reconcile()
+	d, _ := h.deployment("wc-map")
+	if replicas(d) != 4 {
+		t.Fatalf("retained producer replicas %d after completion, want 4", replicas(d))
+	}
+	if h.opStatus(got, "map").Phase != v1alpha1.OperationRunning {
+		t.Fatalf("retained producer reported complete while its segments remain local")
 	}
 }
 
@@ -422,6 +549,115 @@ func TestPodTemplateInjection(t *testing.T) {
 	}
 	if co.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
 		t.Errorf("coordinator strategy %v", co.Spec.Strategy.Type)
+	}
+}
+
+func TestNamedRuntimeSidecarReceivesWorkerSettings(t *testing.T) {
+	wl := mapReduce()
+	always := corev1.ContainerRestartPolicyAlways
+	wl.Spec.Operations[1].Template.Spec.InitContainers = []corev1.Container{{
+		Name: runtimeContainer, Image: "runtime:test", RestartPolicy: &always,
+	}}
+	h := newHarness(t, wl)
+	h.reconcile()
+	d, _ := h.deployment("wc-map")
+	runtime := d.Spec.Template.Spec.InitContainers[0]
+	if runtime.StartupProbe == nil || runtime.StartupProbe.HTTPGet == nil ||
+		runtime.StartupProbe.HTTPGet.Path != "/healthz" ||
+		runtime.StartupProbe.HTTPGet.Port.IntValue() != runtimePort {
+		t.Fatalf("runtime startup probe %+v", runtime.StartupProbe)
+	}
+	if len(runtime.Env) == 0 || len(runtime.VolumeMounts) == 0 ||
+		len(runtime.Ports) != 1 || runtime.Ports[0].ContainerPort != coordinator.SegmentPort {
+		t.Fatalf("runtime settings incomplete: %+v", runtime)
+	}
+	application := d.Spec.Template.Spec.Containers[0]
+	if len(application.Env) != 0 || len(application.VolumeMounts) != 0 || len(application.Ports) != 0 {
+		t.Fatalf("runtime settings injected into application: %+v", application)
+	}
+}
+
+func TestNativeSidecarStartupProbeGatesApplication(t *testing.T) {
+	always := corev1.ContainerRestartPolicyAlways
+	wl := mapReduce()
+	wl.Spec.Operations[1].Template.Spec.InitContainers = []corev1.Container{{
+		Name:          "dependency",
+		Image:         "dependency:test",
+		RestartPolicy: &always,
+		StartupProbe: &corev1.Probe{
+			ProbeHandler:     corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(9000)}},
+			FailureThreshold: 30,
+			PeriodSeconds:    2,
+		},
+	}}
+	wl.Spec.Operations[1].Template.Spec.Containers = append(
+		wl.Spec.Operations[1].Template.Spec.Containers,
+		corev1.Container{Name: "metrics", Image: "metrics:test"},
+	)
+	h := newHarness(t, wl)
+	h.reconcile()
+	d, _ := h.deployment("wc-map")
+	sidecar := d.Spec.Template.Spec.InitContainers[0]
+	if sidecar.RestartPolicy == nil || *sidecar.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Fatalf("dependency restart policy is %v, want Always", sidecar.RestartPolicy)
+	}
+	if sidecar.StartupProbe == nil || sidecar.StartupProbe.TCPSocket == nil ||
+		sidecar.StartupProbe.TCPSocket.Port.IntValue() != 9000 {
+		t.Fatalf("dependency startup probe changed: %+v", sidecar.StartupProbe)
+	}
+	if len(sidecar.Env) != 0 || len(sidecar.VolumeMounts) != 0 {
+		t.Fatalf("runtime settings injected into dependency: env=%v mounts=%v", sidecar.Env, sidecar.VolumeMounts)
+	}
+	app := d.Spec.Template.Spec.Containers[0]
+	if len(app.Env) == 0 || len(app.VolumeMounts) == 0 {
+		t.Fatalf("application lacks runtime settings: env=%v mounts=%v", app.Env, app.VolumeMounts)
+	}
+	helper := d.Spec.Template.Spec.Containers[1]
+	if len(helper.Env) != 0 || len(helper.VolumeMounts) != 0 {
+		t.Fatalf("runtime settings injected into helper: env=%v mounts=%v", helper.Env, helper.VolumeMounts)
+	}
+}
+
+func TestDependencyWaitingStatusAndEventTransition(t *testing.T) {
+	wl := mapReduce()
+	always := corev1.ContainerRestartPolicyAlways
+	wl.Spec.Operations[1].Template.Spec.InitContainers = []corev1.Container{{
+		Name: "dependency", Image: "dependency:test", RestartPolicy: &always,
+		StartupProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+			TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(9000)},
+		}},
+	}}
+	h := newHarness(t, wl)
+	started := false
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "wc-map-0", Namespace: "default", Labels: opLabels(wl, &wl.Spec.Operations[1])},
+		Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{{
+			Name: "dependency", Started: &started,
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
+		}}},
+	}
+	if err := h.c.Create(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	got := h.reconcile()
+	status := h.opStatus(got, "map")
+	if status.Reason != "DependencyWaiting" || !strings.Contains(status.Message, "dependency") {
+		t.Fatalf("map status %+v", status)
+	}
+	found := false
+	for len(h.events.Events) > 0 {
+		if event := <-h.events.Events; strings.Contains(event, "DependencyWaiting") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("no dependency wait event emitted")
+	}
+	h.reconcile()
+	select {
+	case event := <-h.events.Events:
+		t.Fatalf("unchanged dependency emitted another event: %q", event)
+	default:
 	}
 }
 

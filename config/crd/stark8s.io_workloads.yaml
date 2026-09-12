@@ -232,8 +232,8 @@ spec:
                           properties:
                             cpuUtilizationPercent:
                               description: |-
-                                CPUUtilizationPercent creates a HorizontalPodAutoscaler on CPU. Only
-                                applies to operations with completion Never. Zero disables it.
+                                CPUUtilizationPercent is retained for compatibility. Automatic horizontal
+                                scaling is disabled because operation pods may hold local state or output.
                               format: int32
                               type: integer
                             max:
@@ -249,8 +249,9 @@ spec:
                           type: object
                         vertical:
                           description: |-
-                            VerticalScaling requests a VerticalPodAutoscaler for the operation. It is
-                            ignored when the VPA API is not installed in the cluster.
+                            VerticalScaling requests initial resource sizing for a Never operation when
+                            the VerticalPodAutoscaler API is installed. Auto is retained for
+                            compatibility but disabled because it can evict a stateful pod.
                           properties:
                             mode:
                               default: "Off"
@@ -289,9 +290,8 @@ spec:
                       type: object
                     slots:
                       default: 1
-                      description: |-
-                        Slots is how many partitions one replica processes concurrently. The
-                        controller sizes the replica count as runnable tasks divided by slots.
+                      description: Slots is how many partitions one replica processes
+                        concurrently.
                       format: int32
                       minimum: 1
                       type: integer
@@ -8339,6 +8339,11 @@ spec:
                   description: ChannelStatus reports one channel, from coordinator
                     metrics.
                   properties:
+                    acknowledged:
+                      description: Acknowledged counts records accepted as processed
+                        by consumers.
+                      format: int64
+                      type: integer
                     epoch:
                       description: Epoch is the current superstep of a Synchronous
                         feedback channel.
@@ -8347,8 +8352,12 @@ spec:
                     inFlight:
                       format: int64
                       type: integer
+                    latestDeliveryFailure:
+                      description: LatestDeliveryFailure preserves the most recent
+                        failed segment fetch.
+                      type: string
                     lost:
-                      description: Lost counts segments whose holder pod expired before
+                      description: Lost counts records whose holder pod expired before
                         consumption.
                       format: int64
                       type: integer
@@ -8386,6 +8395,8 @@ spec:
                         HoldsUnconsumed: the operation's pods still hold segments that a
                         consumer has not fetched, so they are kept after completion.
                       type: boolean
+                    message:
+                      type: string
                     name:
                       type: string
                     phase:
@@ -8394,6 +8405,8 @@ spec:
                     ready:
                       format: int32
                       type: integer
+                    reason:
+                      type: string
                     replicas:
                       format: int32
                       type: integer
@@ -8411,6 +8424,8 @@ spec:
                 type: array
               phase:
                 description: WorkloadPhase is the lifecycle state of the whole graph.
+                type: string
+              reason:
                 type: string
             type: object
         type: object

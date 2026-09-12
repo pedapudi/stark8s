@@ -140,5 +140,7 @@ the generated policies are enforced.
 - The graph can be edited while a workload runs (the controller pushes the
   channel list on every pass and creates operations on demand), but
   removing an operation or channel from a running workload is not handled.
-- Vertical scaling emits a VerticalPodAutoscaler only when that API is
-  installed; the local scripts do not install it.
+- Initial vertical sizing emits a VerticalPodAutoscaler only when that API is
+  installed; the local scripts do not install it. Automatic horizontal
+  scaling and automatic vertical updates are disabled while operation state
+  and output remain pod-local.

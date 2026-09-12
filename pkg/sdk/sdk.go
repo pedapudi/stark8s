@@ -30,6 +30,8 @@ package sdk
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -135,6 +137,9 @@ type Worker struct {
 	Workload    string
 	Operation   string
 	Instance    string
+	// Incarnation identifies this process lifetime within Instance. It is
+	// generated during initialization when the caller leaves it empty.
+	Incarnation string
 	PodIP       string
 	Slots       int32
 	Inbound     []string
@@ -225,6 +230,13 @@ func FromEnv() (*Worker, error) {
 // init fills defaults so a Worker built by hand (tests) works like one from
 // FromEnv.
 func (w *Worker) init() {
+	if w.Incarnation == "" {
+		var value [16]byte
+		if _, err := rand.Read(value[:]); err != nil {
+			panic(fmt.Sprintf("generate worker incarnation: %v", err))
+		}
+		w.Incarnation = hex.EncodeToString(value[:])
+	}
 	if w.feedback == nil {
 		w.feedback = map[string]bool{}
 	}
@@ -641,7 +653,7 @@ func (w *Worker) Flush() error {
 	}
 	for ch, anns := range w.unannounced {
 		body, _ := json.Marshal(anns)
-		if err := w.do("POST", coordinator.PathChannels+"/"+ch+coordinator.SuffixSegments, body, nil); err != nil {
+		if err := w.do("POST", fmt.Sprintf("%s/%s%s?pod=%s", coordinator.PathChannels, ch, coordinator.SuffixSegments, w.Instance), body, nil); err != nil {
 			return err
 		}
 		delete(w.unannounced, ch)
@@ -661,6 +673,7 @@ func (w *Worker) do(method, path string, body []byte, out any) error {
 		return err
 	}
 	req.Header.Set(coordinator.OperationHeader, w.Operation)
+	req.Header.Set(coordinator.IncarnationHeader, w.Incarnation)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := w.client.Do(req)
 	if err != nil {
@@ -681,7 +694,7 @@ func (w *Worker) do(method, path string, body []byte, out any) error {
 }
 
 func (w *Worker) registration() coordinator.PodRegistration {
-	return coordinator.PodRegistration{Operation: w.Operation, Pod: w.Instance, Addr: w.addr, Slots: w.Slots}
+	return coordinator.PodRegistration{Operation: w.Operation, Pod: w.Instance, Incarnation: w.Incarnation, Addr: w.addr, Slots: w.Slots}
 }
 
 func (w *Worker) register() error {
@@ -703,7 +716,12 @@ func (w *Worker) consume(ch string, max int) (*coordinator.ConsumeResponse, erro
 
 func (w *Worker) ack(ch string, acks []coordinator.SegmentAck) error {
 	body, _ := json.Marshal(acks)
-	return w.do("POST", coordinator.PathChannels+"/"+ch+coordinator.SuffixAck, body, nil)
+	return w.do("POST", fmt.Sprintf("%s/%s%s?pod=%s", coordinator.PathChannels, ch, coordinator.SuffixAck, w.Instance), body, nil)
+}
+
+func (w *Worker) nack(ch string, deliveries []coordinator.SegmentAck) error {
+	body, _ := json.Marshal(deliveries)
+	return w.do("POST", fmt.Sprintf("%s/%s%s?pod=%s", coordinator.PathChannels, ch, coordinator.SuffixNack, w.Instance), body, nil)
 }
 
 // fetch reads a segment from its holder.
@@ -889,6 +907,11 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 					w.epoch = resp.Epoch
 				}
 			}
+			if resp.FiniteEpochs {
+				w.syncLoop = true
+				w.epoch = resp.Epoch
+				w.maxEpoch = resp.MaxEpochs
+			}
 			for _, work := range resp.Work {
 				for _, seg := range work.Segments {
 					recs, err := w.fetchRetry(ctx, seg)
@@ -896,16 +919,12 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 						if ctx.Err() != nil {
 							return ctx.Err()
 						}
-						// Skipping the segment is not an option: it stays in
-						// flight, so the channel never goes quiet, Drained
-						// never becomes true, OnDrain never runs and the
-						// workload hangs silently. The coordinator returns an
-						// in-flight segment to the pending queue only when it
-						// expires the consumer holding it, which needs this
-						// pod to stop heartbeating. So fail: the pod exits
-						// naming the cause, the Deployment replaces it, and
-						// the coordinator re-queues the segment after PodTTL.
-						return fmt.Errorf("consuming %s: %w", ch, err)
+						failure := fmt.Sprintf("fetch segment %s from %s: %v", seg.ID, seg.Holder, err)
+						delivery := []coordinator.SegmentAck{{ID: seg.ID, Holder: seg.Holder, Pod: w.Instance, Failure: failure, RetryAfterMillis: 500}}
+						if nackErr := w.nack(ch, delivery); nackErr != nil {
+							return fmt.Errorf("%s; return delivery: %w", failure, nackErr)
+						}
+						return fmt.Errorf("%s; delivery returned", failure)
 					}
 					progressed = true
 					w.task = coordinator.TaskID{Channel: ch, Partition: work.Partition, Epoch: seg.Epoch}
@@ -934,10 +953,11 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			if !resp.Drained {
 				allDrained = false
 			}
-			if w.feedback[ch] && resp.Mode != graph.FeedbackAsynchronous && !resp.Quiescent {
+			if resp.FiniteEpochs && !resp.Quiescent {
 				allQuiet = false
-			}
-			if !w.feedback[ch] && !resp.Drained {
+			} else if w.feedback[ch] && resp.Mode != graph.FeedbackAsynchronous && !resp.Quiescent {
+				allQuiet = false
+			} else if !resp.FiniteEpochs && !w.feedback[ch] && !resp.Drained {
 				// A loop cannot end an epoch while non-loop inputs still flow.
 				allQuiet = false
 			}
@@ -990,13 +1010,10 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			if err := w.retry(ctx, w.Flush); err != nil {
 				return err
 			}
-			for ch := range w.feedback {
-				ch := ch
-				if err := w.retry(ctx, func() error {
-					return w.do("POST", fmt.Sprintf("%s/%s%s?pod=%s&epoch=%d", coordinator.PathChannels, ch, coordinator.SuffixEpochDone, w.Instance, w.epoch), nil, nil)
-				}); err != nil {
-					return err
-				}
+			if err := w.retry(ctx, func() error {
+				return w.do("POST", fmt.Sprintf("%s/%s%s?pod=%s&epoch=%d", coordinator.PathOperations, w.Operation, coordinator.SuffixEpochDone, w.Instance, w.epoch), nil, nil)
+			}); err != nil {
+				return err
 			}
 			w.lastDone = w.epoch
 			continue

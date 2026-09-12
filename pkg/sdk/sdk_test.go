@@ -166,6 +166,7 @@ func TestSynchronousLoopRunsSupersteps(t *testing.T) {
 		{Name: "ranks", From: "rank"},
 	})
 	defer stop()
+	h.co.SetOperations([]coordinator.OperationSpec{{Name: "rank", Replicas: 2}})
 
 	h.run(h.worker("seed", "seed-0", nil, []string{"graph"}), Handlers{
 		Source: func(ctx context.Context, w *Worker) error {

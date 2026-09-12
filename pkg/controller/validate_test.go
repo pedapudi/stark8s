@@ -74,33 +74,19 @@ func TestValidateSlots(t *testing.T) {
 }
 
 func TestDesiredReplicas(t *testing.T) {
-	s := &v1alpha1.WorkloadSpec{
-		Operations: []v1alpha1.Operation{{Name: "src"}, {Name: "piped"}, {Name: "staged"}},
-		Channels: []graph.Channel{
-			{Name: "p", From: "src", To: "piped", Delivery: graph.DeliveryPipelined},
-			{Name: "m", From: "piped", To: "staged", Delivery: graph.DeliveryMaterialized},
-		},
-	}
 	op := func(name string, slots, min, max int32) *v1alpha1.Operation {
 		return &v1alpha1.Operation{Name: name, Slots: slots, Scaling: v1alpha1.Scaling{Horizontal: v1alpha1.HorizontalScaling{Min: min, Max: max}}}
 	}
 	cases := []struct {
-		name     string
-		op       *v1alpha1.Operation
-		runnable int32
-		want     int32
+		name string
+		op   *v1alpha1.Operation
+		want int32
 	}{
-		{"ceil of runnable over slots", op("staged", 2, 1, 10), 5, 3},
-		{"slots default to one", op("staged", 0, 1, 10), 5, 5},
-		{"clamped to max", op("staged", 1, 1, 4), 100, 4},
-		{"raised to min", op("staged", 1, 3, 4), 1, 3},
-		{"idle staged consumer uses min", op("staged", 1, 0, 4), 0, 0},
-		{"idle source runs at least one", op("src", 1, 0, 4), 0, 1},
-		{"idle pipelined consumer runs at least one", op("piped", 1, 0, 4), 0, 1},
-		{"idle with min two", op("staged", 1, 2, 4), 0, 2},
+		{"membership uses maximum before work", op("staged", 2, 1, 10), 10},
+		{"unset maximum uses one", op("staged", 1, 0, 0), 1},
 	}
 	for _, c := range cases {
-		if got := desiredReplicas(s, c.op, c.runnable); got != c.want {
+		if got := desiredReplicas(c.op); got != c.want {
 			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
 		}
 	}

@@ -21,7 +21,7 @@ something Spark's own execution model handles differently.
 | `coalesce` without shuffle | fewer consumer replicas on a round-robin channel |
 | task | one record batch delivered to one replica |
 | executor pool | one pool per operation instead of one per job |
-| dynamic allocation | `scaling.horizontal` bounds with replicas sized from runnable partitions per `slots` |
+| dynamic allocation | fixed `scaling.horizontal.max` membership for each execution attempt |
 | executor memory and cores | the operation's pod template resources, per stage |
 | action (`collect`, `save`) | a sink operation, or a channel with no consumer read from outside |
 | iterative algorithm (MLlib, GraphX Pregel) | a feedback channel with `maxEpochs` |

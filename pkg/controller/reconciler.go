@@ -13,18 +13,17 @@
 //	                   every pod
 //	channels        -> pushed to the coordinator as topology; sealed when the
 //	                   coordinator reports their producing operation complete
-//	scaling         -> replicas = clamp(ceil(runnableTasks / slots), min, max)
-//	                   from coordinator metrics; HorizontalPodAutoscaler for
-//	                   CPU on streaming operations; VerticalPodAutoscaler for
-//	                   streaming operations when requested and the API exists
+//	scaling         -> fixed maximum replica membership during an attempt;
+//	                   initial vertical resource sizing when requested
 //	network         -> one NetworkPolicy per channel edge (consumer pods may
 //	                   open the producer's segment port), one for all
 //	                   operation pods, one for the coordinator
 //
 // Completion of a batch operation is a coordinator decision, expressed by
 // the controller as scaling the Deployment to zero. Pods that still hold
-// Ephemeral segments a consumer has not fetched are kept until the
-// coordinator reports them released.
+// Local segments a consumer has not fetched are kept until the coordinator
+// reports ephemeral segments released. Retained segments keep their producer
+// pods because they have no durable backing store.
 //
 // An operation whose inbound Materialized channels are not all sealed is not
 // started: its Deployment is created only when its inputs are complete. This
@@ -36,7 +35,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -53,6 +51,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -78,6 +77,8 @@ const (
 	// volume is mounted there in every container.
 	SegmentDir        = "/var/lib/stark8s/segments"
 	segmentVolumeName = "stark8s-segments"
+	runtimeContainer  = "stark8s-runtime"
+	runtimePort       = 8081
 
 	pollInterval = 3 * time.Second
 )
@@ -98,12 +99,16 @@ type Reconciler struct {
 	// CoordinatorURL overrides the in-cluster coordinator address (tests).
 	CoordinatorURL func(wl *v1alpha1.Workload) string
 	HTTP           *http.Client
+	Recorder       record.EventRecorder
 }
 
 // SetupWithManager registers the reconciler.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.HTTP == nil {
 		r.HTTP = &http.Client{Timeout: 10 * time.Second}
+	}
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorderFor("stark8s-controller")
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.Workload{}).
@@ -129,7 +134,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 	if err := Validate(&wl.Spec); err != nil {
-		return r.setPhase(ctx, wl, v1alpha1.WorkloadFailed, "invalid workload: "+err.Error())
+		return r.setPhase(ctx, wl, v1alpha1.WorkloadFailed, "InvalidWorkload", "invalid workload: "+err.Error())
 	}
 	if err := r.ensureCoordinator(ctx, wl); err != nil {
 		return ctrl.Result{}, err
@@ -142,7 +147,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 	if err := r.pushTopology(ctx, wl); err != nil {
 		logger.Info("coordinator not ready", "err", err.Error())
-		if _, err := r.setPhase(ctx, wl, v1alpha1.WorkloadPending, "waiting for coordinator"); err != nil {
+		if _, err := r.setPhase(ctx, wl, v1alpha1.WorkloadPending, "CoordinatorUnavailable", "waiting for coordinator"); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: pollInterval}, nil
@@ -151,9 +156,65 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err != nil {
 		return ctrl.Result{RequeueAfter: pollInterval}, nil
 	}
+	for _, m := range metrics.Channels {
+		if m.Lost == 0 {
+			continue
+		}
+		wl.Status.Channels = nil
+		var lost []string
+		for _, channel := range metrics.Channels {
+			wl.Status.Channels = append(wl.Status.Channels, channelStatus(channel))
+			if channel.Lost > 0 {
+				lost = append(lost, fmt.Sprintf("%s (%d records)", channel.Name, channel.Lost))
+			}
+		}
+		oldOperations := wl.Status.Operations
+		previous := map[string]v1alpha1.OperationStatus{}
+		for _, status := range oldOperations {
+			previous[status.Name] = status
+		}
+		wl.Status.Operations = nil
+		for i := range wl.Spec.Operations {
+			op := &wl.Spec.Operations[i]
+			status := previous[op.Name]
+			status.Name = op.Name
+			for _, channel := range metrics.Channels {
+				if channel.To == op.Name && channel.Lost > 0 {
+					status.Phase, status.Reason = v1alpha1.OperationFailed, "UnavailableData"
+					status.Message = fmt.Sprintf("channel %s lost %d required records", channel.Name, channel.Lost)
+				}
+			}
+			wl.Status.Operations = append(wl.Status.Operations, status)
+		}
+		if r.Recorder != nil {
+			for _, status := range wl.Status.Operations {
+				if status.Reason == "UnavailableData" && previous[status.Name].Reason != status.Reason {
+					r.Recorder.Eventf(wl, corev1.EventTypeWarning, status.Reason, "operation %s: %s", status.Name, status.Message)
+				}
+			}
+		}
+		return r.setPhase(ctx, wl, v1alpha1.WorkloadFailed, "RequiredRecordsLost",
+			"required records lost on channel "+strings.Join(lost, ", "))
+	}
+	for i := range wl.Spec.Operations {
+		op := &wl.Spec.Operations[i]
+		if err := r.ensureHPA(ctx, wl, op); err != nil {
+			return ctrl.Result{}, err
+		}
+		if op.Scaling.Vertical != nil && op.Scaling.Vertical.Mode == v1alpha1.VerticalAuto {
+			if err := r.ensureVPA(ctx, wl, op); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
+	// Publish fixed membership before creating operation Deployments. A worker
+	// may finish before a later reconcile observes every intended replica.
+	if err := r.pushOperations(ctx, wl); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	var opStatus []v1alpha1.OperationStatus
-	allDrained, anyStreaming := true, false
+	allDrained, anyStreaming, anyFailed := true, false, false
 	for i := range wl.Spec.Operations {
 		op := &wl.Spec.Operations[i]
 		st, err := r.reconcileOperation(ctx, wl, op, metrics)
@@ -161,6 +222,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			return ctrl.Result{}, err
 		}
 		opStatus = append(opStatus, st)
+		if st.Phase == v1alpha1.OperationFailed {
+			anyFailed = true
+		}
 		if op.Completion == v1alpha1.CompletionNever {
 			anyStreaming = true
 		} else if st.Phase != v1alpha1.OperationSucceeded {
@@ -172,31 +236,92 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if m, err := r.metrics(ctx, wl); err == nil {
 		metrics = m
 	}
+	oldOperations := wl.Status.Operations
 	wl.Status.Operations = opStatus
 	wl.Status.Channels = nil
 	for _, m := range metrics.Channels {
-		wl.Status.Channels = append(wl.Status.Channels, v1alpha1.ChannelStatus{
-			Name: m.Name, Sealed: m.Sealed, Pending: m.Pending, InFlight: m.InFlight,
-			Produced: m.Produced, Epoch: m.Epoch, Overflowed: m.Overflowed, Lost: m.Lost,
-		})
+		wl.Status.Channels = append(wl.Status.Channels, channelStatus(m))
 	}
 	phase, msg := v1alpha1.WorkloadRunning, ""
-	if allDrained && !anyStreaming {
+	for _, op := range wl.Spec.Operations {
+		if op.Scaling.Horizontal.CPUUtilizationPercent > 0 ||
+			(op.Scaling.Vertical != nil && op.Scaling.Vertical.Mode == v1alpha1.VerticalAuto) {
+			msg = "automatic scaling disabled because operation pods may hold local state or output"
+			break
+		}
+	}
+	if anyFailed {
+		phase, msg = v1alpha1.WorkloadFailed, "one or more operations failed"
+	} else if allDrained && !anyStreaming {
 		phase, msg = v1alpha1.WorkloadSucceeded, "all operations drained"
 	}
-	wl.Status.Phase, wl.Status.Message = phase, msg
+	oldReason := wl.Status.Reason
+	wl.Status.Phase, wl.Status.Reason, wl.Status.Message = phase, reasonForPhase(phase, msg), msg
 	if err := r.Status().Update(ctx, wl); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	r.emitStatusTransitions(wl, oldReason, oldOperations)
 	if phase == v1alpha1.WorkloadRunning {
 		return ctrl.Result{RequeueAfter: pollInterval}, nil
 	}
 	return ctrl.Result{}, nil
 }
 
-func (r *Reconciler) setPhase(ctx context.Context, wl *v1alpha1.Workload, phase v1alpha1.WorkloadPhase, msg string) (ctrl.Result, error) {
-	wl.Status.Phase, wl.Status.Message = phase, msg
-	return ctrl.Result{}, client.IgnoreNotFound(r.Status().Update(ctx, wl))
+func channelStatus(m coordinator.ChannelMetrics) v1alpha1.ChannelStatus {
+	return v1alpha1.ChannelStatus{
+		Name: m.Name, Sealed: m.Sealed, Pending: m.Pending, InFlight: m.InFlight,
+		Produced: m.Produced, Acknowledged: m.Acknowledged, Epoch: m.Epoch,
+		Overflowed: m.Overflowed, Lost: m.Lost, LatestDeliveryFailure: m.LatestDeliveryFailure,
+	}
+}
+
+func (r *Reconciler) setPhase(ctx context.Context, wl *v1alpha1.Workload, phase v1alpha1.WorkloadPhase, reason, msg string) (ctrl.Result, error) {
+	oldReason := wl.Status.Reason
+	wl.Status.Phase, wl.Status.Reason, wl.Status.Message = phase, reason, msg
+	err := client.IgnoreNotFound(r.Status().Update(ctx, wl))
+	if err == nil && r.Recorder != nil && oldReason != reason {
+		eventType := corev1.EventTypeNormal
+		if phase == v1alpha1.WorkloadFailed {
+			eventType = corev1.EventTypeWarning
+		}
+		r.Recorder.Event(wl, eventType, reason, msg)
+	}
+	return ctrl.Result{}, err
+}
+
+func reasonForPhase(phase v1alpha1.WorkloadPhase, message string) string {
+	switch {
+	case phase == v1alpha1.WorkloadSucceeded:
+		return "OperationsDrained"
+	case phase == v1alpha1.WorkloadFailed:
+		return "OperationFailed"
+	case strings.Contains(message, "automatic scaling disabled"):
+		return "AutomaticScalingDisabled"
+	default:
+		return "OperationsRunning"
+	}
+}
+
+func (r *Reconciler) emitStatusTransitions(wl *v1alpha1.Workload, oldReason string, old []v1alpha1.OperationStatus) {
+	if r.Recorder == nil {
+		return
+	}
+	if wl.Status.Reason != oldReason {
+		r.Recorder.Event(wl, corev1.EventTypeNormal, wl.Status.Reason, wl.Status.Message)
+	}
+	previous := map[string]string{}
+	for _, status := range old {
+		previous[status.Name] = status.Reason
+	}
+	for _, status := range wl.Status.Operations {
+		if status.Reason != "" && previous[status.Name] != status.Reason {
+			eventType := corev1.EventTypeNormal
+			if status.Phase == v1alpha1.OperationFailed {
+				eventType = corev1.EventTypeWarning
+			}
+			r.Recorder.Eventf(wl, eventType, status.Reason, "operation %s: %s", status.Name, status.Message)
+		}
+	}
 }
 
 // Validate checks graph integrity: channels reference declared operations,
@@ -367,7 +492,7 @@ func (r *Reconciler) ensureCoordinator(ctx context.Context, wl *v1alpha1.Workloa
 			Env: []corev1.EnvVar{{
 				Name:  "STARK8S_SEGMENT_ADDR",
 				Value: fmt.Sprintf("%s.%s.svc:%d", coordinatorName(wl), wl.Namespace, coordinator.SegmentPort),
-			}},
+			}, {Name: coordinator.EnvWorkload, Value: wl.Name}},
 			Ports: []corev1.ContainerPort{
 				{ContainerPort: coordinator.ControlPort, Name: "control"},
 				{ContainerPort: coordinator.SegmentPort, Name: "segments"},
@@ -438,6 +563,27 @@ func (r *Reconciler) metrics(ctx context.Context, wl *v1alpha1.Workload) (metric
 	return v, nil
 }
 
+// pushOperations publishes fixed membership before worker registration.
+func (r *Reconciler) pushOperations(ctx context.Context, wl *v1alpha1.Workload) error {
+	specs := make([]coordinator.OperationSpec, 0, len(wl.Spec.Operations))
+	for i := range wl.Spec.Operations {
+		o := &wl.Spec.Operations[i]
+		specs = append(specs, coordinator.OperationSpec{Name: o.Name, Replicas: desiredReplicas(o)})
+	}
+	body, _ := json.Marshal(specs)
+	req, _ := http.NewRequestWithContext(ctx, "PUT", r.coordinatorURL(wl)+coordinator.PathOperations, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := r.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("operation push: %s", resp.Status)
+	}
+	return nil
+}
+
 func (r *Reconciler) seal(ctx context.Context, wl *v1alpha1.Workload, channel string) error {
 	url := r.coordinatorURL(wl) + coordinator.PathChannels + "/" + channel + coordinator.SuffixSeal
 	req, _ := http.NewRequestWithContext(ctx, "POST", url, nil)
@@ -467,55 +613,20 @@ func slots(op *v1alpha1.Operation) int32 {
 	return op.Slots
 }
 
-// desiredReplicas sizes an operation from the number of runnable tasks:
-// clamp(ceil(runnable / slots), min, max). With no runnable tasks the count
-// is min, raised to one when the operation must run to make progress on its
-// own: a source, or a consumer of a Pipelined channel that must be present
-// while its producer runs.
-func desiredReplicas(spec *v1alpha1.WorkloadSpec, op *v1alpha1.Operation, runnable int32) int32 {
-	h := op.Scaling.Horizontal
-	min, max := h.Min, h.Max
+// desiredReplicas establishes fixed membership before an operation receives
+// work. Pods may hold acknowledged application state or local output even
+// when no input is pending, so the controller cannot safely reduce membership
+// during an execution attempt.
+func desiredReplicas(op *v1alpha1.Operation) int32 {
+	max := op.Scaling.Horizontal.Max
 	if max < 1 {
 		max = 1
 	}
-	if min > max {
-		min = max
-	}
-	if runnable <= 0 {
-		want := min
-		if want < 1 && mustRunIdle(spec, op) {
-			want = 1
-		}
-		return want
-	}
-	want := int32(math.Ceil(float64(runnable) / float64(slots(op))))
-	if want < min {
-		want = min
-	}
-	if want > max {
-		want = max
-	}
-	return want
-}
-
-// mustRunIdle reports whether an operation needs a pod even when the
-// coordinator reports nothing runnable: sources produce without input, and
-// consumers of Pipelined channels receive records as they are produced.
-func mustRunIdle(spec *v1alpha1.WorkloadSpec, op *v1alpha1.Operation) bool {
-	inbound := spec.Inbound(op.Name)
-	if len(inbound) == 0 {
-		return true
-	}
-	for _, c := range inbound {
-		if c.Delivery != graph.DeliveryMaterialized {
-			return true
-		}
-	}
-	return false
+	return max
 }
 
 func (r *Reconciler) reconcileOperation(ctx context.Context, wl *v1alpha1.Workload, op *v1alpha1.Operation, metrics metricsView) (v1alpha1.OperationStatus, error) {
-	st := v1alpha1.OperationStatus{Name: op.Name, Phase: v1alpha1.OperationWaiting}
+	st := v1alpha1.OperationStatus{Name: op.Name, Phase: v1alpha1.OperationWaiting, Reason: "InputNotReady", Message: "waiting for materialized input"}
 	om, hasMetrics := metrics.operations[op.Name]
 	st.RunnableTasks, st.HoldsUnconsumed = om.RunnableTasks, om.HoldsUnconsumed
 
@@ -523,7 +634,8 @@ func (r *Reconciler) reconcileOperation(ctx context.Context, wl *v1alpha1.Worklo
 	// until that channel is sealed. Feedback channels are excluded because
 	// they seal only when the loop terminates.
 	for _, c := range wl.Spec.Inbound(op.Name) {
-		if c.Delivery == graph.DeliveryMaterialized && c.Feedback == nil && !metrics.channels[c.Name].Sealed {
+		cm := metrics.channels[c.Name]
+		if c.Delivery == graph.DeliveryMaterialized && c.Feedback == nil && !cm.Sealed && !cm.ProductionClosed {
 			return st, nil
 		}
 	}
@@ -540,7 +652,6 @@ func (r *Reconciler) reconcileOperation(ctx context.Context, wl *v1alpha1.Worklo
 	}
 
 	streaming := op.Completion == v1alpha1.CompletionNever
-	useHPA := streaming && op.Scaling.Horizontal.CPUUtilizationPercent > 0
 	labels := opLabels(wl, op)
 	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: opName(wl, op), Namespace: wl.Namespace}}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dep, func() error {
@@ -551,7 +662,7 @@ func (r *Reconciler) reconcileOperation(ctx context.Context, wl *v1alpha1.Worklo
 		}
 		var want int32
 		switch {
-		case drainComplete && om.HoldsUnconsumed:
+		case drainComplete && (om.HoldsUnconsumed || holdsRetainedSegments(&wl.Spec, op)):
 			// Pods hold Ephemeral segments a consumer has not fetched.
 			want = current
 			if want < 1 {
@@ -559,10 +670,8 @@ func (r *Reconciler) reconcileOperation(ctx context.Context, wl *v1alpha1.Worklo
 			}
 		case drainComplete:
 			want = 0
-		case useHPA && dep.Spec.Replicas != nil:
-			want = current
 		default:
-			want = desiredReplicas(&wl.Spec, op, om.RunnableTasks)
+			want = desiredReplicas(op)
 		}
 		dep.Spec.Replicas = &want
 		dep.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
@@ -575,16 +684,97 @@ func (r *Reconciler) reconcileOperation(ctx context.Context, wl *v1alpha1.Worklo
 	st.Replicas = *dep.Spec.Replicas
 	st.Ready = dep.Status.ReadyReplicas
 	st.Phase = v1alpha1.OperationRunning
+	st.Reason, st.Message = r.operationReason(ctx, wl, op, dep, metrics)
+	if st.Reason == "OperationFailed" {
+		st.Phase = v1alpha1.OperationFailed
+	}
 	if drainComplete && st.Replicas == 0 && dep.Status.Replicas == 0 {
 		st.Phase = v1alpha1.OperationSucceeded
+		st.Reason, st.Message = "OperationDrained", "operation completed and released its pods"
 	}
 	if !streaming {
 		return st, nil
 	}
-	if err := r.ensureHPA(ctx, wl, op); err != nil {
-		return st, err
-	}
 	return st, r.ensureVPA(ctx, wl, op)
+}
+
+func (r *Reconciler) operationReason(ctx context.Context, wl *v1alpha1.Workload, op *v1alpha1.Operation, dep *appsv1.Deployment, metrics metricsView) (string, string) {
+	for _, channel := range wl.Spec.Inbound(op.Name) {
+		if failure := metrics.channels[channel.Name].LatestDeliveryFailure; failure != "" {
+			return "DeliveryFailureRecorded", fmt.Sprintf("channel %s: %s", channel.Name, failure)
+		}
+	}
+	for _, condition := range dep.Status.Conditions {
+		if condition.Type == appsv1.DeploymentProgressing && condition.Status == corev1.ConditionFalse {
+			return "OperationFailed", condition.Reason + ": " + condition.Message
+		}
+	}
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(wl.Namespace), client.MatchingLabels(opLabels(wl, op))); err == nil {
+		dependencies := map[string]bool{}
+		for _, container := range dep.Spec.Template.Spec.InitContainers {
+			if container.RestartPolicy != nil && *container.RestartPolicy == corev1.ContainerRestartPolicyAlways && container.StartupProbe != nil {
+				dependencies[container.Name] = true
+			}
+		}
+		for _, pod := range pods.Items {
+			for _, status := range pod.Status.InitContainerStatuses {
+				if !dependencies[status.Name] {
+					continue
+				}
+				if status.Started != nil && *status.Started {
+					continue
+				}
+				if status.State.Terminated != nil && status.State.Terminated.ExitCode != 0 {
+					return "DependencyFailed", fmt.Sprintf("pod %s dependency %s exited: %s", pod.Name, status.Name, status.State.Terminated.Reason)
+				}
+				reason := "startup probe has not succeeded"
+				if status.State.Waiting != nil && status.State.Waiting.Reason != "" {
+					reason = status.State.Waiting.Reason
+				}
+				return "DependencyWaiting", fmt.Sprintf("pod %s dependency %s: %s", pod.Name, status.Name, reason)
+			}
+		}
+	}
+	if dep.Status.ReadyReplicas < *dep.Spec.Replicas {
+		return "PodsNotReady", fmt.Sprintf("%d of %d replicas ready", dep.Status.ReadyReplicas, *dep.Spec.Replicas)
+	}
+	return "Processing", "operation replicas are ready"
+}
+
+func holdsRetainedSegments(spec *v1alpha1.WorkloadSpec, op *v1alpha1.Operation) bool {
+	for _, channel := range spec.Outbound(op.Name) {
+		if channel.To != "" && channel.Durability == graph.DurabilityRetained {
+			return true
+		}
+	}
+	return false
+}
+
+func finiteEpochOperation(spec *v1alpha1.WorkloadSpec, name string) bool {
+	seen := map[string]bool{name: true}
+	for changed := true; changed; {
+		changed = false
+		for _, c := range spec.Channels {
+			if c.Feedback != nil && c.Feedback.Mode != graph.FeedbackAsynchronous {
+				if !seen[c.From] || !seen[c.To] {
+					seen[c.From], seen[c.To], changed = true, true, true
+				}
+			}
+			if seen[c.From] && c.To != "" && !seen[c.To] {
+				seen[c.To], changed = true, true
+			}
+			if seen[c.To] && c.From != "" && !seen[c.From] {
+				seen[c.From], changed = true, true
+			}
+		}
+	}
+	for _, c := range spec.Channels {
+		if c.Feedback != nil && c.Feedback.Mode != graph.FeedbackAsynchronous && (seen[name] && (seen[c.From] || seen[c.To])) {
+			return true
+		}
+	}
+	return false
 }
 
 // podTemplate returns the operation's template with graph discovery, the
@@ -644,8 +834,26 @@ func (r *Reconciler) podTemplate(wl *v1alpha1.Workload, op *v1alpha1.Operation) 
 			VolumeSource: corev1.VolumeSource{EmptyDir: dir},
 		})
 	}
-	for i := range tpl.Spec.Containers {
-		c := &tpl.Spec.Containers[i]
+	var worker *corev1.Container
+	if len(tpl.Spec.Containers) > 0 {
+		worker = &tpl.Spec.Containers[0]
+	}
+	for i := range tpl.Spec.InitContainers {
+		container := &tpl.Spec.InitContainers[i]
+		if container.Name != runtimeContainer || container.RestartPolicy == nil ||
+			*container.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+			continue
+		}
+		worker = container
+		if container.StartupProbe == nil {
+			container.StartupProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromInt(runtimePort)},
+			}}
+		}
+		break
+	}
+	if worker != nil {
+		c := worker
 		c.Env = append(env, c.Env...)
 		mounted := false
 		for _, m := range c.VolumeMounts {
@@ -656,19 +864,17 @@ func (r *Reconciler) podTemplate(wl *v1alpha1.Workload, op *v1alpha1.Operation) 
 		if !mounted {
 			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: segmentVolumeName, MountPath: SegmentDir})
 		}
-		if i == 0 {
-			hasPort := false
-			for _, p := range c.Ports {
-				if p.ContainerPort == coordinator.SegmentPort {
-					hasPort = true
-				}
+		hasPort := false
+		for _, p := range c.Ports {
+			if p.ContainerPort == coordinator.SegmentPort {
+				hasPort = true
 			}
-			if !hasPort {
-				c.Ports = append(c.Ports, corev1.ContainerPort{ContainerPort: coordinator.SegmentPort, Name: "segments"})
-			}
-			if op.Segments != nil {
-				requestEphemeralStorage(c, op.Segments.Size)
-			}
+		}
+		if !hasPort {
+			c.Ports = append(c.Ports, corev1.ContainerPort{ContainerPort: coordinator.SegmentPort, Name: "segments"})
+		}
+		if op.Segments != nil {
+			requestEphemeralStorage(c, op.Segments.Size)
 		}
 	}
 	return tpl
@@ -768,32 +974,8 @@ func (r *Reconciler) ensureServiceAccounts(ctx context.Context, wl *v1alpha1.Wor
 
 func (r *Reconciler) ensureHPA(ctx context.Context, wl *v1alpha1.Workload, op *v1alpha1.Operation) error {
 	hpa := &autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Name: opName(wl, op), Namespace: wl.Namespace}}
-	pct := op.Scaling.Horizontal.CPUUtilizationPercent
-	if pct == 0 {
-		err := r.Delete(ctx, hpa)
-		return client.IgnoreNotFound(err)
-	}
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, hpa, func() error {
-		hpa.Labels = opLabels(wl, op)
-		min := op.Scaling.Horizontal.Min
-		if min < 1 {
-			min = 1
-		}
-		max := op.Scaling.Horizontal.Max
-		if max < min {
-			max = min
-		}
-		hpa.Spec.MinReplicas = &min
-		hpa.Spec.MaxReplicas = max
-		hpa.Spec.ScaleTargetRef = autoscalingv2.CrossVersionObjectReference{APIVersion: "apps/v1", Kind: "Deployment", Name: opName(wl, op)}
-		hpa.Spec.Metrics = []autoscalingv2.MetricSpec{{
-			Type: autoscalingv2.ResourceMetricSourceType,
-			Resource: &autoscalingv2.ResourceMetricSource{Name: corev1.ResourceCPU,
-				Target: autoscalingv2.MetricTarget{Type: autoscalingv2.UtilizationMetricType, AverageUtilization: &pct}},
-		}}
-		return controllerutil.SetControllerReference(wl, hpa, r.Scheme())
-	})
-	return err
+	err := r.Delete(ctx, hpa)
+	return client.IgnoreNotFound(err)
 }
 
 var vpaGVK = schema.GroupVersionKind{Group: "autoscaling.k8s.io", Version: "v1", Kind: "VerticalPodAutoscaler"}
@@ -816,6 +998,9 @@ func (r *Reconciler) ensureVPA(ctx context.Context, wl *v1alpha1.Workload, op *v
 	vpa.SetGroupVersionKind(vpaGVK)
 	vpa.SetName(opName(wl, op))
 	vpa.SetNamespace(wl.Namespace)
+	if op.Scaling.Vertical.Mode == v1alpha1.VerticalAuto {
+		return client.IgnoreNotFound(r.Delete(ctx, vpa))
+	}
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, vpa, func() error {
 		vpa.SetLabels(opLabels(wl, op))
 		_ = unstructured.SetNestedMap(vpa.Object, map[string]any{

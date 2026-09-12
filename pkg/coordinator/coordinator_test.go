@@ -292,6 +292,218 @@ func TestSynchronousBarrierWaitsForEveryPod(t *testing.T) {
 	}
 }
 
+func TestFiniteEpochWaitsForIntendedProducerRegistration(t *testing.T) {
+	co := New("coordinator:8090")
+	co.Configure([]graph.Channel{{Name: "loop", From: "step", To: "step", Delivery: graph.DeliveryMaterialized,
+		Feedback: &graph.Feedback{Mode: graph.FeedbackSynchronous, MaxEpochs: 2}}})
+	co.SetOperations([]OperationSpec{{Name: "step", Replicas: 2}})
+	if err := co.Register(PodRegistration{Operation: "step", Pod: "step-0"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.OperationEpochDone("step", "step-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := co.Consume("loop", "step", "step-0", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Epoch != 0 {
+		t.Fatalf("advanced before the second intended producer registered: %+v", resp)
+	}
+	if err := co.Register(PodRegistration{Operation: "step", Pod: "step-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.OperationEpochDone("step", "step-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	resp, _ = co.Consume("loop", "step", "step-0", 10)
+	if resp.Epoch != 1 || !resp.ProductionClosed {
+		t.Fatalf("epoch 1 did not open after both producers finished: %+v", resp)
+	}
+}
+
+func TestMaterializedEpochOpensBeforeQueuedRecordsDrain(t *testing.T) {
+	co := New("coordinator:8090")
+	co.Configure([]graph.Channel{
+		{Name: "input", To: "produce"},
+		{Name: "batch", From: "produce", To: "consume", Delivery: graph.DeliveryMaterialized},
+		{Name: "feedback", From: "consume", To: "produce", Feedback: &graph.Feedback{MaxEpochs: 2}},
+	})
+	co.SetOperations([]OperationSpec{{Name: "produce", Replicas: 1}})
+	_ = co.Register(PodRegistration{Operation: "produce", Pod: "produce-0"})
+	if err := co.Produce("batch", "produce", []Record{{Key: "queued", Epoch: 0}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.Seal("input"); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.OperationEpochDone("produce", "produce-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := co.Consume("batch", "consume", "consume-0", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.ProductionClosed || len(resp.Work) != 1 || resp.Drained {
+		t.Fatalf("materialized input waited for queued acknowledgements: %+v", resp)
+	}
+}
+
+func TestFiniteEpochProgressPropagatesThroughThreeOperationsAndEmptyOutput(t *testing.T) {
+	co := New("coordinator:8090")
+	co.Configure([]graph.Channel{
+		{Name: "initial", To: "first"},
+		{Name: "first-second", From: "first", To: "second", Delivery: graph.DeliveryMaterialized},
+		{Name: "second-third", From: "second", To: "third", Delivery: graph.DeliveryMaterialized},
+		{Name: "feedback", From: "third", To: "first", Delivery: graph.DeliveryMaterialized, Feedback: &graph.Feedback{MaxEpochs: 3}},
+	})
+	for _, op := range []string{"first", "second", "third"} {
+		co.SetOperations([]OperationSpec{{Name: op, Replicas: 1}})
+		_ = co.Register(PodRegistration{Operation: op, Pod: op + "-0"})
+	}
+	if err := co.Seal("initial"); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.OperationEpochDone("first", "first-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := co.Consume("first-second", "second", "second-0", 10); !resp.Quiescent {
+		t.Fatalf("first edge did not close empty epoch: %+v", resp)
+	}
+	if err := co.OperationEpochDone("second", "second-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := co.Consume("second-third", "third", "third-0", 10); !resp.Quiescent {
+		t.Fatalf("second edge did not close empty epoch: %+v", resp)
+	}
+	if err := co.OperationEpochDone("third", "third-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := co.Consume("feedback", "first", "first-0", 10); resp.Epoch != 1 || !resp.Quiescent {
+		t.Fatalf("feedback did not increment the epoch: %+v", resp)
+	}
+}
+
+func TestFiniteEpochProgressPropagatesThroughTwoOperationCycle(t *testing.T) {
+	co := New("coordinator:8090")
+	co.Configure([]graph.Channel{
+		{Name: "forward", From: "first", To: "second"},
+		{Name: "feedback", From: "second", To: "first", Feedback: &graph.Feedback{MaxEpochs: 2}},
+	})
+	for _, op := range []string{"first", "second"} {
+		co.SetOperations([]OperationSpec{{Name: op, Replicas: 1}})
+		_ = co.Register(PodRegistration{Operation: op, Pod: op + "-0"})
+	}
+	if err := co.OperationEpochDone("first", "first-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := co.Consume("forward", "second", "second-0", 10); !resp.Quiescent {
+		t.Fatalf("forward edge did not close: %+v", resp)
+	}
+	if err := co.OperationEpochDone("second", "second-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := co.Consume("feedback", "first", "first-0", 10); resp.Epoch != 1 || !resp.Quiescent {
+		t.Fatalf("feedback edge did not advance: %+v", resp)
+	}
+}
+
+func TestExpiredWorkerKeepsEpochObligationUntilReplacementFinishes(t *testing.T) {
+	co := New("coordinator:8090")
+	now := time.Unix(100, 0)
+	co.now = func() time.Time { return now }
+	co.Configure([]graph.Channel{{Name: "loop", From: "step", To: "step", Feedback: &graph.Feedback{MaxEpochs: 2}}})
+	co.SetOperations([]OperationSpec{{Name: "step", Replicas: 2}})
+	_ = co.Register(PodRegistration{Operation: "step", Pod: "step-0"})
+	_ = co.Register(PodRegistration{Operation: "step", Pod: "step-1"})
+	if err := co.OperationEpochDone("step", "step-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(PodTTL + time.Second)
+	_ = co.Register(PodRegistration{Operation: "step", Pod: "step-0"})
+	co.Metrics() // expires step-1 without removing the intended replica count
+	if resp, _ := co.Consume("loop", "step", "step-0", 10); resp.Epoch != 0 {
+		t.Fatalf("worker loss erased an unfinished progress obligation: %+v", resp)
+	}
+	_ = co.Register(PodRegistration{Operation: "step", Pod: "step-1"})
+	if err := co.OperationEpochDone("step", "step-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := co.Consume("loop", "step", "step-0", 10); resp.Epoch != 1 {
+		t.Fatalf("replacement did not satisfy the preserved obligation: %+v", resp)
+	}
+}
+
+func TestFiniteEpochSourceClosureWaitsForStaggeredHashProducers(t *testing.T) {
+	co := New("coordinator:8090")
+	co.Configure([]graph.Channel{
+		{Name: "batch", From: "source", To: "step", Delivery: graph.DeliveryMaterialized,
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2}},
+		{Name: "feedback", From: "step", To: "step", Feedback: &graph.Feedback{MaxEpochs: 2}},
+	})
+	co.SetOperations([]OperationSpec{{Name: "source", Replicas: 2}, {Name: "step", Replicas: 1}})
+	_ = co.Register(PodRegistration{Operation: "source", Pod: "source-0"})
+	if err := co.SourceDone(PodRegistration{Operation: "source", Pod: "source-0"}); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := co.Consume("batch", "step", "step-0", 10); resp.ProductionClosed {
+		t.Fatalf("source epoch closed before the second intended producer registered: %+v", resp)
+	}
+	_ = co.Register(PodRegistration{Operation: "source", Pod: "source-1"})
+	if err := co.SourceDone(PodRegistration{Operation: "source", Pod: "source-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := co.Consume("batch", "step", "step-0", 10); !resp.ProductionClosed || !resp.Quiescent {
+		t.Fatalf("source epoch did not close after both producers finished: %+v", resp)
+	}
+}
+
+func TestOperationEpochDoneRetryAfterAdvanceIsIdempotent(t *testing.T) {
+	co := New("coordinator:8090")
+	co.Configure([]graph.Channel{{Name: "loop", From: "step", To: "step", Feedback: &graph.Feedback{MaxEpochs: 3}}})
+	co.SetOperations([]OperationSpec{{Name: "step", Replicas: 2}})
+	for _, pod := range []string{"step-0", "step-1"} {
+		_ = co.Register(PodRegistration{Operation: "step", Pod: pod})
+	}
+	if err := co.OperationEpochDone("step", "step-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.OperationEpochDone("step", "step-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.OperationEpochDone("step", "step-1", 0); err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	if resp, _ := co.Consume("loop", "step", "step-0", 10); resp.Epoch != 1 {
+		t.Fatalf("retry advanced the epoch again: %+v", resp)
+	}
+}
+
+func TestFiniteNonFeedbackChannelRejectsPriorEpochAnnouncement(t *testing.T) {
+	co := New("coordinator:8090")
+	co.Configure([]graph.Channel{
+		{Name: "forward", From: "first", To: "second"},
+		{Name: "feedback", From: "second", To: "first", Feedback: &graph.Feedback{MaxEpochs: 3}},
+	})
+	co.SetOperations([]OperationSpec{{Name: "first", Replicas: 1}, {Name: "second", Replicas: 1}})
+	for _, op := range []string{"first", "second"} {
+		_ = co.Register(PodRegistration{Operation: op, Pod: op + "-0"})
+	}
+	if err := co.OperationEpochDone("first", "first-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.OperationEpochDone("second", "second-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	err := co.Announce("forward", "first", []SegmentAnnouncement{{ID: "late", Holder: "first:8090", Epoch: 0, Records: 1}})
+	if err == nil {
+		t.Fatal("prior-epoch segment was accepted on a finite non-feedback channel")
+	}
+	if metrics := co.Metrics(); metrics.Channels[1].Pending != 0 {
+		t.Fatalf("rejected segment became pending: %+v", metrics.Channels)
+	}
+}
+
 func TestAsynchronousLoopDeliversImmediatelyAndTerminates(t *testing.T) {
 	co := New("self:8090")
 	co.Configure([]graph.Channel{

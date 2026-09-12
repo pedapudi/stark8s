@@ -298,23 +298,10 @@ func closedForm() []float64 {
 	return []float64{(sxx*sy - sx*sxy) / det, (n*sxy - sx*sy) / det}
 }
 
-// TestSynchronousFeedbackDoesNotWaitForAnotherOperation records why the
-// weights channel is an Asynchronous feedback channel and not a Synchronous
-// one, which for a training loop would be the obvious choice.
-//
-// A Synchronous feedback channel is a barrier: the consumer runs OnEpochEnd
-// when the channel is quiescent at the current epoch, reports the epoch
-// finished, and the coordinator releases the next one. Quiescent means
-// nothing pending and nothing in flight — which is also true of a channel
-// whose producer has not sent anything yet. When the producer is the same
-// operation, as in examples/pagerank, that cannot happen: the pod fills the
-// channel in OnEpochEnd and only then reports the epoch finished. When the
-// producer is a different operation there is nothing holding the barrier,
-// and the consumer runs through every epoch to the bound on its own.
-//
-// This test starts the consumer of such a channel and never starts the
-// producer at all.
-func TestSynchronousFeedbackDoesNotWaitForAnotherOperation(t *testing.T) {
+// TestSynchronousFeedbackWaitsForItsProducer verifies that the empty initial
+// epoch can bootstrap a loop while later epochs remain closed until every
+// intended producer has joined and finished its output for the prior epoch.
+func TestSynchronousFeedbackWaitsForItsProducer(t *testing.T) {
 	const maxEpochs = 3
 	h, stop := newHarness(t, []graph.Channel{
 		{Name: "gradients", From: "worker", To: "server",
@@ -322,9 +309,29 @@ func TestSynchronousFeedbackDoesNotWaitForAnotherOperation(t *testing.T) {
 			Feedback:     &graph.Feedback{Mode: graph.FeedbackSynchronous, MaxEpochs: maxEpochs}},
 	})
 	defer stop()
+	h.co.SetOperations([]coordinator.OperationSpec{
+		{Name: "worker", Replicas: 1},
+		{Name: "server", Replicas: 1},
+	})
 
 	var mu sync.Mutex
 	var ran []int32
+	waitForEpochs := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			mu.Lock()
+			reached := len(ran) >= want
+			mu.Unlock()
+			if reached {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		t.Fatalf("consumer ran epochs %v, want at least %d", ran, want)
+	}
 	h.run("server", "server-0", []string{"gradients"}, nil, []string{"gradients"}, nil, sdk.Handlers{
 		OnEpochEnd: func(ctx context.Context, w *sdk.Worker, epoch int32) error {
 			mu.Lock()
@@ -333,12 +340,36 @@ func TestSynchronousFeedbackDoesNotWaitForAnotherOperation(t *testing.T) {
 			return nil
 		},
 	})
+
+	waitForEpochs(1)
+	time.Sleep(200 * time.Millisecond)
+	mu.Lock()
+	if fmt.Sprint(ran) != "[0]" {
+		t.Fatalf("consumer ran epochs %v before its producer joined, want [0]", ran)
+	}
+	mu.Unlock()
+
+	const incarnation = "worker-process"
+	if err := h.co.Register(coordinator.PodRegistration{
+		Operation: "worker", Pod: "worker-0", Incarnation: incarnation, Addr: "worker-0:8090", Slots: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for epoch := int32(0); epoch < maxEpochs; epoch++ {
+		if err := h.co.OperationEpochDoneSession("worker", "worker-0", incarnation, epoch); err != nil {
+			t.Fatalf("close producer epoch %d: %v", epoch, err)
+		}
+		if epoch+1 >= maxEpochs {
+			continue
+		}
+		waitForEpochs(int(epoch) + 2)
+	}
 	h.waitComplete("server")
 
 	mu.Lock()
 	defer mu.Unlock()
 	if fmt.Sprint(ran) != "[0 1 2]" {
-		t.Errorf("consumer ran epochs %v, want [0 1 2]: the barrier is expected to run to the bound unaided", ran)
+		t.Errorf("consumer ran epochs %v, want [0 1 2]", ran)
 	}
 	if cm := h.channel("gradients"); !cm.Sealed || cm.Produced != 0 {
 		t.Errorf("gradients: %+v, want sealed with nothing produced", cm)

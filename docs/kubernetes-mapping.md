@@ -27,8 +27,7 @@ which serves them on the same segment API.
 | the workload as a whole | one Deployment (one replica, Recreate strategy) running the coordinator, plus a Service exposing the control port (8080) and the segment port (8090) | `<workload>-coordinator` |
 | each operation | Deployment | `<workload>-<operation>` |
 | each operation | ServiceAccount, set as the pod's `serviceAccountName` | `<workload>-<operation>` |
-| `scaling.horizontal.cpuUtilizationPercent` on a `Never` operation | HorizontalPodAutoscaler (autoscaling/v2) targeting the Deployment | `<workload>-<operation>` |
-| `scaling.vertical` on a `Never` operation | VerticalPodAutoscaler, only when the `autoscaling.k8s.io` API is installed | `<workload>-<operation>` |
+| `scaling.vertical.mode: Initial` on a `Never` operation | VerticalPodAutoscaler, only when the `autoscaling.k8s.io` API is installed | `<workload>-<operation>` |
 | each channel with both a producer and a consumer | NetworkPolicy | `<workload>-edge-<channel>` |
 | operation pods as a group | NetworkPolicy | `<workload>-operations` |
 | each operation that declares `egress` | NetworkPolicy | `<workload>-egress-<operation>` |
@@ -57,7 +56,15 @@ its replicas until the Workload is deleted.
 A completed operation's pods may still hold Ephemeral segments that a
 downstream consumer has not fetched. The coordinator reports this as
 `OperationMetrics.HoldsUnconsumed`, and while it is true the controller
-keeps the Deployment at its current replica count. When the segments are
+keeps the Deployment at its current replica count. On a partitioned channel
+one acknowledgement settles a segment, because it went to one replica. On a
+Broadcast channel the segment is settled only when acknowledgements from as
+many replica slots as the controller published have arrived. A replacement
+pod reuses an expired slot, so successive pod names cannot satisfy the count.
+A producer feeding a Broadcast channel keeps a pod until its consumer has
+finished reading. A consumer whose completion is `Never` never finishes, so
+such a producer is held for the life of the workload; a replica added to it
+later still needs the records. When the segments are
 acknowledged the flag clears and the Deployment is scaled to zero. This
 hold-until-consumed rule is what makes producer-local segment storage safe
 under a Deployment, whose pods would otherwise be removed on completion.
@@ -92,7 +99,7 @@ bound is reached. Channels with no producer are sealed by an external
 
 The controller injects the following into every pod of an operation.
 
-Environment variables, prepended to every container's `env`:
+Environment variables, prepended to the worker container's `env`:
 
 | variable | value |
 |---|---|
@@ -111,18 +118,66 @@ Environment variables, prepended to every container's `env`:
 Pod spec additions:
 
 - an `emptyDir` volume named `stark8s-segments`, mounted at
-  `/var/lib/stark8s/segments` in every container;
-- a `containerPort` of 8090 named `segments` on the first container;
+  `/var/lib/stark8s/segments` in the worker container;
+- a `containerPort` of 8090 named `segments` on the worker container;
 - `serviceAccountName` set to `<workload>-<operation>`;
 - the three `stark8s.io/*` labels.
 
+The worker container is a restartable init container named
+`stark8s-runtime` when the template contains one. The controller adds an
+HTTP startup probe for `/healthz` on port 8081 when that runtime has no
+startup probe. Without the named runtime, the first regular container is the
+worker. The controller leaves every other container unchanged.
+
+## Local dependencies start before the application
+
+A local dependency can run as a native sidecar in
+`template.spec.initContainers`. Set its container-level `restartPolicy` to
+`Always` and give it a `startupProbe` for the service the application uses:
+
+```yaml
+template:
+  spec:
+    initContainers:
+      - name: model-server
+        image: example/model-server:1
+        restartPolicy: Always
+        startupProbe:
+          tcpSocket:
+            port: 9000
+          periodSeconds: 2
+          failureThreshold: 60
+    containers:
+      - name: application
+        image: example/worker:1
+```
+
+Kubernetes starts the application only after the sidecar startup probe
+succeeds. The probe must test the dependency directly; probing the application
+would create a circular wait because the application has not started yet.
+A wrong port leaves the Pod in its initialization state, and the failed
+startup probe appears in the Pod status and events.
+[Sidecar containers](https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/)
+are stable in Kubernetes 1.33 and enabled by default from Kubernetes 1.29.
+Clusters older than 1.29 require the `SidecarContainers` feature gate.
 The worker library reads the environment and needs no further
-configuration. A container that does not use the library can call the
-coordinator HTTP API directly with the same information.
+configuration. It generates a process incarnation at startup, includes it in
+registration, and sends it in the `X-Stark8s-Incarnation` header. A replacement
+process in the same pod receives unfinished deliveries immediately. Requests
+from the replaced process return a conflict. Clients that omit the incarnation
+retain the earlier protocol and do not receive same-pod restart recovery. A
+container that does not use the library can call the coordinator HTTP API
+directly with the same information.
 
 On every reconcile pass the controller sends the complete channel list to
 the coordinator (`PUT /topology`). Existing channels keep their state; new
 channels are created. This is what makes the graph editable while running.
+
+The same pass sends the replica count for each operation (`PUT /operations`).
+The coordinator uses this count to retain Broadcast segments until every
+intended replica has acknowledged them, including replicas that have not
+registered yet. A consumer gated behind a Materialized channel therefore has
+its segments retained while it waits for its Deployment to start.
 
 ## Sizing the segment volume
 
@@ -139,16 +194,14 @@ acknowledged it, so what has to fit is the peak unacknowledged output. On a
 Materialized channel that is the replica's whole output, since the consumer
 is not started until the channel seals, and the hold-until-consumed rule
 above keeps a completed operation's pods, and their segments, in place until
-the consumer has read them. While the operation is still running that rule
-does not apply: `desiredReplicas` follows the runnable-task count down and
-scales replicas away along with the segments they hold.
+the consumer has read them. The replica count stays fixed while the operation
+runs because an empty input queue does not prove that a pod holds no state.
 
 On a **Retained** channel with a consumer nothing is ever deleted.
 `Released` skips retained channels, so the coordinator never tells the
 producer it may drop a segment, and the volume has to hold everything the
-replica produces for as long as its pod runs. Sizing such a producer for its
-peak unacknowledged output will under-provision it by the whole of its
-output.
+replica produces for as long as its pod runs. Such a producer must reserve
+room for all of its output.
 
 A channel with **no consumer** never reaches this volume at all. The
 coordinator forces `To: ""` channels to Retained, and the worker posts their
@@ -157,9 +210,9 @@ does nothing for an operation whose only output is a terminal channel — the
 records accumulate in the coordinator's memory instead.
 
 Sizing the volume is a scheduling statement, not a durability one. Segments
-live and die with the pod: `HoldsUnconsumed` is set only for non-Retained
-channels, so an operation whose output is Retained is scaled to zero on
-completion like any other and its retained segments go with it.
+live and die with the pod. A completed producer of retained internal segments
+therefore remains running. It can release those pods only after retained
+segments have durable backing storage.
 
 `spec.operations[].segments.size` declares how much room that needs:
 
@@ -230,40 +283,21 @@ Note that this route sizes the volume without requesting anything: the
 controller only touches `ephemeral-storage` under `segments.size`, so a pod
 template declaring its own segment volume is still scheduled as though it
 needed no disk, and should carry its own request.
-
 ## Scaling
 
-**Horizontal, from runnable tasks.** On each pass (every three seconds while
-the workload runs) the controller reads `GET /metrics` from the coordinator.
-For each operation it computes
+**Fixed membership during an attempt.** The controller creates each operation
+at `scaling.horizontal.max` replicas before it can receive work. The count
+stays fixed until a completed operation no longer holds unconsumed output.
+The controller then scales the operation to zero. This rule preserves local
+application state and output when the pending input count falls.
 
-    replicas = clamp(ceil(RunnableTasks / slots), min, max)
+`cpuUtilizationPercent` is retained for API compatibility, but the controller
+does not create a HorizontalPodAutoscaler. It removes an existing autoscaler
+for the operation and explains the disabled setting in workload status.
 
-where `RunnableTasks` is the coordinator's count of the operation's
-partitions with pending input, `slots` is `spec.operations[].slots`, and
-`min` and `max` are `scaling.horizontal.min` and `scaling.horizontal.max`.
-When the coordinator has not yet reported the operation or reports zero
-runnable tasks, the count is `min`, raised to one for operations that must
-be present to make progress on their own: sources (no inbound channels) and
-consumers of at least one Pipelined channel. A consumer whose inbound
-channels are all Materialized may sit at zero replicas until work is
-pending.
-
-The same formula chooses the initial replica count when a gated operation
-is first created, so a stage consuming a sealed shuffle starts with
-parallelism proportional to the number of partitions that received records.
-
-**Horizontal, from CPU.** For `Never` operations with
-`cpuUtilizationPercent` set, the controller creates a
-HorizontalPodAutoscaler bounded by `min` (at least one) and `max` and leaves
-the replica count to it after the Deployment exists.
-
-**Vertical.** When `scaling.vertical.mode` is `Initial` or `Auto`, the
-operation's completion is `Never`, and the VerticalPodAutoscaler API is
-present, the controller creates a VerticalPodAutoscaler with that update
-mode targeting the operation's Deployment. `Drain` operations receive none,
-because the VPA updater evicts pods and the segments held by an evicted pod
-would be lost.
+`scaling.vertical.mode: Initial` remains supported for `Never` operations
+when the VerticalPodAutoscaler API is installed. The `Auto` mode is disabled
+and any existing object is removed because automatic updates evict pods.
 
 **Partition count as an upper bound.** A hash-partitioned channel with
 `partitions: N` can usefully feed at most `ceil(N / slots)` consumer
@@ -337,19 +371,34 @@ The controller writes:
 
 - `status.phase`: `Pending` until the coordinator accepts the topology,
   then `Running`; `Succeeded` when every `Drain` operation is `Succeeded`
-  and the workload has no `Never` operation; `Failed` when the graph is
-  invalid. Once `Succeeded` or `Failed`, the workload is no longer
-  reconciled and the coordinator remains available for reading result
-  channels;
-- `status.operations[]`: phase (`Waiting`, `Running`, `Succeeded`), desired
-  replicas, ready pods, `runnableTasks`, and `holdsUnconsumed`, the last
-  two copied from the coordinator's operation metrics. An operation is
-  `Succeeded` when the coordinator reports it complete and its Deployment
-  has zero desired and zero observed replicas;
+  and the workload has no `Never` operation; `Failed` when validation,
+  required-record availability, or an operation fails. `status.reason`
+  gives a stable machine-readable reason and `status.message` gives details.
+  Once `Succeeded` or `Failed`, the workload is no longer reconciled and
+  the coordinator remains available for reading result channels;
+- `status.operations[]`: phase, reason, message, desired replicas, ready
+  pods, `runnableTasks`, and `holdsUnconsumed`. Reasons distinguish input
+  gating, dependency startup, recorded delivery failures, pod readiness,
+  processing, completion, and Deployment failure. A restartable init
+  sidecar whose startup probe has not succeeded reports `DependencyWaiting`;
 - `status.channels[]`: sealed flag, pending and in-flight record counts,
-  total produced, the current epoch for Synchronous feedback channels,
-  `overflowed` (records diverted or dropped at the loop bound), and `lost`
-  (segments whose holder pod expired before consumption).
+  total produced and acknowledged records, the current epoch for Synchronous
+  feedback channels, the latest delivery failure, `overflowed` records, and
+  `lost` records whose holder pod expired before consumption.
+
+The controller emits an event only when a workload or operation reason
+changes. Persistent failures remain in status without producing an event on
+every reconciliation pass.
+
+The coordinator exposes the JSON report at `GET /metrics` and Prometheus
+text at `GET /metrics/prometheus`. Prometheus series use graph and operation
+or channel labels. They include produced, acknowledged, pending, in-flight,
+lost, and overflowed record counts; committed epochs; runnable tasks; and
+live pods. No record or segment identifier appears as a label.
+
+There is no general stall timer. An unchanged queue can mean a healthy idle
+stream or a handler that is still processing, so elapsed time alone does not
+establish failure.
 
 `kubectl get workloads` shows the phase; `kubectl get workload <name> -o
 yaml` shows the rest.

@@ -393,6 +393,9 @@ func TestEmitBlobDroppedAtLoopBound(t *testing.T) {
 	if err := w.serveSegments(); err != nil {
 		t.Fatal(err)
 	}
+	if err := h.co.Register(w.registration()); err != nil {
+		t.Fatal(err)
+	}
 	if err := w.EmitBlob("turns", "k", strings.NewReader("payload")); err != nil {
 		t.Fatal(err)
 	}
