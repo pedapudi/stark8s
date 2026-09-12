@@ -117,6 +117,50 @@ func TestCheckpointFollowsFixedOwnerAcrossPodReplacement(t *testing.T) {
 	}
 }
 
+func TestCollectiveRankZeroExitsAfterRestoringCompletedCheckpoint(t *testing.T) {
+	h, stop := newHarness(t, nil)
+	defer stop()
+	checkpoints, err := storage.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlers := Handlers{
+		Snapshot: func(context.Context) ([]byte, error) { return []byte("complete"), nil },
+		Restore:  func(context.Context, []byte) error { return nil },
+	}
+	first := h.worker("train", "train-0", nil, nil)
+	first.Incarnation = "first"
+	first.CheckpointStore, first.CheckpointPrefix = checkpoints, "workload"
+	first.init()
+	if err := first.startCheckpoint(context.Background(), handlers); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.commitCheckpoint(context.Background(), handlers, "", nil, true, false); err != nil {
+		t.Fatal(err)
+	}
+
+	sourceCalls, drainCalls := 0, 0
+	handlers.Source = func(context.Context, *Worker) error { sourceCalls++; return nil }
+	handlers.OnDrain = func(context.Context, *Worker) error { drainCalls++; return nil }
+	replacement := h.worker("train", "train-0", nil, nil)
+	replacement.Incarnation = "second"
+	replacement.CheckpointStore, replacement.CheckpointPrefix = checkpoints, "workload"
+	replacement.CollectiveSize, replacement.CollectiveRank = 2, 0
+	done := make(chan error, 1)
+	go func() { done <- replacement.Run(context.Background(), handlers) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("collective rank zero waited after restoring a completed checkpoint")
+	}
+	if sourceCalls != 0 || drainCalls != 0 {
+		t.Fatalf("callbacks reran after completed checkpoint: source=%d drain=%d", sourceCalls, drainCalls)
+	}
+}
+
 func TestCommittedDrainCallbackIsNotRepeatedAfterCrash(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

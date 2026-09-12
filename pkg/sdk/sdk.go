@@ -1178,6 +1178,9 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 		if err := w.retry(ctx, w.reportDone); err != nil {
 			return err
 		}
+		if w.CollectiveSize > 0 {
+			return nil
+		}
 		return w.idle(ctx)
 	}
 	if w.checkpoint != nil && w.checkpoint.current.EpochCallbackComplete {
