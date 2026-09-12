@@ -54,6 +54,22 @@ spec:
                     Channel is a directed information flow between two operations. It is the
                     only kind of edge in the graph.
                   properties:
+                    combine:
+                      description: |-
+                        Combine names a function the producer applies to records sharing a key
+                        before they are put on the wire, so a stage that emits one record per
+                        fact ships one record per key instead. It is the map-side half of a
+                        reduce-by-key: the consumer still aggregates across producers.
+
+                        The function must be associative and commutative, because the producer
+                        applies it to whatever subset of a key's records happen to be buffered
+                        together. Empty means no combining.
+                      enum:
+                      - Sum
+                      - Min
+                      - Max
+                      - Count
+                      type: string
                     delivery:
                       default: Pipelined
                       description: Delivery says when records become visible to the

@@ -39,7 +39,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
 
@@ -119,14 +119,17 @@ type Worker struct {
 	feedbackOut map[string]bool
 
 	client *http.Client
-	specs  map[string]v1alpha1.Channel
+	specs  map[string]graph.Channel
 
-	buffers     map[bufKey][]wireRecord
-	bufBytes    map[bufKey]int
-	order       []bufKey
-	rr          map[string]uint64
-	unannounced map[string][]coordinator.SegmentAnnouncement
-	overflowed  map[string]int64
+	buffers map[bufKey][]wireRecord
+	// combineIndex maps a buffered record key to its slot in buffers, for
+	// channels that declare a Combine function.
+	combineIndex map[bufKey]map[string]int
+	bufBytes     map[bufKey]int
+	order        []bufKey
+	rr           map[string]uint64
+	unannounced  map[string][]coordinator.SegmentAnnouncement
+	overflowed   map[string]int64
 
 	epoch    int32
 	maxEpoch int32
@@ -324,7 +327,7 @@ func (w *Worker) Emit(channel, key string, value any) error {
 	epoch := w.epoch
 	if w.feedbackOut[channel] {
 		epoch = w.epoch + 1
-		if spec.Feedback != nil && spec.Feedback.Mode == v1alpha1.FeedbackAsynchronous && epoch >= spec.Feedback.MaxEpochs {
+		if spec.Feedback != nil && spec.Feedback.Mode == graph.FeedbackAsynchronous && epoch >= spec.Feedback.MaxEpochs {
 			if spec.Feedback.Overflow == "" {
 				w.overflowed[channel]++
 				return nil
@@ -342,9 +345,9 @@ func (w *Worker) buffer(channel, key string, value json.RawMessage, epoch int32)
 	}
 	var p int32
 	switch {
-	case spec.To == "" || spec.Partitioning.Mode == v1alpha1.PartitionBroadcast:
+	case spec.To == "" || spec.Partitioning.Mode == graph.PartitionBroadcast:
 		p = 0
-	case spec.Partitioning.Mode == v1alpha1.PartitionHash:
+	case spec.Partitioning.Mode == graph.PartitionHash:
 		p = int32(coordinator.HashPartition(key, int(spec.Partitioning.Partitions)))
 	default:
 		p = int32(w.rr[channel] % uint64(spec.Partitioning.Partitions))
@@ -354,6 +357,18 @@ func (w *Worker) buffer(channel, key string, value json.RawMessage, epoch int32)
 	if _, ok := w.buffers[k]; !ok {
 		w.order = append(w.order, k)
 	}
+	if spec.Combine != "" {
+		if err := w.combine(k, spec.Combine, key, value, epoch); err != nil {
+			return err
+		}
+		// The buffer now holds one record per distinct key, so the flush
+		// threshold bounds distinct keys rather than facts. That is the point:
+		// a stage emitting many records per key ships far fewer.
+		if len(w.buffers[k]) >= flushRecords || w.bufBytes[k] >= flushBytes {
+			return w.flushBuffer(k)
+		}
+		return nil
+	}
 	w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: value, Epoch: epoch})
 	w.bufBytes[k] += len(key) + len(value)
 	if len(w.buffers[k]) >= flushRecords || w.bufBytes[k] >= flushBytes {
@@ -362,26 +377,101 @@ func (w *Worker) buffer(channel, key string, value json.RawMessage, epoch int32)
 	return nil
 }
 
+// combine folds a record into the buffered record for the same key, applying
+// the channel's function. The buffered slice stays the source of truth so that
+// flushBuffer, the byte accounting and the ordering guarantees all keep
+// working unchanged; combineIndex only says where in it each key lives.
+func (w *Worker) combine(k bufKey, mode graph.CombineMode, key string, value json.RawMessage, epoch int32) error {
+	if w.combineIndex == nil {
+		w.combineIndex = map[bufKey]map[string]int{}
+	}
+	idx, ok := w.combineIndex[k]
+	if !ok {
+		idx = map[string]int{}
+		w.combineIndex[k] = idx
+	}
+
+	if mode == graph.CombineCount {
+		// Count ignores the emitted value, so it is the one mode that accepts
+		// a null and the one that cannot fail on a non-numeric record.
+		if at, seen := idx[key]; seen {
+			var n float64
+			if err := json.Unmarshal(w.buffers[k][at].Value, &n); err != nil {
+				return fmt.Errorf("combine Count on channel %q key %q: %w", k.channel, key, err)
+			}
+			return w.setCombined(k, at, n+1)
+		}
+		idx[key] = len(w.buffers[k])
+		b, _ := json.Marshal(1)
+		w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: b, Epoch: epoch})
+		w.bufBytes[k] += len(key) + len(b)
+		return nil
+	}
+
+	var incoming float64
+	if err := json.Unmarshal(value, &incoming); err != nil {
+		return fmt.Errorf("combine %s on channel %q key %q: value must be a number: %w", mode, k.channel, key, err)
+	}
+	at, seen := idx[key]
+	if !seen {
+		idx[key] = len(w.buffers[k])
+		w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: value, Epoch: epoch})
+		w.bufBytes[k] += len(key) + len(value)
+		return nil
+	}
+	var held float64
+	if err := json.Unmarshal(w.buffers[k][at].Value, &held); err != nil {
+		return fmt.Errorf("combine %s on channel %q key %q: %w", mode, k.channel, key, err)
+	}
+	switch mode {
+	case graph.CombineSum:
+		held += incoming
+	case graph.CombineMin:
+		if incoming < held {
+			held = incoming
+		}
+	case graph.CombineMax:
+		if incoming > held {
+			held = incoming
+		}
+	default:
+		return fmt.Errorf("channel %q: unknown combine mode %q", k.channel, mode)
+	}
+	return w.setCombined(k, at, held)
+}
+
+// setCombined rewrites a buffered record in place, keeping the byte accounting
+// consistent with the new encoding.
+func (w *Worker) setCombined(k bufKey, at int, v float64) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	w.bufBytes[k] += len(b) - len(w.buffers[k][at].Value)
+	w.buffers[k][at].Value = b
+	return nil
+}
+
 // spec returns the declared channel, loading the topology on first use.
-func (w *Worker) spec(channel string) (v1alpha1.Channel, error) {
+func (w *Worker) spec(channel string) (graph.Channel, error) {
 	if w.specs == nil {
 		if err := w.loadTopology(); err != nil {
-			return v1alpha1.Channel{}, err
+			return graph.Channel{}, err
 		}
 	}
 	s, ok := w.specs[channel]
 	if !ok {
-		return v1alpha1.Channel{}, fmt.Errorf("channel %q is not declared in the topology", channel)
+		return graph.Channel{}, fmt.Errorf("channel %q is not declared in the topology", channel)
 	}
 	return s, nil
 }
 
 func (w *Worker) loadTopology() error {
-	var specs []v1alpha1.Channel
+	var specs []graph.Channel
 	if err := w.do("GET", coordinator.PathTopology, nil, &specs); err != nil {
 		return err
 	}
-	m := map[string]v1alpha1.Channel{}
+	m := map[string]graph.Channel{}
 	for _, s := range specs {
 		if s.Partitioning.Partitions <= 0 {
 			s.Partitioning.Partitions = 1
@@ -398,6 +488,7 @@ func (w *Worker) flushBuffer(k bufKey) error {
 	recs := w.buffers[k]
 	if len(recs) == 0 {
 		delete(w.buffers, k)
+		delete(w.combineIndex, k)
 		delete(w.bufBytes, k)
 		return nil
 	}
@@ -411,6 +502,7 @@ func (w *Worker) flushBuffer(k bufKey) error {
 			return err
 		}
 		delete(w.buffers, k)
+		delete(w.combineIndex, k)
 		delete(w.bufBytes, k)
 		return nil
 	}
@@ -424,6 +516,7 @@ func (w *Worker) flushBuffer(k bufKey) error {
 		return err
 	}
 	delete(w.buffers, k)
+	delete(w.combineIndex, k)
 	delete(w.bufBytes, k)
 	w.unannounced[k.channel] = append(w.unannounced[k.channel], coordinator.SegmentAnnouncement{
 		ID: id, Channel: k.channel, Partition: k.partition, Epoch: k.epoch,
@@ -524,8 +617,12 @@ func (w *Worker) ack(ch string, acks []coordinator.SegmentAck) error {
 }
 
 // fetch reads a segment from its holder.
-func (w *Worker) fetch(ref coordinator.SegmentRef) ([]wireRecord, error) {
-	resp, err := w.client.Get("http://" + ref.Holder + "/segments/" + ref.ID)
+func (w *Worker) fetch(ctx context.Context, ref coordinator.SegmentRef) ([]wireRecord, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+ref.Holder+"/segments/"+ref.ID, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := w.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -620,6 +717,7 @@ const (
 	fetchAttempts     = 6
 	fetchRetryFloor   = 200 * time.Millisecond
 	fetchRetryCeiling = 2 * time.Second
+	fetchRetryBudget  = 6 * time.Second
 )
 
 // Run executes the worker: it registers, starts heartbeats and the segment
@@ -680,7 +778,7 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			}
 			if w.feedback[ch] {
 				w.maxEpoch = resp.MaxEpochs
-				if resp.Mode != v1alpha1.FeedbackAsynchronous {
+				if resp.Mode != graph.FeedbackAsynchronous {
 					w.syncLoop = true
 					w.epoch = resp.Epoch
 				}
@@ -730,7 +828,7 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			if !resp.Drained {
 				allDrained = false
 			}
-			if w.feedback[ch] && resp.Mode != v1alpha1.FeedbackAsynchronous && !resp.Quiescent {
+			if w.feedback[ch] && resp.Mode != graph.FeedbackAsynchronous && !resp.Quiescent {
 				allQuiet = false
 			}
 			if !w.feedback[ch] && !resp.Drained {
@@ -799,11 +897,13 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 // fetchRetry fetches a segment, riding out a transient failure of its holder
 // for a bounded number of attempts.
 func (w *Worker) fetchRetry(ctx context.Context, seg coordinator.SegmentRef) ([]wireRecord, error) {
+	retryCtx, cancel := context.WithTimeout(ctx, fetchRetryBudget)
+	defer cancel()
 	wait := fetchRetryFloor
 	var err error
-	for i := 0; i < fetchAttempts && ctx.Err() == nil; i++ {
+	for i := 0; i < fetchAttempts && retryCtx.Err() == nil; i++ {
 		var recs []wireRecord
-		if recs, err = w.fetch(seg); err == nil {
+		if recs, err = w.fetch(retryCtx, seg); err == nil {
 			return recs, nil
 		}
 		log.Printf("fetch segment %s from %s (attempt %d of %d): %v", seg.ID, seg.Holder, i+1, fetchAttempts, err)
@@ -811,7 +911,7 @@ func (w *Worker) fetchRetry(ctx context.Context, seg coordinator.SegmentRef) ([]
 			break
 		}
 		select {
-		case <-ctx.Done():
+		case <-retryCtx.Done():
 		case <-time.After(wait):
 		}
 		if wait < fetchRetryCeiling {

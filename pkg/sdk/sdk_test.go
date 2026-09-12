@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
 
@@ -23,7 +23,7 @@ type harness struct {
 	wg  sync.WaitGroup
 }
 
-func newHarness(t *testing.T, specs []v1alpha1.Channel) (*harness, context.CancelFunc) {
+func newHarness(t *testing.T, specs []graph.Channel) (*harness, context.CancelFunc) {
 	t.Helper()
 	seg := httptest.NewServer(nil)
 	co := coordinator.New(strings.TrimPrefix(seg.URL, "http://"))
@@ -78,8 +78,8 @@ func (h *harness) waitComplete(op string) {
 }
 
 func TestWorkersExchangeSegmentsDirectly(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "words", From: "read", To: "count", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 4}},
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "words", From: "read", To: "count", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4}},
 		{Name: "totals", From: "count"},
 	})
 	defer stop()
@@ -156,11 +156,11 @@ func TestWorkersExchangeSegmentsDirectly(t *testing.T) {
 }
 
 func TestSynchronousLoopRunsSupersteps(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "graph", From: "seed", To: "rank", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2}},
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "graph", From: "seed", To: "rank", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2}},
 		{Name: "contrib", From: "rank", To: "rank",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2},
-			Feedback:     &v1alpha1.Feedback{Mode: v1alpha1.FeedbackSynchronous, MaxEpochs: 4}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackSynchronous, MaxEpochs: 4}},
 		{Name: "ranks", From: "rank"},
 	})
 	defer stop()
@@ -245,11 +245,11 @@ func TestSynchronousLoopRunsSupersteps(t *testing.T) {
 }
 
 func TestAsynchronousLoopDivertsAtBound(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "prompts", To: "agent", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2}},
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "prompts", To: "agent", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2}},
 		{Name: "turns", From: "agent", To: "agent",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2},
-			Feedback:     &v1alpha1.Feedback{Mode: v1alpha1.FeedbackAsynchronous, MaxEpochs: 3, Overflow: "unfinished"}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackAsynchronous, MaxEpochs: 3, Overflow: "unfinished"}},
 		{Name: "unfinished", From: "agent"},
 		{Name: "answers", From: "agent"},
 	})
@@ -313,23 +313,141 @@ func TestSegmentDirFallsBackWhenNotWritable(t *testing.T) {
 	s.remove(id)
 }
 
+// combineOutput drains a Retained channel through the coordinator and returns
+// the surviving records keyed by their record key.
+func combineOutput(t *testing.T, h *harness, channel string) map[string]float64 {
+	t.Helper()
+	recs, _, err := h.co.Records(channel, "", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]float64{}
+	for _, r := range recs {
+		n, ok := r.Value.(float64)
+		if !ok {
+			t.Fatalf("record %q value %v is not a number", r.Key, r.Value)
+		}
+		out[r.Key] = n
+	}
+	return out
+}
+
+// A channel that declares Combine folds records sharing a key before they go
+// on the wire, so the segment carries one record per key instead of one per
+// emitted fact. This is the map-side half of a reduce-by-key.
+func TestCombineFoldsRecordsBeforeTheWire(t *testing.T) {
+	for _, tc := range []struct {
+		mode graph.CombineMode
+		want map[string]float64
+	}{
+		{graph.CombineSum, map[string]float64{"a": 6, "b": 40}},
+		{graph.CombineMin, map[string]float64{"a": 1, "b": 10}},
+		{graph.CombineMax, map[string]float64{"a": 3, "b": 30}},
+		{graph.CombineCount, map[string]float64{"a": 3, "b": 2}},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			h, done := newHarness(t, []graph.Channel{{
+				Name: "out", From: "src", Durability: graph.DurabilityRetained,
+				Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 1},
+				Combine:      tc.mode,
+			}})
+			defer done()
+			w := h.worker("src", "src-0", nil, []string{"out"})
+			h.run(w, Handlers{Source: func(ctx context.Context, w *Worker) error {
+				for _, e := range []struct {
+					k string
+					v int
+				}{{"a", 1}, {"b", 10}, {"a", 2}, {"b", 30}, {"a", 3}} {
+					if err := w.Emit("out", e.k, e.v); err != nil {
+						return err
+					}
+				}
+				return nil
+			}})
+			h.waitComplete("src")
+
+			got := combineOutput(t, h, "out")
+			if len(got) != len(tc.want) {
+				t.Fatalf("%s emitted %d records, want %d (one per key): %v", tc.mode, len(got), len(tc.want), got)
+			}
+			for k, want := range tc.want {
+				if got[k] != want {
+					t.Fatalf("%s key %q = %v, want %v", tc.mode, k, got[k], want)
+				}
+			}
+			// Five facts went in; the combined channel must carry two records.
+			if m := h.co.Metrics().Channels[0]; m.Produced != 2 {
+				t.Fatalf("%s put %d records on the wire, want 2 from 5 facts", tc.mode, m.Produced)
+			}
+		})
+	}
+}
+
+// Without Combine the same program ships every fact, which is the behaviour
+// the feature exists to avoid and the regression guard for the default path.
+func TestWithoutCombineEveryFactGoesOnTheWire(t *testing.T) {
+	h, done := newHarness(t, []graph.Channel{{
+		Name: "out", From: "src", Durability: graph.DurabilityRetained,
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 1},
+	}})
+	defer done()
+	w := h.worker("src", "src-0", nil, []string{"out"})
+	h.run(w, Handlers{Source: func(ctx context.Context, w *Worker) error {
+		for i := 0; i < 5; i++ {
+			if err := w.Emit("out", "a", 1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}})
+	h.waitComplete("src")
+	if m := h.co.Metrics().Channels[0]; m.Produced != 5 {
+		t.Fatalf("uncombined channel produced %d records, want 5", m.Produced)
+	}
+}
+
+// A non-numeric record on an arithmetic combine channel is a programming
+// error and must be reported at the Emit that caused it, not silently dropped
+// or deferred to a decode failure in the consumer.
+func TestCombineRejectsNonNumericValues(t *testing.T) {
+	h, done := newHarness(t, []graph.Channel{{
+		Name: "out", From: "src", Durability: graph.DurabilityRetained,
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 1},
+		Combine:      graph.CombineSum,
+	}})
+	defer done()
+	w := h.worker("src", "src-0", nil, []string{"out"})
+	if err := w.Emit("out", "a", "not a number"); err == nil {
+		t.Fatal("Emit accepted a string on a Sum channel")
+	} else if !strings.Contains(err.Error(), "must be a number") {
+		t.Fatalf("unhelpful error: %v", err)
+	}
+}
+
+func TestCombineModeIdempotence(t *testing.T) {
+	for mode, want := range map[graph.CombineMode]bool{
+		graph.CombineMin: true, graph.CombineMax: true,
+		graph.CombineSum: false, graph.CombineCount: false,
+	} {
+		if got := mode.Idempotent(); got != want {
+			t.Fatalf("%s.Idempotent() = %v, want %v", mode, got, want)
+		}
+	}
+}
+
 func TestSynchronousLoopDoesNotStallOnIdlePods(t *testing.T) {
 	const supersteps = 8
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "graph", From: "seed", To: "rank", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 4}},
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "graph", From: "seed", To: "rank", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4}},
 		{Name: "contrib", From: "rank", To: "rank",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 4},
-			Feedback:     &v1alpha1.Feedback{Mode: v1alpha1.FeedbackSynchronous, MaxEpochs: supersteps}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackSynchronous, MaxEpochs: supersteps}},
 	})
 	defer stop()
 
 	h.run(h.worker("seed", "seed-0", nil, []string{"graph"}), Handlers{
 		Source: func(ctx context.Context, w *Worker) error { return w.Emit("graph", "only", 1.0) },
 	})
-	// Two pods, one key: the key lands in a single partition, so one of the
-	// two pods never receives a record and spends the whole loop waiting at
-	// the barrier. The barrier cannot advance without it, so its poll rate
-	// sets the pace of every superstep.
 	for _, inst := range []string{"rank-0", "rank-1"} {
 		w := h.worker("rank", inst, []string{"graph", "contrib"}, []string{"contrib"})
 		w.SetFeedback([]string{"contrib"}, []string{"contrib"})
@@ -355,17 +473,14 @@ func TestSynchronousLoopDoesNotStallOnIdlePods(t *testing.T) {
 	}
 	start := time.Now()
 	h.waitComplete("rank")
-	elapsed := time.Since(start)
-	// Comfortably above the ~300ms a superstep costs when the idle pod wakes
-	// promptly, and comfortably below the seconds it costs when it does not.
-	if budget := supersteps * time.Second; elapsed > budget {
-		t.Fatalf("%d supersteps of no real work took %v, over the %v budget: a pod idle at the barrier is sleeping through its release", supersteps, elapsed, budget)
+	if elapsed, budget := time.Since(start), supersteps*time.Second; elapsed > budget {
+		t.Fatalf("%d supersteps took %v, over the %v budget", supersteps, elapsed, budget)
 	}
 }
 
 func TestUnfetchableSegmentFailsInsteadOfHanging(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "s", From: "produce", To: "consume", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 1}},
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "s", From: "produce", To: "consume", Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 1}},
 	})
 	defer stop()
 
@@ -391,9 +506,9 @@ func TestUnfetchableSegmentFailsInsteadOfHanging(t *testing.T) {
 }
 
 func TestLargeRecordsFlushOnBytes(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "big", From: "a", To: "b", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 1}},
-		{Name: "small", From: "a", To: "b", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 1}},
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "big", From: "a", To: "b", Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 1}},
+		{Name: "small", From: "a", To: "b", Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 1}},
 	})
 	defer stop()
 	w := h.worker("a", "a-0", nil, []string{"big", "small"})

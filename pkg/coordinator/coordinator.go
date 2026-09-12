@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 )
 
 // PodTTL is how long a pod may stay silent before it is considered gone.
@@ -161,7 +161,7 @@ type segment struct {
 func (s *segment) key() string { return s.holder + "/" + s.id }
 
 type channel struct {
-	spec v1alpha1.Channel
+	spec graph.Channel
 
 	sealed     bool
 	produced   int64
@@ -196,20 +196,20 @@ func (c *channel) partitions() int { return int(c.spec.Partitioning.Partitions) 
 func (c *channel) external() bool { return c.spec.To == "" }
 
 func (c *channel) broadcast() bool {
-	return c.spec.Partitioning.Mode == v1alpha1.PartitionBroadcast
+	return c.spec.Partitioning.Mode == graph.PartitionBroadcast
 }
 
-func (c *channel) feedbackMode() v1alpha1.FeedbackMode {
+func (c *channel) feedbackMode() graph.FeedbackMode {
 	if c.spec.Feedback == nil {
 		return ""
 	}
-	if c.spec.Feedback.Mode == v1alpha1.FeedbackAsynchronous {
-		return v1alpha1.FeedbackAsynchronous
+	if c.spec.Feedback.Mode == graph.FeedbackAsynchronous {
+		return graph.FeedbackAsynchronous
 	}
-	return v1alpha1.FeedbackSynchronous
+	return graph.FeedbackSynchronous
 }
 
-func (c *channel) synchronous() bool { return c.feedbackMode() == v1alpha1.FeedbackSynchronous }
+func (c *channel) synchronous() bool { return c.feedbackMode() == graph.FeedbackSynchronous }
 
 // Coordinator holds the control-plane state of one workload.
 type Coordinator struct {
@@ -258,7 +258,7 @@ func (co *Coordinator) get(name string) (*channel, error) {
 // Configure declares channels. Existing channels keep their state so the
 // controller can call this on every reconcile; new channels are created and
 // channels absent from the list are left untouched.
-func (co *Coordinator) Configure(specs []v1alpha1.Channel) {
+func (co *Coordinator) Configure(specs []graph.Channel) {
 	co.mu.Lock()
 	defer co.mu.Unlock()
 	for _, s := range specs {
@@ -266,13 +266,13 @@ func (co *Coordinator) Configure(specs []v1alpha1.Channel) {
 			s.Partitioning.Partitions = 1
 		}
 		if s.Partitioning.Mode == "" {
-			s.Partitioning.Mode = v1alpha1.PartitionRoundRobin
+			s.Partitioning.Mode = graph.PartitionRoundRobin
 		}
 		if s.To == "" {
-			s.Durability = v1alpha1.DurabilityRetained
+			s.Durability = graph.DurabilityRetained
 		}
 		if s.Feedback != nil && s.Feedback.Mode == "" {
-			s.Feedback.Mode = v1alpha1.FeedbackSynchronous
+			s.Feedback.Mode = graph.FeedbackSynchronous
 		}
 		if c, ok := co.channels[s.Name]; ok {
 			c.spec = s
@@ -297,10 +297,10 @@ func (co *Coordinator) Configure(specs []v1alpha1.Channel) {
 }
 
 // Topology returns the declared channels.
-func (co *Coordinator) Topology() []v1alpha1.Channel {
+func (co *Coordinator) Topology() []graph.Channel {
 	co.mu.Lock()
 	defer co.mu.Unlock()
-	out := make([]v1alpha1.Channel, 0, len(co.channels))
+	out := make([]graph.Channel, 0, len(co.channels))
 	for _, n := range co.channelNames() {
 		out = append(out, co.channels[n].spec)
 	}
@@ -368,7 +368,7 @@ func (co *Coordinator) Released(podName string) []string {
 	co.expireAll()
 	var out []string
 	for _, c := range co.channels {
-		if c.spec.Durability == v1alpha1.DurabilityRetained {
+		if c.spec.Durability == graph.DurabilityRetained {
 			continue
 		}
 		for k, s := range c.all {
@@ -578,9 +578,9 @@ func (c *channel) enqueue(s *segment) {
 // partitionOf computes the partition of a record the way producer pods do.
 func (c *channel) partitionOf(r Record) int32 {
 	switch c.spec.Partitioning.Mode {
-	case v1alpha1.PartitionBroadcast:
+	case graph.PartitionBroadcast:
 		return 0
-	case v1alpha1.PartitionHash:
+	case graph.PartitionHash:
 		return int32(HashPartition(r.Key, c.partitions()))
 	default:
 		p := int32(c.rr % uint64(c.partitions()))
@@ -698,7 +698,7 @@ func (co *Coordinator) seal(c *channel) {
 func (c *channel) assigned(o *operation, id string) []int {
 	var out []int
 	n := c.partitions()
-	if c.spec.Partitioning.Mode == v1alpha1.PartitionHash {
+	if c.spec.Partitioning.Mode == graph.PartitionHash {
 		o.balanceHash(n)
 		for p := 0; p < n; p++ {
 			if o.owner[ownerKey(n, p)] == id {
@@ -784,7 +784,7 @@ func (c *channel) inflightRecords() int64 {
 func (c *channel) quiet() bool { return c.pending() == 0 && len(c.inflight) == 0 }
 
 func (c *channel) gated() bool {
-	return c.spec.Delivery == v1alpha1.DeliveryMaterialized && !c.sealed
+	return c.spec.Delivery == graph.DeliveryMaterialized && !c.sealed
 }
 
 // Consume returns up to max segments pending on the partitions the pod owns.
@@ -850,7 +850,7 @@ func (co *Coordinator) Consume(name, opName, podName string, max int) (*ConsumeR
 					// The pod is about to process records of this partition
 					// and may keep state derived from them, so its ownership
 					// stops being provisional here.
-					if c.spec.Partitioning.Mode == v1alpha1.PartitionHash {
+					if c.spec.Partitioning.Mode == graph.PartitionHash {
 						o.pinned[ownerKey(c.partitions(), p)] = true
 					}
 					resp.Work = append(resp.Work, work)
@@ -900,7 +900,7 @@ func (co *Coordinator) Ack(name string, acks []SegmentAck) error {
 		} else {
 			s.released = true
 		}
-		if s.released && s.data != nil && c.spec.Durability != v1alpha1.DurabilityRetained {
+		if s.released && s.data != nil && c.spec.Durability != graph.DurabilityRetained {
 			s.data = nil
 			delete(c.all, s.key())
 		}
@@ -969,7 +969,7 @@ func (co *Coordinator) EpochDone(name, podName string, epoch int32) error {
 // with sealed inputs is finished.
 func (co *Coordinator) settle() {
 	for _, c := range co.channels {
-		if c.sealed || c.feedbackMode() != v1alpha1.FeedbackAsynchronous {
+		if c.sealed || c.feedbackMode() != graph.FeedbackAsynchronous {
 			continue
 		}
 		members := co.cycleMembers(c)
@@ -1129,14 +1129,14 @@ func (co *Coordinator) operationMetrics(name string) OperationMetrics {
 						continue
 					}
 					k := c.spec.Name + "/" + fmt.Sprint(p)
-					if c.spec.Partitioning.Mode == v1alpha1.PartitionHash {
+					if c.spec.Partitioning.Mode == graph.PartitionHash {
 						k = "hash/" + ownerKey(c.partitions(), p)
 					}
 					runnable[k] = true
 				}
 			}
 		}
-		if c.spec.Durability != v1alpha1.DurabilityRetained {
+		if c.spec.Durability != graph.DurabilityRetained {
 			for _, s := range c.all {
 				if s.data == nil && !s.released && s.op == name {
 					om.HoldsUnconsumed = true
