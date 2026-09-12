@@ -1,8 +1,9 @@
 package coordinator
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"reflect"
 	"sort"
 	"time"
 
@@ -68,11 +69,17 @@ func sameRecords(a, b []Record) bool {
 		return false
 	}
 	for i := range a {
-		if a[i].Key != b[i].Key || a[i].Epoch != b[i].Epoch || !reflect.DeepEqual(a[i].Value, b[i].Value) {
+		if a[i].Key != b[i].Key || a[i].Epoch != b[i].Epoch || !sameJSONValue(a[i].Value, b[i].Value) {
 			return false
 		}
 	}
 	return true
+}
+
+func sameJSONValue(a, b any) bool {
+	aJSON, aErr := json.Marshal(a)
+	bJSON, bErr := json.Marshal(b)
+	return aErr == nil && bErr == nil && bytes.Equal(aJSON, bJSON)
 }
 
 // SetSubscription creates a named durable cursor. Repeating the same binding

@@ -287,7 +287,7 @@ func TestWorkersExchangeSegmentsDirectly(t *testing.T) {
 	}
 	total := 0
 	for _, r := range recs {
-		total += int(r.Value.(float64))
+		total += int(numberValue(t, r.Value))
 	}
 	if len(recs) != 7 || total != lines {
 		t.Fatalf("totals: %d records summing to %d: %+v", len(recs), total, recs)
@@ -388,7 +388,7 @@ func TestSynchronousLoopRunsSupersteps(t *testing.T) {
 	// Each vertex receives one contribution per epoch after the first
 	// (epochs 1..3); contributions emitted at epoch 3 fall beyond the bound.
 	for _, r := range recs {
-		if r.Value.(float64) != 4 || received[r.Key] != 3 {
+		if numberValue(t, r.Value) != 4 || received[r.Key] != 3 {
 			t.Fatalf("vertex %s: value %v received %d", r.Key, r.Value, received[r.Key])
 		}
 	}
@@ -473,13 +473,26 @@ func combineOutput(t *testing.T, h *harness, channel string) map[string]float64 
 	}
 	out := map[string]float64{}
 	for _, r := range recs {
-		n, ok := r.Value.(float64)
-		if !ok {
-			t.Fatalf("record %q value %v is not a number", r.Key, r.Value)
-		}
-		out[r.Key] = n
+		out[r.Key] = numberValue(t, r.Value)
 	}
 	return out
+}
+
+func numberValue(t *testing.T, value any) float64 {
+	t.Helper()
+	switch number := value.(type) {
+	case float64:
+		return number
+	case json.Number:
+		result, err := number.Float64()
+		if err != nil {
+			t.Fatalf("value %q is not a number: %v", number, err)
+		}
+		return result
+	default:
+		t.Fatalf("value %v is not a number", value)
+		return 0
+	}
 }
 
 // A channel that declares Combine folds records sharing a key before they go

@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,79 @@ import (
 	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/pkg/storage"
 )
+
+func TestHTTPNumbersSurviveDurableRestartAndAppendRetry(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	co, err := NewDurable(ctx, "first:8090", store, "state", "writer-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := co.Configure([]graph.Channel{
+		{Name: "records", Durability: graph.DurabilityRetained},
+		{Name: "events", Durability: graph.DurabilityRetained},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(Handler(co))
+	recordsJSON := `[{"key":"above-safe-integer","value":9007199254740993},{"key":"int64-max","value":9223372036854775807}]`
+	storedRecordsJSON := `[{"key":"above-safe-integer","value":9007199254740993,"epoch":0},{"key":"int64-max","value":9223372036854775807,"epoch":0}]`
+	response, err := http.Post(server.URL+PathChannels+"/records"+SuffixRecords, "application/json", bytes.NewBufferString(recordsJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("produce status = %s", response.Status)
+	}
+	appendJSON := `{"appendId":"lost-response","partition":0,"records":` + recordsJSON + `}`
+	response, err = http.Post(server.URL+PathChannels+"/events"+SuffixAppends, "application/json", bytes.NewBufferString(appendJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Closing without reading models a committed append whose response was lost.
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("append status = %s", response.Status)
+	}
+	server.Close()
+
+	restored, err := NewDurable(ctx, "replacement:8090", store, "state", "writer-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredServer := httptest.NewServer(Handler(restored))
+	defer restoredServer.Close()
+	response, err = http.Post(restoredServer.URL+PathChannels+"/events"+SuffixAppends, "application/json", bytes.NewBufferString(appendJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("HTTP append retry status = %s", response.Status)
+	}
+	restoredRecords, _, err := restored.Records("records", "", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := mustJSON(restoredRecords); got != storedRecordsJSON {
+		t.Fatalf("restored records = %s, want %s", got, storedRecordsJSON)
+	}
+	batch := AppendBatch{AppendID: "lost-response", Records: []Record{
+		{Key: "above-safe-integer", Value: int64(9007199254740993)},
+		{Key: "int64-max", Value: int64(9223372036854775807)},
+	}}
+	if offset, err := restored.Append("events", "", batch); err != nil || offset != 0 {
+		t.Fatalf("append retry offset=%d err=%v", offset, err)
+	}
+	got := mustJSON(restored.channels["events"].history[0][0].data)
+	if got != storedRecordsJSON {
+		t.Fatalf("restored append = %s, want %s", got, storedRecordsJSON)
+	}
+}
 
 func TestDurableCoordinatorRestoresPublicationDeliveryAndExternalRecords(t *testing.T) {
 	ctx := context.Background()

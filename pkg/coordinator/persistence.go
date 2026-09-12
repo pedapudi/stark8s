@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -183,7 +184,9 @@ func (co *Coordinator) snapshot() persistedCoordinator {
 
 func (co *Coordinator) restore(body []byte) error {
 	var in persistedCoordinator
-	if err := json.Unmarshal(body, &in); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&in); err != nil {
 		return fmt.Errorf("decode coordinator state: %w", err)
 	}
 	co.nextID = in.NextID

@@ -94,7 +94,9 @@ func HandlerForGraph(co *Coordinator, graphName string) http.Handler {
 	ch := PathChannels + "/{c}"
 	mux.HandleFunc("POST "+ch+SuffixAppends, func(w http.ResponseWriter, r *http.Request) {
 		var batch AppendBatch
-		if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+		decoder := json.NewDecoder(r.Body)
+		decoder.UseNumber()
+		if err := decoder.Decode(&batch); err != nil {
 			http.Error(w, err.Error(), 400)
 			return
 		}
@@ -197,7 +199,9 @@ func HandlerForGraph(co *Coordinator, graphName string) http.Handler {
 	})
 	mux.HandleFunc("POST "+ch+SuffixRecords, func(w http.ResponseWriter, r *http.Request) {
 		var recs []Record
-		if err := json.NewDecoder(r.Body).Decode(&recs); err != nil {
+		decoder := json.NewDecoder(r.Body)
+		decoder.UseNumber()
+		if err := decoder.Decode(&recs); err != nil {
 			http.Error(w, err.Error(), 400)
 			return
 		}
