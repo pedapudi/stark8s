@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 )
 
 // payload returns n deterministic pseudorandom bytes and their digest. The
@@ -42,7 +42,7 @@ func digestOf(r io.Reader) (string, int64, error) {
 // channel and checks it arrives byte for byte, and that the blob is deleted
 // once the segment carrying its handle is released.
 func TestBlobRoundTrip(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
+	h, stop := newHarness(t, []graph.Channel{
 		{Name: "docs", From: "src", To: "sink"},
 		{Name: "digests", From: "sink"},
 	})
@@ -155,9 +155,9 @@ func blobFiles(t *testing.T, dir string) []string {
 // broadcast record is fetched by every consumer replica, and that it survives
 // until the last of them has acknowledged the carrying segment.
 func TestBlobBroadcastReachesEveryReplica(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
+	h, stop := newHarness(t, []graph.Channel{
 		{Name: "model", From: "trainer", To: "scorer",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionBroadcast}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionBroadcast}},
 		{Name: "seen", From: "scorer"},
 	})
 	defer stop()
@@ -353,9 +353,9 @@ func TestBlobLifetimeAcrossSegments(t *testing.T) {
 // at the bound of an asynchronous loop is discarded with it, rather than
 // staying on disk with nothing left to reference it.
 func TestEmitBlobDroppedAtLoopBound(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
+	h, stop := newHarness(t, []graph.Channel{
 		{Name: "turns", From: "agent", To: "agent",
-			Feedback: &v1alpha1.Feedback{Mode: v1alpha1.FeedbackAsynchronous, MaxEpochs: 1}},
+			Feedback: &graph.Feedback{Mode: graph.FeedbackAsynchronous, MaxEpochs: 1}},
 	})
 	defer stop()
 	w := h.worker("agent", "agent-0", []string{"turns"}, []string{"turns"})
@@ -382,7 +382,7 @@ func TestEmitBlobDroppedAtLoopBound(t *testing.T) {
 // TestEmitBlobRejectsUndeclaredChannel leaves nothing on disk when the emit
 // cannot succeed.
 func TestEmitBlobRejectsUndeclaredChannel(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{{Name: "docs", From: "src", To: "sink"}})
+	h, stop := newHarness(t, []graph.Channel{{Name: "docs", From: "src", To: "sink"}})
 	defer stop()
 	w := h.worker("src", "src-0", nil, []string{"docs"})
 	if err := w.serveSegments(); err != nil {
