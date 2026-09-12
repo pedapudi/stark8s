@@ -41,9 +41,15 @@ spec:
       template: {spec: {containers: [{name: main, image: stark8s:dev, command: ["/wordcount", "reduce"]}]}}
   channels:
     - {name: lines,   from: read,   to: map,    partitioning: {mode: RoundRobin, partitions: 8}, delivery: Pipelined}
-    - {name: shuffle, from: map,    to: reduce, partitioning: {mode: Hash, partitions: 6},       delivery: Materialized}
+    - {name: shuffle, from: map,    to: reduce, partitioning: {mode: Hash, partitions: 6},       delivery: Materialized, combine: Sum}
     - {name: totals,  from: reduce}                # no consumer: read from outside
 ```
+
+`shuffle` declares `combine: Sum`, so `map` folds the counts for a word as it
+buffers and puts one record per distinct word on the wire rather than one per
+occurrence — the map-side half of a reduce-by-key. `Sum`, `Min`, `Max` and
+`Count` are available; `Min` and `Max` are idempotent, so a consumer applying
+them needs no deduplication despite at-least-once delivery.
 
 `map` starts as soon as `read` produces lines and scales on the backlog of
 `lines`. `reduce` is not started until `map` has completed, because
@@ -86,7 +92,9 @@ the generated policies are enforced.
   what this design takes from each.
 - [web/editor.html](web/editor.html) — a single-file graph editor and
   viewer for Workloads that converts to and from the YAML;
-  [web/README.md](web/README.md) describes it.
+  [web/README.md](web/README.md) describes it. The coordinator serves the
+  same file at `/editor`, so a running workload can be watched by
+  port-forwarding to it and opening that address.
 
 ## Layout
 
@@ -96,7 +104,7 @@ the generated policies are enforced.
 | `pkg/controller` | reconciler: Workload to Kubernetes resources |
 | `pkg/coordinator` | the control-plane protocol (`api.go`) and the coordinator server |
 | `pkg/exchange` | the earlier brokered in-memory channel runtime, kept only while `pkg/controller` still imports it |
-| `pkg/sdk` | worker library: local segments, fetch, process, acknowledge, supersteps |
+| `pkg/sdk` | worker library: local segments, fetch, process, acknowledge, supersteps, pass-by-reference payloads (`blob.go`) |
 | `cmd/controller`, `cmd/coordinator` | binaries |
 | `examples/wordcount`, `examples/pagerank` | acyclic and cyclic examples |
 | `config/crd`, `config/manager` | install manifests |
@@ -111,15 +119,28 @@ the generated policies are enforced.
   producing task is not re-executed, so the records are gone. The
   coordinator keeps its index in memory only; restarting it loses the
   segment index and the workload must be resubmitted.
+- How much a producer can hold is `spec.operations[].segments.size`, which
+  sizes the segment volume per pod and requests the matching ephemeral
+  storage. Left unset the volume is a bare `emptyDir` whose capacity is
+  whatever the cluster's defaults allow. Either way a producer that outgrows
+  the space is evicted, losing its segments as above; declaring a size makes
+  the eviction attributable to the operation rather than to the node filling
+  up, but does not prevent it. There is no spill to external storage and no
+  backpressure on a producer that fills the volume.
 - Delivery is at-least-once. A consumer that expires has its unacknowledged
   records redelivered to another replica; application state on the expired
   replica is lost. There is no state checkpointing.
-- Hash partitions are assigned to consumer replicas on first contact and
-  stay there. Adding replicas to a hash-partitioned consumer after all
-  partitions are owned has no effect, so `partitions` should be at least
-  the maximum replica count.
+- Hash partition ownership is provisional until the coordinator hands the
+  owner a segment for that partition, and pinned to it from then on: a
+  replica accumulating state for a partition never loses it to a rebalance,
+  only to its own expiry. Replicas that register later pick up whichever
+  partitions have not been handed work yet, so a consumer whose pods start
+  staggered still spreads over them; a partition already in use does not
+  move, so `partitions` should still be at least the maximum replica count.
 - The graph can be edited while a workload runs (the controller pushes the
   channel list on every pass and creates operations on demand), but
   removing an operation or channel from a running workload is not handled.
-- Vertical scaling emits a VerticalPodAutoscaler only when that API is
-  installed; the local scripts do not install it.
+- Initial vertical sizing emits a VerticalPodAutoscaler only when that API is
+  installed; the local scripts do not install it. Automatic horizontal
+  scaling and automatic vertical updates are disabled while operation state
+  and output remain pod-local.

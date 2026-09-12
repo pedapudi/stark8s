@@ -3,7 +3,7 @@ package coordinator
 import (
 	"testing"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 )
 
 // A Broadcast segment must survive until every replica of the consuming
@@ -18,10 +18,10 @@ import (
 // are about to ask for.
 func TestBroadcastSegmentHeldUntilEveryReplicaAcknowledges(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{{
+	co.Configure([]graph.Channel{{
 		Name: "dict", From: "vocab", To: "extract",
-		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionBroadcast},
-		Delivery:     v1alpha1.DeliveryMaterialized,
+		Partitioning: graph.Partitioning{Mode: graph.PartitionBroadcast},
+		Delivery:     graph.DeliveryMaterialized,
 	}})
 	co.SetOperations([]OperationSpec{{Name: "vocab", Replicas: 1}, {Name: "extract", Replicas: 3}})
 
@@ -78,9 +78,9 @@ func TestBroadcastSegmentHeldUntilEveryReplicaAcknowledges(t *testing.T) {
 // pin that segment for ever waiting for replicas it no longer runs.
 func TestBroadcastReleasedAfterConsumerScalesDown(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{
+	co.Configure([]graph.Channel{
 		{Name: "dict", From: "vocab", To: "extract",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionBroadcast}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionBroadcast}},
 	})
 	co.SetOperations([]OperationSpec{{Name: "extract", Replicas: 3}})
 	register(t, co, "vocab", "vocab-0")
@@ -100,8 +100,8 @@ func TestBroadcastReleasedAfterConsumerScalesDown(t *testing.T) {
 // operation, and looking one up would invent an operation with no name.
 func TestBroadcastWithNoConsumerInventsNoOperation(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{
-		{Name: "out", From: "a", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionBroadcast}},
+	co.Configure([]graph.Channel{
+		{Name: "out", From: "a", Partitioning: graph.Partitioning{Mode: graph.PartitionBroadcast}},
 	})
 	register(t, co, "a", "a-0")
 	// Announcing rather than producing puts a segment on the channel, which

@@ -54,6 +54,22 @@ spec:
                     Channel is a directed information flow between two operations. It is the
                     only kind of edge in the graph.
                   properties:
+                    combine:
+                      description: |-
+                        Combine names a function the producer applies to records sharing a key
+                        before they are put on the wire, so a stage that emits one record per
+                        fact ships one record per key instead. It is the map-side half of a
+                        reduce-by-key: the consumer still aggregates across producers.
+
+                        The function must be associative and commutative, because the producer
+                        applies it to whatever subset of a key's records happen to be buffered
+                        together. Empty means no combining.
+                      enum:
+                      - Sum
+                      - Min
+                      - Max
+                      - Count
+                      type: string
                     delivery:
                       default: Pipelined
                       description: Delivery says when records become visible to the
@@ -163,6 +179,40 @@ spec:
                       - Drain
                       - Never
                       type: string
+                    egress:
+                      description: |-
+                        Egress lists what this operation may reach outside the workload.
+
+                        The default is nothing. Operation pods are otherwise allowed to reach
+                        only the coordinator, DNS, and the segment port of pods in the same
+                        workload, which is what keeps one operation off another operation's
+                        channels. An operation that has to read a feed, call an API or fetch an
+                        identity token says so here, and the grant applies to that operation
+                        alone; its neighbours are unaffected.
+
+                        Declaring it per operation rather than per workload keeps the grant
+                        visible in the graph, so a reader can see which vertices reach outside
+                        and a reviewer sees the widening in the same change as the code that
+                        needs it.
+                      items:
+                        description: |-
+                          EgressRule grants one operation access to one destination outside the
+                          workload.
+
+                          It is a struct holding a single field rather than a bare destination so
+                          that a narrower grant can be expressed later, by adding an explicit CIDR or
+                          a port list here, without changing the shape of anything already written.
+                        properties:
+                          to:
+                            description: To names the destination.
+                            enum:
+                            - Metadata
+                            - Internet
+                            type: string
+                        required:
+                        - to
+                        type: object
+                      type: array
                     name:
                       type: string
                     scaling:
@@ -182,8 +232,8 @@ spec:
                           properties:
                             cpuUtilizationPercent:
                               description: |-
-                                CPUUtilizationPercent creates a HorizontalPodAutoscaler on CPU. Only
-                                applies to operations with completion Never. Zero disables it.
+                                CPUUtilizationPercent is retained for compatibility. Automatic horizontal
+                                scaling is disabled because operation pods may hold local state or output.
                               format: int32
                               type: integer
                             max:
@@ -199,8 +249,9 @@ spec:
                           type: object
                         vertical:
                           description: |-
-                            VerticalScaling requests a VerticalPodAutoscaler for the operation. It is
-                            ignored when the VPA API is not installed in the cluster.
+                            VerticalScaling requests initial resource sizing for a Never operation when
+                            the VerticalPodAutoscaler API is installed. Auto is retained for
+                            compatibility but disabled because it can evict a stateful pod.
                           properties:
                             mode:
                               default: "Off"
@@ -213,11 +264,34 @@ spec:
                               type: string
                           type: object
                       type: object
+                    segments:
+                      description: |-
+                        Segments sizes the local volume this operation's pods keep their
+                        produced segments in. A pod template that declares its own volume named
+                        stark8s-segments sizes it instead, and the two cannot both be set.
+                      properties:
+                        size:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          description: |-
+                            Size is the capacity of the segment volume. The controller sets it as
+                            the volume's sizeLimit and as a floor under the first container's
+                            ephemeral-storage request, which is what the scheduler places the pod
+                            by. No limit is set: a pod's ephemeral-storage limit is charged the
+                            volume together with every container's writable layer and logs, so a
+                            limit equal to Size would evict the pod before the volume filled. A
+                            template whose containers do add up to a limit keeps it, and one that
+                            does not exceed Size is rejected rather than raised.
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                      required:
+                      - size
+                      type: object
                     slots:
                       default: 1
-                      description: |-
-                        Slots is how many partitions one replica processes concurrently. The
-                        controller sizes the replica count as runnable tasks divided by slots.
+                      description: Slots is how many partitions one replica processes
+                        concurrently.
                       format: int32
                       minimum: 1
                       type: integer
@@ -8237,6 +8311,18 @@ spec:
                           - containers
                           type: object
                       type: object
+                    tickInterval:
+                      description: |-
+                        TickInterval makes the operation run on a clock as well as on its
+                        input: every replica calls its Tick handler this often, between passes
+                        over its inbound channels. It suits an operation that polls a feed, a
+                        queue or an API on a schedule while taking what to poll for from a
+                        channel. Leave it unset for an operation driven only by records.
+
+                        The handler runs on the same goroutine as record processing, so this is
+                        a floor on the period rather than a guarantee: a long batch of records
+                        delays the next tick.
+                      type: string
                   required:
                   - name
                   - template
@@ -8253,6 +8339,11 @@ spec:
                   description: ChannelStatus reports one channel, from coordinator
                     metrics.
                   properties:
+                    acknowledged:
+                      description: Acknowledged counts records accepted as processed
+                        by consumers.
+                      format: int64
+                      type: integer
                     epoch:
                       description: Epoch is the current superstep of a Synchronous
                         feedback channel.
@@ -8261,8 +8352,12 @@ spec:
                     inFlight:
                       format: int64
                       type: integer
+                    latestDeliveryFailure:
+                      description: LatestDeliveryFailure preserves the most recent
+                        failed segment fetch.
+                      type: string
                     lost:
-                      description: Lost counts segments whose holder pod expired before
+                      description: Lost counts records whose holder pod expired before
                         consumption.
                       format: int64
                       type: integer
@@ -8300,6 +8395,8 @@ spec:
                         HoldsUnconsumed: the operation's pods still hold segments that a
                         consumer has not fetched, so they are kept after completion.
                       type: boolean
+                    message:
+                      type: string
                     name:
                       type: string
                     phase:
@@ -8308,6 +8405,8 @@ spec:
                     ready:
                       format: int32
                       type: integer
+                    reason:
+                      type: string
                     replicas:
                       format: int32
                       type: integer
@@ -8325,6 +8424,8 @@ spec:
                 type: array
               phase:
                 description: WorkloadPhase is the lifecycle state of the whole graph.
+                type: string
+              reason:
                 type: string
             type: object
         type: object

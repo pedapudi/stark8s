@@ -33,5 +33,5 @@ func main() {
 	}()
 	addr := fmt.Sprintf(":%d", coordinator.ControlPort)
 	log.Printf("coordinator listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, coordinator.Handler(co)))
+	log.Fatal(http.ListenAndServe(addr, coordinator.HandlerForGraph(co, os.Getenv(coordinator.EnvWorkload))))
 }

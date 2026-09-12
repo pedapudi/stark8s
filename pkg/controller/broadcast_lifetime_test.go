@@ -12,6 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/api/v1alpha1"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
@@ -65,10 +66,10 @@ func broadcastStage() *v1alpha1.Workload {
 				{Name: "vocab", Scaling: v1alpha1.Scaling{Horizontal: v1alpha1.HorizontalScaling{Min: 1, Max: 1}}, Template: container()},
 				{Name: "extract", Scaling: v1alpha1.Scaling{Horizontal: v1alpha1.HorizontalScaling{Min: 3, Max: 3}}, Template: container()},
 			},
-			Channels: []v1alpha1.Channel{
+			Channels: []graph.Channel{
 				{Name: "dict", From: "vocab", To: "extract",
-					Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionBroadcast},
-					Delivery:     v1alpha1.DeliveryMaterialized},
+					Partitioning: graph.Partitioning{Mode: graph.PartitionBroadcast},
+					Delivery:     graph.DeliveryMaterialized},
 			},
 		},
 	}
