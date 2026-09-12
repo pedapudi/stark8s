@@ -3,12 +3,16 @@
 `editor.html` is a single HTML file, with its style sheet and script
 inline, that builds, edits, and views a stark8s Workload as a graph. It
 converts between the drawing and the Workload YAML in both directions. It
-has no build step, loads no library, fetches no font, and makes no network
-request, so it runs under a strict content security policy.
+has no build step, loads no library, and fetches no font.
+
+The coordinator serves the same file, and a page served that way reads the
+running workload from the coordinator it came from. Those are the only
+requests the page makes, they are same-origin GETs, and a page opened any
+other way makes none at all.
 
 ## Opening it
 
-The file works from any of three places.
+The file works from any of four places.
 
 - Open `web/editor.html` directly in a browser from the file system.
 - Serve the `web` directory with any static file server and open
@@ -16,9 +20,50 @@ The file works from any of three places.
 - Publish the file as a hosted page. Downloads may be blocked on some
   hosts; the "copy yaml" control copies the document to the clipboard for
   that case.
+- Ask a running workload's coordinator for it, which also shows that
+  workload live. See Watching a running workload below.
 
 Appending `?selftest` to the address runs the round-trip check inside the
 page (see Testing below).
+
+## Watching a running workload
+
+The coordinator embeds this file and serves it at `/editor`, so viewing a
+workload that is running needs no script and no file on disk:
+
+```sh
+kubectl port-forward svc/<workload>-coordinator 8080:8080
+```
+
+then open `http://127.0.0.1:8080/editor`.
+
+The page reads `GET /topology` once to draw the graph and polls
+`GET /metrics` every two seconds to refresh the overlay. It only ever
+reads. Nothing is written back, and no request the page makes can change
+the workload.
+
+Whether a coordinator is there is detected rather than configured: the
+page tries the two addresses relative to where it was served from, and a
+failure of either leaves it exactly as it would be opened from a file. So
+the same file is both the offline editor and the live viewer.
+
+What the coordinator can and cannot tell you is worth stating, because the
+overlay shows less this way than a pasted `kubectl` document does. The
+coordinator holds the channel graph and the counters, so every channel
+mark is exact. It does not hold the pod templates, the scaling bounds, or
+the workload's name, so an operation drawn from the coordinator carries
+its name and nothing else. It has no notion of a phase either, so no phase
+glyph is drawn. What it does know about an operation is the number of pods
+registered with it, which is neither the replica count the controller
+asked for nor Kubernetes readiness, and is labelled `live` for that
+reason.
+
+Editing still works on a page served this way. The graph is loaded once,
+at connect, and only when the page has nothing else open; the poll after
+that touches the overlay alone and never rewrites the document. Pressing
+"load graph" replaces the document with the coordinator's view on
+purpose. Pasting into the status pane takes precedence over the live feed
+until the pane is cleared.
 
 ## What the page shows
 
@@ -63,6 +108,8 @@ names it; the table below is the same vocabulary.
 | circle with a centre bar | edge end | external consumer: records are read through the exchange API |
 | empty ring, dotted ring, tick, cross | node, from observed status | phase Waiting, Running, Succeeded, Failed |
 | `ready/replicas` text in the node's second line | node, from observed status | ready and total replicas |
+| `N live` text in the node's second line | node, from a coordinator | pods registered with the coordinator and not expired; not a replica count and not readiness |
+| `N runnable`, `complete` text in the node's second line | node, from a coordinator | partitions with pending input, and whether every inbound channel is drained and every pod has reported done |
 | `pending · inflight · produced · epoch` text under an edge | edge, from observed status | the channel's counters |
 | chevron at the consumer end | edge | direction of flow |
 | accent line down a node's left edge, name in full ink | node | the selected operation |
