@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 )
 
 var segSeq int64
@@ -83,9 +83,9 @@ func operationMetrics(co *Coordinator, name string) OperationMetrics {
 
 func TestMaterializedGatesUntilSealed(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{{Name: "s", From: "a", To: "b",
-		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 4},
-		Delivery:     v1alpha1.DeliveryMaterialized}})
+	co.Configure([]graph.Channel{{Name: "s", From: "a", To: "b",
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4},
+		Delivery:     graph.DeliveryMaterialized}})
 	register(t, co, "b", "b-0")
 	announce(t, co, "s", "a", "a-0", 1, 0, 2)
 	if err := co.Announce("s", "zzz", []SegmentAnnouncement{{ID: "x", Records: 1}}); err == nil {
@@ -109,9 +109,9 @@ func TestMaterializedGatesUntilSealed(t *testing.T) {
 
 func TestHashChannelsIntoOneOperationAreCoPartitioned(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{
-		{Name: "left", From: "a", To: "join", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 8}},
-		{Name: "right", From: "b", To: "join", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 8}},
+	co.Configure([]graph.Channel{
+		{Name: "left", From: "a", To: "join", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 8}},
+		{Name: "right", From: "b", To: "join", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 8}},
 	})
 	pods := []string{"j-0", "j-1", "j-2"}
 	for _, p := range pods {
@@ -166,8 +166,8 @@ func TestExpiredConsumerRedelivers(t *testing.T) {
 	co := New("self:8090")
 	now := time.Now()
 	co.now = func() time.Time { return now }
-	co.Configure([]v1alpha1.Channel{{Name: "s", From: "a", To: "b",
-		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 2}}})
+	co.Configure([]graph.Channel{{Name: "s", From: "a", To: "b",
+		Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 2}}})
 	register(t, co, "a", "a-0")
 	register(t, co, "b", "dead")
 	announce(t, co, "s", "a", "a-0", 0, 0, 1)
@@ -195,8 +195,8 @@ func TestExpiredHolderLosesSegmentsWithoutBlocking(t *testing.T) {
 	co := New("self:8090")
 	now := time.Now()
 	co.now = func() time.Time { return now }
-	co.Configure([]v1alpha1.Channel{{Name: "s", From: "a", To: "b",
-		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 2}}})
+	co.Configure([]graph.Channel{{Name: "s", From: "a", To: "b",
+		Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 2}}})
 	register(t, co, "a", "a-0")
 	register(t, co, "b", "b-0")
 	announce(t, co, "s", "a", "a-0", 0, 0, 4)
@@ -231,14 +231,14 @@ func TestExpiredHolderLosesSegmentsWithoutBlocking(t *testing.T) {
 
 func TestSynchronousBarrierAndTermination(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{{Name: "fb", From: "r", To: "r",
-		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2},
-		Feedback:     &v1alpha1.Feedback{MaxEpochs: 3}}})
+	co.Configure([]graph.Channel{{Name: "fb", From: "r", To: "r",
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2},
+		Feedback:     &graph.Feedback{MaxEpochs: 3}}})
 	register(t, co, "r", "r-0")
 	// Epoch-1 segments are held while epoch 0 is current.
 	announce(t, co, "fb", "r", "r-0", 0, 1, 1)
 	n, resp := drain(t, co, "fb", "r", "r-0")
-	if n != 0 || !resp.Quiescent || resp.Epoch != 0 || resp.Mode != v1alpha1.FeedbackSynchronous {
+	if n != 0 || !resp.Quiescent || resp.Epoch != 0 || resp.Mode != graph.FeedbackSynchronous {
 		t.Fatalf("epoch 0: n=%d resp=%+v", n, resp)
 	}
 	if m := channelMetrics(co, "fb"); m.Pending != 1 {
@@ -275,9 +275,9 @@ func TestSynchronousBarrierAndTermination(t *testing.T) {
 
 func TestSynchronousBarrierWaitsForEveryPod(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{{Name: "fb", From: "r", To: "r",
-		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2},
-		Feedback:     &v1alpha1.Feedback{MaxEpochs: 2}}})
+	co.Configure([]graph.Channel{{Name: "fb", From: "r", To: "r",
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2},
+		Feedback:     &graph.Feedback{MaxEpochs: 2}}})
 	register(t, co, "r", "r-0")
 	register(t, co, "r", "r-1")
 	drain(t, co, "fb", "r", "r-0")
@@ -292,13 +292,225 @@ func TestSynchronousBarrierWaitsForEveryPod(t *testing.T) {
 	}
 }
 
+func TestFiniteEpochWaitsForIntendedProducerRegistration(t *testing.T) {
+	co := New("coordinator:8090")
+	co.Configure([]graph.Channel{{Name: "loop", From: "step", To: "step", Delivery: graph.DeliveryMaterialized,
+		Feedback: &graph.Feedback{Mode: graph.FeedbackSynchronous, MaxEpochs: 2}}})
+	co.SetOperations([]OperationSpec{{Name: "step", Replicas: 2}})
+	if err := co.Register(PodRegistration{Operation: "step", Pod: "step-0"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.OperationEpochDone("step", "step-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := co.Consume("loop", "step", "step-0", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Epoch != 0 {
+		t.Fatalf("advanced before the second intended producer registered: %+v", resp)
+	}
+	if err := co.Register(PodRegistration{Operation: "step", Pod: "step-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.OperationEpochDone("step", "step-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	resp, _ = co.Consume("loop", "step", "step-0", 10)
+	if resp.Epoch != 1 || !resp.ProductionClosed {
+		t.Fatalf("epoch 1 did not open after both producers finished: %+v", resp)
+	}
+}
+
+func TestMaterializedEpochOpensBeforeQueuedRecordsDrain(t *testing.T) {
+	co := New("coordinator:8090")
+	co.Configure([]graph.Channel{
+		{Name: "input", To: "produce"},
+		{Name: "batch", From: "produce", To: "consume", Delivery: graph.DeliveryMaterialized},
+		{Name: "feedback", From: "consume", To: "produce", Feedback: &graph.Feedback{MaxEpochs: 2}},
+	})
+	co.SetOperations([]OperationSpec{{Name: "produce", Replicas: 1}})
+	_ = co.Register(PodRegistration{Operation: "produce", Pod: "produce-0"})
+	if err := co.Produce("batch", "produce", []Record{{Key: "queued", Epoch: 0}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.Seal("input"); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.OperationEpochDone("produce", "produce-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := co.Consume("batch", "consume", "consume-0", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.ProductionClosed || len(resp.Work) != 1 || resp.Drained {
+		t.Fatalf("materialized input waited for queued acknowledgements: %+v", resp)
+	}
+}
+
+func TestFiniteEpochProgressPropagatesThroughThreeOperationsAndEmptyOutput(t *testing.T) {
+	co := New("coordinator:8090")
+	co.Configure([]graph.Channel{
+		{Name: "initial", To: "first"},
+		{Name: "first-second", From: "first", To: "second", Delivery: graph.DeliveryMaterialized},
+		{Name: "second-third", From: "second", To: "third", Delivery: graph.DeliveryMaterialized},
+		{Name: "feedback", From: "third", To: "first", Delivery: graph.DeliveryMaterialized, Feedback: &graph.Feedback{MaxEpochs: 3}},
+	})
+	for _, op := range []string{"first", "second", "third"} {
+		co.SetOperations([]OperationSpec{{Name: op, Replicas: 1}})
+		_ = co.Register(PodRegistration{Operation: op, Pod: op + "-0"})
+	}
+	if err := co.Seal("initial"); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.OperationEpochDone("first", "first-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := co.Consume("first-second", "second", "second-0", 10); !resp.Quiescent {
+		t.Fatalf("first edge did not close empty epoch: %+v", resp)
+	}
+	if err := co.OperationEpochDone("second", "second-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := co.Consume("second-third", "third", "third-0", 10); !resp.Quiescent {
+		t.Fatalf("second edge did not close empty epoch: %+v", resp)
+	}
+	if err := co.OperationEpochDone("third", "third-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := co.Consume("feedback", "first", "first-0", 10); resp.Epoch != 1 || !resp.Quiescent {
+		t.Fatalf("feedback did not increment the epoch: %+v", resp)
+	}
+}
+
+func TestFiniteEpochProgressPropagatesThroughTwoOperationCycle(t *testing.T) {
+	co := New("coordinator:8090")
+	co.Configure([]graph.Channel{
+		{Name: "forward", From: "first", To: "second"},
+		{Name: "feedback", From: "second", To: "first", Feedback: &graph.Feedback{MaxEpochs: 2}},
+	})
+	for _, op := range []string{"first", "second"} {
+		co.SetOperations([]OperationSpec{{Name: op, Replicas: 1}})
+		_ = co.Register(PodRegistration{Operation: op, Pod: op + "-0"})
+	}
+	if err := co.OperationEpochDone("first", "first-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := co.Consume("forward", "second", "second-0", 10); !resp.Quiescent {
+		t.Fatalf("forward edge did not close: %+v", resp)
+	}
+	if err := co.OperationEpochDone("second", "second-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := co.Consume("feedback", "first", "first-0", 10); resp.Epoch != 1 || !resp.Quiescent {
+		t.Fatalf("feedback edge did not advance: %+v", resp)
+	}
+}
+
+func TestExpiredWorkerKeepsEpochObligationUntilReplacementFinishes(t *testing.T) {
+	co := New("coordinator:8090")
+	now := time.Unix(100, 0)
+	co.now = func() time.Time { return now }
+	co.Configure([]graph.Channel{{Name: "loop", From: "step", To: "step", Feedback: &graph.Feedback{MaxEpochs: 2}}})
+	co.SetOperations([]OperationSpec{{Name: "step", Replicas: 2}})
+	_ = co.Register(PodRegistration{Operation: "step", Pod: "step-0"})
+	_ = co.Register(PodRegistration{Operation: "step", Pod: "step-1"})
+	if err := co.OperationEpochDone("step", "step-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(PodTTL + time.Second)
+	_ = co.Register(PodRegistration{Operation: "step", Pod: "step-0"})
+	co.Metrics() // expires step-1 without removing the intended replica count
+	if resp, _ := co.Consume("loop", "step", "step-0", 10); resp.Epoch != 0 {
+		t.Fatalf("worker loss erased an unfinished progress obligation: %+v", resp)
+	}
+	_ = co.Register(PodRegistration{Operation: "step", Pod: "step-1"})
+	if err := co.OperationEpochDone("step", "step-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := co.Consume("loop", "step", "step-0", 10); resp.Epoch != 1 {
+		t.Fatalf("replacement did not satisfy the preserved obligation: %+v", resp)
+	}
+}
+
+func TestFiniteEpochSourceClosureWaitsForStaggeredHashProducers(t *testing.T) {
+	co := New("coordinator:8090")
+	co.Configure([]graph.Channel{
+		{Name: "batch", From: "source", To: "step", Delivery: graph.DeliveryMaterialized,
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2}},
+		{Name: "feedback", From: "step", To: "step", Feedback: &graph.Feedback{MaxEpochs: 2}},
+	})
+	co.SetOperations([]OperationSpec{{Name: "source", Replicas: 2}, {Name: "step", Replicas: 1}})
+	_ = co.Register(PodRegistration{Operation: "source", Pod: "source-0"})
+	if err := co.SourceDone(PodRegistration{Operation: "source", Pod: "source-0"}); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := co.Consume("batch", "step", "step-0", 10); resp.ProductionClosed {
+		t.Fatalf("source epoch closed before the second intended producer registered: %+v", resp)
+	}
+	_ = co.Register(PodRegistration{Operation: "source", Pod: "source-1"})
+	if err := co.SourceDone(PodRegistration{Operation: "source", Pod: "source-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := co.Consume("batch", "step", "step-0", 10); !resp.ProductionClosed || !resp.Quiescent {
+		t.Fatalf("source epoch did not close after both producers finished: %+v", resp)
+	}
+}
+
+func TestOperationEpochDoneRetryAfterAdvanceIsIdempotent(t *testing.T) {
+	co := New("coordinator:8090")
+	co.Configure([]graph.Channel{{Name: "loop", From: "step", To: "step", Feedback: &graph.Feedback{MaxEpochs: 3}}})
+	co.SetOperations([]OperationSpec{{Name: "step", Replicas: 2}})
+	for _, pod := range []string{"step-0", "step-1"} {
+		_ = co.Register(PodRegistration{Operation: "step", Pod: pod})
+	}
+	if err := co.OperationEpochDone("step", "step-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.OperationEpochDone("step", "step-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.OperationEpochDone("step", "step-1", 0); err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	if resp, _ := co.Consume("loop", "step", "step-0", 10); resp.Epoch != 1 {
+		t.Fatalf("retry advanced the epoch again: %+v", resp)
+	}
+}
+
+func TestFiniteNonFeedbackChannelRejectsPriorEpochAnnouncement(t *testing.T) {
+	co := New("coordinator:8090")
+	co.Configure([]graph.Channel{
+		{Name: "forward", From: "first", To: "second"},
+		{Name: "feedback", From: "second", To: "first", Feedback: &graph.Feedback{MaxEpochs: 3}},
+	})
+	co.SetOperations([]OperationSpec{{Name: "first", Replicas: 1}, {Name: "second", Replicas: 1}})
+	for _, op := range []string{"first", "second"} {
+		_ = co.Register(PodRegistration{Operation: op, Pod: op + "-0"})
+	}
+	if err := co.OperationEpochDone("first", "first-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.OperationEpochDone("second", "second-0", 0); err != nil {
+		t.Fatal(err)
+	}
+	err := co.Announce("forward", "first", []SegmentAnnouncement{{ID: "late", Holder: "first:8090", Epoch: 0, Records: 1}})
+	if err == nil {
+		t.Fatal("prior-epoch segment was accepted on a finite non-feedback channel")
+	}
+	if metrics := co.Metrics(); metrics.Channels[1].Pending != 0 {
+		t.Fatalf("rejected segment became pending: %+v", metrics.Channels)
+	}
+}
+
 func TestAsynchronousLoopDeliversImmediatelyAndTerminates(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{
-		{Name: "in", From: "src", To: "agent", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2}},
+	co.Configure([]graph.Channel{
+		{Name: "in", From: "src", To: "agent", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2}},
 		{Name: "loop", From: "agent", To: "agent",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2},
-			Feedback:     &v1alpha1.Feedback{Mode: v1alpha1.FeedbackAsynchronous, MaxEpochs: 3, Overflow: "spill"}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackAsynchronous, MaxEpochs: 3, Overflow: "spill"}},
 		{Name: "spill", From: "agent"},
 	})
 	register(t, co, "src", "src-0")
@@ -309,7 +521,7 @@ func TestAsynchronousLoopDeliversImmediatelyAndTerminates(t *testing.T) {
 	announce(t, co, "loop", "agent", "ag-0", 0, 1, 1)
 	announce(t, co, "loop", "agent", "ag-0", 1, 2, 1)
 	resp, _ := co.Consume("loop", "agent", "ag-0", 10)
-	if resp.Mode != v1alpha1.FeedbackAsynchronous || resp.MaxEpochs != 3 || resp.Quiescent {
+	if resp.Mode != graph.FeedbackAsynchronous || resp.MaxEpochs != 3 || resp.Quiescent {
 		t.Fatalf("async consume: %+v", resp)
 	}
 	got := 0
@@ -355,8 +567,8 @@ func TestAsynchronousLoopDeliversImmediatelyAndTerminates(t *testing.T) {
 
 func TestBroadcastDeliversToEveryPod(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{
-		{Name: "bc", From: "a", To: "b", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionBroadcast}},
+	co.Configure([]graph.Channel{
+		{Name: "bc", From: "a", To: "b", Partitioning: graph.Partitioning{Mode: graph.PartitionBroadcast}},
 	})
 	register(t, co, "a", "a-0")
 	register(t, co, "b", "b-0")
@@ -381,8 +593,8 @@ func TestBroadcastDeliversToEveryPod(t *testing.T) {
 
 func TestExternalProduceAndKeyFilteredLongPoll(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{
-		{Name: "in", To: "w", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 4}},
+	co.Configure([]graph.Channel{
+		{Name: "in", To: "w", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4}},
 		{Name: "out", From: "w"},
 	})
 	register(t, co, "w", "w-0")
@@ -451,10 +663,10 @@ func TestHoldsUnconsumedAndCompleteTransitions(t *testing.T) {
 	co := New("self:8090")
 	now := time.Now()
 	co.now = func() time.Time { return now }
-	co.Configure([]v1alpha1.Channel{
-		{Name: "s", From: "src", To: "b", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 2}},
-		{Name: "kept", From: "src", To: "c", Durability: v1alpha1.DurabilityRetained,
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 1}},
+	co.Configure([]graph.Channel{
+		{Name: "s", From: "src", To: "b", Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 2}},
+		{Name: "kept", From: "src", To: "c", Durability: graph.DurabilityRetained,
+			Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 1}},
 	})
 	register(t, co, "src", "src-0")
 	register(t, co, "src", "src-1")
@@ -523,8 +735,8 @@ func TestPendingByPartitionAndHTTPRoundTrip(t *testing.T) {
 	co := New("self:8090")
 	srv := httptest.NewServer(Handler(co))
 	defer srv.Close()
-	body, _ := json.Marshal([]v1alpha1.Channel{{Name: "s", From: "a", To: "b",
-		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 3}}})
+	body, _ := json.Marshal([]graph.Channel{{Name: "s", From: "a", To: "b",
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 3}}})
 	req, _ := http.NewRequest("PUT", srv.URL+PathTopology, bytesReader(body))
 	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != 204 {
 		t.Fatalf("topology: %v %v", err, resp)
@@ -560,3 +772,71 @@ func TestPendingByPartitionAndHTTPRoundTrip(t *testing.T) {
 }
 
 func bytesReader(b []byte) *bytes.Reader { return bytes.NewReader(b) }
+
+func TestHashPartitionsRebalanceOntoLatePods(t *testing.T) {
+	co := New("self:8090")
+	co.Configure([]graph.Channel{{Name: "s", From: "a", To: "b",
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4}}})
+	// One replica of the consumer is ready before the others and polls an
+	// empty channel, as happens whenever pods start staggered.
+	register(t, co, "b", "b-0")
+	if _, err := co.Consume("s", "b", "b-0", 10); err != nil {
+		t.Fatal(err)
+	}
+	pods := []string{"b-0", "b-1", "b-2", "b-3"}
+	for _, id := range pods[1:] {
+		register(t, co, "b", id)
+	}
+	for p := int32(0); p < 4; p++ {
+		announce(t, co, "s", "a", "a-0", p, 0, 1)
+	}
+	got := map[string]int64{}
+	for _, id := range pods {
+		if n, _ := drain(t, co, "s", "b", id); n > 0 {
+			got[id] = n
+		}
+	}
+	if len(got) != 4 {
+		t.Fatalf("4 partitions over 4 replicas reached %d of them (%v): partitions taken before the other replicas registered are never revisited", len(got), got)
+	}
+}
+
+func TestHashPartitionStaysWithTheOwnerThatProcessedIt(t *testing.T) {
+	co := New("self:8090")
+	co.Configure([]graph.Channel{{Name: "s", From: "a", To: "b",
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4}}})
+	register(t, co, "b", "b-0")
+	announce(t, co, "s", "a", "a-0", 2, 0, 1)
+	if n, _ := drain(t, co, "s", "b", "b-0"); n != 1 {
+		t.Fatalf("first consumer got %d records, want 1", n)
+	}
+	for _, id := range []string{"b-1", "b-2", "b-3"} {
+		register(t, co, "b", id)
+	}
+	// b-0 may hold state derived from partition 2, so partition 2 must keep
+	// going to b-0 however many replicas appear and however often the
+	// assignment is recomputed.
+	for round := 0; round < 3; round++ {
+		announce(t, co, "s", "a", "a-0", 2, 0, 1)
+		for _, id := range []string{"b-1", "b-2", "b-3", "b-0"} {
+			n, _ := drain(t, co, "s", "b", id)
+			if n > 0 && id != "b-0" {
+				t.Fatalf("round %d: partition 2 migrated to %s after b-0 processed it", round, id)
+			}
+		}
+	}
+	// The other three partitions carry no state anywhere, so they are free
+	// to move onto the replicas that arrived late.
+	for p := int32(0); p < 4; p++ {
+		announce(t, co, "s", "a", "a-0", p, 0, 1)
+	}
+	owners := map[string]bool{}
+	for _, id := range []string{"b-0", "b-1", "b-2", "b-3"} {
+		if n, _ := drain(t, co, "s", "b", id); n > 0 {
+			owners[id] = true
+		}
+	}
+	if len(owners) != 4 {
+		t.Fatalf("4 partitions spread over %d replicas: %v", len(owners), owners)
+	}
+}

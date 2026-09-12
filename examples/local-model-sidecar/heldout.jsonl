@@ -1,0 +1,2 @@
+{"id":"brief-rivers","prompt":"Write five words about rivers","constraints":{"includes":["rivers"],"excludes":["ocean"]}}
+{"id":"brief-forests","prompt":"Write five words about forests","constraints":{"includes":["forests"],"excludes":["desert"]}}

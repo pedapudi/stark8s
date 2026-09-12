@@ -160,7 +160,9 @@ or by a bridging operation, to the outer Workload's channels.
 NetworkPolicy from the topology: an operation's pods may reach only the
 coordinator and the segment servers of the operations that produce for them,
 and the coordinator authorises per channel which operation may produce and
-which may consume. A search tool cannot post to the calculator's channel,
+which may consume. An operation that has to reach outside the workload, to
+call a model API or fetch an identity token, declares that in its `egress`
+field, and the grant applies to that operation alone. A search tool cannot post to the calculator's channel,
 and an agent cannot read another agent's inbound channel, because those
 edges are absent from the graph. Each operation runs under its own service
 account with its own secrets, so a tool that holds a credential does not

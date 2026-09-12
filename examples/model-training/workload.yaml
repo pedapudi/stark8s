@@ -1,0 +1,81 @@
+# Group-relative training with a caller-provided local model backend.
+#
+#   prompts -> rollout -> reward -> advantage -> learner
+#                  ^                              |
+#                  +---------- weights -----------+
+#
+# The weights channel carries checkpoint references. The model and checkpoint
+# directories are supplied through the model-training-data claim.
+apiVersion: stark8s.io/v1alpha1
+kind: Workload
+metadata:
+  name: model-training
+spec:
+  operations:
+    - name: prompts
+      template:
+        spec:
+          containers:
+            - {name: main, image: "stark8s:dev", imagePullPolicy: IfNotPresent, command: ["/model-training", "prompts"]}
+    - name: rollout
+      slots: 1
+      scaling: {horizontal: {min: 2, max: 2}}
+      template:
+        spec:
+          containers:
+            - {name: main, image: "stark8s:dev", imagePullPolicy: IfNotPresent, command: ["/model-training", "-generator=http://127.0.0.1:8100", "rollout"]}
+            - name: model
+              image: model-sidecar:local
+              imagePullPolicy: IfNotPresent
+              command: ["python3", "/work/server.py"]
+              env:
+                - {name: BACKEND_MODULE, value: model_backend}
+                - {name: MODEL_PATH, value: /data/model}
+                - {name: CHECKPOINT_DIR, value: /data/checkpoints}
+                - {name: PORT, value: "8100"}
+              volumeMounts: [{name: data, mountPath: /data}]
+          volumes: [{name: data, persistentVolumeClaim: {claimName: model-training-data}}]
+    - name: reward
+      slots: 1
+      scaling: {horizontal: {min: 2, max: 2}}
+      template:
+        spec:
+          containers:
+            - {name: main, image: "stark8s:dev", imagePullPolicy: IfNotPresent, command: ["/model-training", "reward"]}
+    - name: advantage
+      slots: 1
+      scaling: {horizontal: {min: 2, max: 2}}
+      template:
+        spec:
+          containers:
+            - {name: main, image: "stark8s:dev", imagePullPolicy: IfNotPresent, command: ["/model-training", "advantage"]}
+    - name: learner
+      slots: 1
+      scaling: {horizontal: {min: 1, max: 1}}
+      template:
+        spec:
+          containers:
+            - {name: main, image: "stark8s:dev", imagePullPolicy: IfNotPresent, command: ["/model-training", "-trainer=http://127.0.0.1:8200", "learner"]}
+            - name: model
+              image: model-sidecar:local
+              imagePullPolicy: IfNotPresent
+              command: ["python3", "/work/server.py"]
+              env:
+                - {name: BACKEND_MODULE, value: model_backend}
+                - {name: MODEL_PATH, value: /data/model}
+                - {name: CHECKPOINT_DIR, value: /data/checkpoints}
+                - {name: PORT, value: "8200"}
+              volumeMounts: [{name: data, mountPath: /data}]
+          volumes: [{name: data, persistentVolumeClaim: {claimName: model-training-data}}]
+  channels:
+    - {name: batch, from: prompts, to: rollout, partitioning: {mode: Hash, partitions: 8}}
+    - {name: completions, from: rollout, to: reward, partitioning: {mode: RoundRobin, partitions: 8}}
+    - {name: scored, from: reward, to: advantage, partitioning: {mode: Hash, partitions: 8}}
+    - {name: advantages, from: advantage, to: learner, partitioning: {mode: Hash, partitions: 1}}
+    - name: weights
+      from: learner
+      to: rollout
+      partitioning: {mode: Broadcast, partitions: 1}
+      feedback: {mode: Asynchronous, maxEpochs: 30}
+    - {name: metrics, from: learner, durability: Retained}
+    - {name: eval, from: rollout, durability: Retained}
