@@ -206,9 +206,10 @@ func TestGraphTrainsAgainstAStubModel(t *testing.T) {
 		handlers("learner", testCfg, model, model))
 
 	deadline := time.Now().Add(120 * time.Second)
+	wantLoads := (testSteps - 1) * 2
 	for time.Now().Before(deadline) {
 		model.mu.Lock()
-		done := model.trained >= testSteps
+		done := model.trained >= testSteps && len(model.loaded) >= wantLoads
 		model.mu.Unlock()
 		if done {
 			break
@@ -228,8 +229,8 @@ func TestGraphTrainsAgainstAStubModel(t *testing.T) {
 	// Every rollout replica loaded every checkpoint but the dropped one, which
 	// is what proves the Broadcast feedback edge carried the reference and
 	// that the rollout acted on it.
-	if want := (testSteps - 1) * 2; len(loaded) != want {
-		t.Errorf("checkpoint loads = %d, want %d (%v)", len(loaded), want, loaded)
+	if len(loaded) != wantLoads {
+		t.Errorf("checkpoint loads = %d, want %d (%v)", len(loaded), wantLoads, loaded)
 	}
 
 	recs, _, err := r.co.Records("metrics", "", 0, 0)

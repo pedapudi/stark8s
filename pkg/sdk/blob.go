@@ -105,8 +105,14 @@ func (r Record) Blob() (BlobHandle, bool) {
 // the lifetime rule at the top of this file.
 //
 // EmitBlob reads r to EOF before it returns. It does not close r.
+// Durable segments reject blob handles because the referenced payload remains
+// on one pod. Store the payload durably and emit an application-owned reference
+// when the surrounding segment is durable.
 func (w *Worker) EmitBlob(channel, key string, r io.Reader) error {
 	w.init()
+	if w.DurableSegments != nil {
+		return errors.New("EmitBlob cannot write to durable segments because blob payloads are pod-local; store the payload durably and emit its application-owned reference")
+	}
 	// Validate the channel before writing anything, so a misspelled name does
 	// not leave a file behind.
 	if _, err := w.spec(channel); err != nil {
@@ -237,16 +243,28 @@ func (s *segmentStore) writeBlob(instance string, r io.Reader) (string, int64, e
 	s.mu.Lock()
 	s.seq++
 	id := fmt.Sprintf("%s-%d-%d", instance, time.Now().UnixNano(), s.seq)
+	used, limit := s.usedBytes, s.maxBytes
+	remaining := limit - used
 	s.mu.Unlock()
+	if limit > 0 && remaining <= 0 {
+		return "", 0, fmt.Errorf("%w: %d of %d bytes used", errStorageCapacity, used, limit)
+	}
 
 	tmp := s.blobPath(id) + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return "", 0, err
 	}
-	n, err := io.Copy(f, r)
+	reader := r
+	if limit > 0 {
+		reader = io.LimitReader(r, remaining+1)
+	}
+	n, err := io.Copy(f, reader)
 	if cerr := f.Close(); err == nil {
 		err = cerr
+	}
+	if err == nil && limit > 0 && n > remaining {
+		err = fmt.Errorf("%w: blob needs more than %d available bytes at %d of %d bytes", errStorageCapacity, remaining, used, limit)
 	}
 	if err == nil {
 		err = os.Rename(tmp, s.blobPath(id))
@@ -257,6 +275,7 @@ func (s *segmentStore) writeBlob(instance string, r io.Reader) (string, int64, e
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.usedBytes += n
 	if s.blobs == nil {
 		s.blobs = map[string]*blobRef{}
 	}
@@ -306,7 +325,7 @@ func (s *segmentStore) releaseBlobs(segment string) {
 	}
 	s.mu.Unlock()
 	for _, id := range dead {
-		_ = os.Remove(s.blobPath(id))
+		s.removeBlobFile(id)
 	}
 }
 
@@ -316,7 +335,18 @@ func (s *segmentStore) dropBlob(id string) {
 	s.mu.Lock()
 	delete(s.blobs, id)
 	s.mu.Unlock()
-	_ = os.Remove(s.blobPath(id))
+	s.removeBlobFile(id)
+}
+
+func (s *segmentStore) removeBlobFile(id string) {
+	path := s.blobPath(id)
+	info, err := os.Stat(path)
+	if err != nil || os.Remove(path) != nil {
+		return
+	}
+	s.mu.Lock()
+	s.usedBytes -= info.Size()
+	s.mu.Unlock()
 }
 
 // serveBlob streams a blob from disk. It never reads the payload into memory.

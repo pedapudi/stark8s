@@ -34,8 +34,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -43,6 +45,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -68,7 +71,8 @@ const (
 	LabelRole      = "stark8s.io/role"
 	// LabelChannel is set on per-edge NetworkPolicies so that policies for
 	// channels removed from the spec can be found and deleted.
-	LabelChannel = "stark8s.io/channel"
+	LabelChannel    = "stark8s.io/channel"
+	LabelCollective = "stark8s.io/collective-operation"
 
 	RoleOperation   = "operation"
 	RoleCoordinator = "coordinator"
@@ -113,6 +117,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.Workload{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&batchv1.Job{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&networkingv1.NetworkPolicy{}).
@@ -328,7 +333,17 @@ func (r *Reconciler) emitStatusTransitions(wl *v1alpha1.Workload, oldReason stri
 // names are unique, feedback overflow targets are declared channels, slot
 // counts are positive, and every cycle passes through a feedback channel.
 func Validate(s *v1alpha1.WorkloadSpec) error {
+	if objectStore := s.Coordinator.ObjectStore; objectStore != nil {
+		endpoint, err := url.Parse(objectStore.Endpoint)
+		if err != nil || (endpoint.Scheme != "http" && endpoint.Scheme != "https") || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
+			return errors.New("coordinator object store endpoint must be an HTTP or HTTPS URL with a host and without user information, query parameters, or a fragment")
+		}
+		if strings.TrimSpace(objectStore.CredentialsSecret) == "" {
+			return errors.New("coordinator object store credentialsSecret is required")
+		}
+	}
 	ops := map[string]bool{}
+	collectives := map[string]bool{}
 	for _, o := range s.Operations {
 		if ops[o.Name] {
 			return fmt.Errorf("duplicate operation %q", o.Name)
@@ -337,6 +352,32 @@ func Validate(s *v1alpha1.WorkloadSpec) error {
 		// Zero is the unset value and means one slot.
 		if o.Slots < 0 {
 			return fmt.Errorf("operation %q: slots must be at least 1", o.Name)
+		}
+		if o.Checkpoint && o.Collective == nil && (o.Scaling.Horizontal.Min > 1 || o.Scaling.Horizontal.Max > 1) {
+			return fmt.Errorf("operation %q: checkpointing initially supports one replica", o.Name)
+		}
+		if o.Collective != nil {
+			collectives[o.Name] = true
+			if o.Completion == v1alpha1.CompletionNever {
+				return fmt.Errorf("operation %q: a collective must be finite", o.Name)
+			}
+			if o.Collective.Size < 2 {
+				return fmt.Errorf("operation %q: collective size must be at least 2", o.Name)
+			}
+			if o.Collective.Placement == v1alpha1.CollectivePlacementGang {
+				return fmt.Errorf("operation %q: gang placement requires the native WorkloadWithJob capability, which this controller has not enabled", o.Name)
+			}
+			if o.Collective.MaxAttempts > 1 {
+				for _, channel := range s.Channels {
+					if channel.From != o.Name && channel.To != o.Name {
+						continue
+					}
+					if !o.Checkpoint || s.Coordinator.ObjectStore == nil {
+						return fmt.Errorf("operation %q: retrying a collective connected to graph channels requires an operation checkpoint and coordinator objectStore to fence graph I/O", o.Name)
+					}
+					break
+				}
+			}
 		}
 		if o.TickInterval != nil && o.TickInterval.Duration < 0 {
 			return fmt.Errorf("operation %q: tickInterval must not be negative", o.Name)
@@ -405,6 +446,9 @@ func Validate(s *v1alpha1.WorkloadSpec) error {
 		if c.To != "" && !ops[c.To] {
 			return fmt.Errorf("channel %q: unknown consumer %q", c.Name, c.To)
 		}
+		if c.To != "" && collectives[c.From] && s.Coordinator.ObjectStore == nil {
+			return fmt.Errorf("channel %q: collective operation %q needs coordinator objectStore for durable internal output", c.Name, c.From)
+		}
 		if c.Feedback != nil {
 			if c.To == "" {
 				return fmt.Errorf("channel %q: feedback channels need a consuming operation", c.Name)
@@ -460,6 +504,24 @@ func coordinatorLabels(wl *v1alpha1.Workload) map[string]string {
 	return map[string]string{LabelWorkload: wl.Name, LabelRole: RoleCoordinator}
 }
 
+func objectStoreEnv(wl *v1alpha1.Workload) []corev1.EnvVar {
+	s := wl.Spec.Coordinator.ObjectStore
+	if s == nil {
+		return nil
+	}
+	prefix := string(wl.UID)
+	if prefix == "" {
+		prefix = wl.Namespace + "/" + wl.Name
+	}
+	secret := func(name, key string, optional bool) corev1.EnvVar {
+		return corev1.EnvVar{Name: name, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: s.CredentialsSecret}, Key: key, Optional: &optional}}}
+	}
+	return []corev1.EnvVar{
+		{Name: coordinator.EnvObjectEndpoint, Value: s.Endpoint}, {Name: coordinator.EnvObjectRegion, Value: s.Region}, {Name: coordinator.EnvObjectPrefix, Value: prefix},
+		secret(coordinator.EnvObjectAccessKey, "accessKey", false), secret(coordinator.EnvObjectSecretKey, "secretKey", false), secret(coordinator.EnvObjectSessionToken, "sessionToken", true),
+	}
+}
+
 func (r *Reconciler) coordinatorURL(wl *v1alpha1.Workload) string {
 	if r.CoordinatorURL != nil {
 		return r.CoordinatorURL(wl)
@@ -481,6 +543,11 @@ func (r *Reconciler) ensureCoordinator(ctx context.Context, wl *v1alpha1.Workloa
 		dep.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType}
 		dep.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
 		dep.Spec.Template.Labels = labels
+		env := []corev1.EnvVar{{
+			Name:  coordinator.EnvSegmentAddr,
+			Value: fmt.Sprintf("%s.%s.svc:%d", coordinatorName(wl), wl.Namespace, coordinator.SegmentPort),
+		}, {Name: coordinator.EnvWorkload, Value: wl.Name}}
+		env = append(env, objectStoreEnv(wl)...)
 		dep.Spec.Template.Spec.Containers = []corev1.Container{{
 			Name:    "coordinator",
 			Image:   image,
@@ -489,10 +556,7 @@ func (r *Reconciler) ensureCoordinator(ctx context.Context, wl *v1alpha1.Workloa
 			// announces the coordinator Service's DNS name so worker pods
 			// reach it the same way they reach the control API, rather than
 			// its own pod hostname, which cluster DNS does not resolve.
-			Env: []corev1.EnvVar{{
-				Name:  "STARK8S_SEGMENT_ADDR",
-				Value: fmt.Sprintf("%s.%s.svc:%d", coordinatorName(wl), wl.Namespace, coordinator.SegmentPort),
-			}, {Name: coordinator.EnvWorkload, Value: wl.Name}},
+			Env: env,
 			Ports: []corev1.ContainerPort{
 				{ContainerPort: coordinator.ControlPort, Name: "control"},
 				{ContainerPort: coordinator.SegmentPort, Name: "segments"},
@@ -568,7 +632,11 @@ func (r *Reconciler) pushOperations(ctx context.Context, wl *v1alpha1.Workload) 
 	specs := make([]coordinator.OperationSpec, 0, len(wl.Spec.Operations))
 	for i := range wl.Spec.Operations {
 		o := &wl.Spec.Operations[i]
-		specs = append(specs, coordinator.OperationSpec{Name: o.Name, Replicas: desiredReplicas(o)})
+		replicas := desiredReplicas(o)
+		if o.Collective != nil {
+			replicas = 1
+		}
+		specs = append(specs, coordinator.OperationSpec{Name: o.Name, Replicas: replicas})
 	}
 	body, _ := json.Marshal(specs)
 	req, _ := http.NewRequestWithContext(ctx, "PUT", r.coordinatorURL(wl)+coordinator.PathOperations, bytes.NewReader(body))
@@ -638,6 +706,9 @@ func (r *Reconciler) reconcileOperation(ctx context.Context, wl *v1alpha1.Worklo
 		if c.Delivery == graph.DeliveryMaterialized && c.Feedback == nil && !cm.Sealed && !cm.ProductionClosed {
 			return st, nil
 		}
+	}
+	if op.Collective != nil {
+		return r.reconcileCollective(ctx, wl, op)
 	}
 
 	drainComplete := hasMetrics && om.Complete && op.Completion != v1alpha1.CompletionNever
@@ -813,10 +884,12 @@ func (r *Reconciler) podTemplate(wl *v1alpha1.Workload, op *v1alpha1.Operation) 
 		{Name: coordinator.EnvFeedback, Value: strings.Join(fb, ",")},
 		{Name: coordinator.EnvFeedbackOut, Value: strings.Join(fbOut, ",")},
 		{Name: coordinator.EnvSegmentDir, Value: SegmentDir},
+		{Name: coordinator.EnvCheckpoint, Value: strconv.FormatBool(op.Checkpoint)},
 	}
 	if op.TickInterval != nil && op.TickInterval.Duration > 0 {
 		env = append(env, corev1.EnvVar{Name: coordinator.EnvTickInterval, Value: op.TickInterval.Duration.String()})
 	}
+	env = append(env, objectStoreEnv(wl)...)
 	hasVolume := false
 	for _, v := range tpl.Spec.Volumes {
 		if v.Name == segmentVolumeName {
@@ -1082,6 +1155,20 @@ func (r *Reconciler) ensureNetworkPolicies(ctx context.Context, wl *v1alpha1.Wor
 	segment := intstr.FromInt(coordinator.SegmentPort)
 	dnsRule := networkingv1.NetworkPolicyEgressRule{Ports: []networkingv1.NetworkPolicyPort{{Protocol: &udp, Port: &dns}, {Protocol: &tcp, Port: &dns}}}
 	bothPorts := []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &control}, {Protocol: &tcp, Port: &segment}}
+	egress := []networkingv1.NetworkPolicyEgressRule{dnsRule}
+	if s := wl.Spec.Coordinator.ObjectStore; s != nil {
+		if u, err := url.Parse(s.Endpoint); err == nil {
+			port := 443
+			if u.Scheme == "http" {
+				port = 80
+			}
+			if parsed, err := strconv.Atoi(u.Port()); err == nil {
+				port = parsed
+			}
+			portValue := intstr.FromInt(port)
+			egress = append(egress, networkingv1.NetworkPolicyEgressRule{Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &portValue}}})
+		}
+	}
 
 	// Operation pods: egress to the coordinator, to DNS, and to the segment
 	// port of any pod of the same workload. Ingress is granted only by the
@@ -1092,11 +1179,10 @@ func (r *Reconciler) ensureNetworkPolicies(ctx context.Context, wl *v1alpha1.Wor
 		ops.Spec = networkingv1.NetworkPolicySpec{
 			PodSelector: workloadPods,
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
-			Egress: []networkingv1.NetworkPolicyEgressRule{
+			Egress: append([]networkingv1.NetworkPolicyEgressRule{
 				{To: []networkingv1.NetworkPolicyPeer{{PodSelector: &coordinatorPods}}, Ports: bothPorts},
 				{To: []networkingv1.NetworkPolicyPeer{{PodSelector: &workloadPods}}, Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &segment}}},
-				dnsRule,
-			},
+			}, egress...),
 		}
 		return controllerutil.SetControllerReference(wl, ops, r.Scheme())
 	}); err != nil {
@@ -1118,7 +1204,7 @@ func (r *Reconciler) ensureNetworkPolicies(ctx context.Context, wl *v1alpha1.Wor
 			PodSelector: coordinatorPods,
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
 			Ingress:     []networkingv1.NetworkPolicyIngressRule{{From: from, Ports: bothPorts}},
-			Egress:      []networkingv1.NetworkPolicyEgressRule{dnsRule},
+			Egress:      egress,
 		}
 		return controllerutil.SetControllerReference(wl, co, r.Scheme())
 	}); err != nil {
@@ -1148,6 +1234,29 @@ func (r *Reconciler) ensureNetworkPolicies(ctx context.Context, wl *v1alpha1.Wor
 				PodSelector: selector,
 				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
 				Egress:      rules,
+			}
+			return controllerutil.SetControllerReference(wl, np, r.Scheme())
+		}); err != nil {
+			return err
+		}
+	}
+
+	wantedCollectives := map[string]bool{}
+	for i := range wl.Spec.Operations {
+		op := &wl.Spec.Operations[i]
+		if op.Collective == nil {
+			continue
+		}
+		wantedCollectives[op.Name] = true
+		peers := metav1.LabelSelector{MatchLabels: opLabels(wl, op)}
+		np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: wl.Name + "-collective-" + op.Name, Namespace: wl.Namespace}}
+		if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, np, func() error {
+			np.Labels = map[string]string{LabelWorkload: wl.Name, LabelCollective: op.Name}
+			np.Spec = networkingv1.NetworkPolicySpec{
+				PodSelector: peers,
+				PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
+				Ingress:     []networkingv1.NetworkPolicyIngressRule{{From: []networkingv1.NetworkPolicyPeer{{PodSelector: &peers}}}},
+				Egress:      []networkingv1.NetworkPolicyEgressRule{{To: []networkingv1.NetworkPolicyPeer{{PodSelector: &peers}}}},
 			}
 			return controllerutil.SetControllerReference(wl, np, r.Scheme())
 		}); err != nil {
@@ -1189,6 +1298,14 @@ func (r *Reconciler) ensureNetworkPolicies(ctx context.Context, wl *v1alpha1.Wor
 	}
 	for i := range list.Items {
 		np := &list.Items[i]
+		if op, isCollective := np.Labels[LabelCollective]; isCollective {
+			if !wantedCollectives[op] {
+				if err := r.Delete(ctx, np); client.IgnoreNotFound(err) != nil {
+					return err
+				}
+			}
+			continue
+		}
 		if ch, isEdge := np.Labels[LabelChannel]; isEdge {
 			if wanted[ch] {
 				continue

@@ -86,10 +86,16 @@ the generated policies are enforced.
 - [docs/kubernetes-mapping.md](docs/kubernetes-mapping.md) — how a Workload
   becomes Deployments, Jobs, Services, NetworkPolicies, and autoscalers,
   and how the pieces find each other.
+- [docs/checkpoints.md](docs/checkpoints.md) — how finite operations commit
+  state, consumed input positions, and durable output manifests together.
+- [docs/language-runtime.md](docs/language-runtime.md) — the optional local
+  worker runtime protocol and its Go and Python clients.
 - [docs/spark-mapping.md](docs/spark-mapping.md) — how a Spark physical
   plan maps onto a Workload, and what the mapping exposes.
 - [docs/precedent.md](docs/precedent.md) — prior systems and papers, and
   what this design takes from each.
+- [docs/qualification.md](docs/qualification.md) — reproducible worker
+  benchmarks and local-cluster correctness and restart checks.
 - [web/editor.html](web/editor.html) — a single-file graph editor and
   viewer for Workloads that converts to and from the YAML;
   [web/README.md](web/README.md) describes it. The coordinator serves the
@@ -105,7 +111,8 @@ the generated policies are enforced.
 | `pkg/coordinator` | the control-plane protocol (`api.go`) and the coordinator server |
 | `pkg/exchange` | the earlier brokered in-memory channel runtime, kept only while `pkg/controller` still imports it |
 | `pkg/sdk` | worker library: local segments, fetch, process, acknowledge, supersteps, pass-by-reference payloads (`blob.go`) |
-| `cmd/controller`, `cmd/coordinator` | binaries |
+| `pkg/runtime`, `clients/python` | local worker protocol and application clients |
+| `cmd/controller`, `cmd/coordinator`, `cmd/runtime` | binaries |
 | `examples/wordcount`, `examples/pagerank` | acyclic and cyclic examples |
 | `config/crd`, `config/manager` | install manifests |
 | `hack` | local cluster scripts |

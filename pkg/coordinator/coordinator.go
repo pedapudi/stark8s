@@ -1,6 +1,8 @@
 package coordinator
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"sort"
@@ -8,6 +10,7 @@ import (
 	"time"
 
 	"github.com/pedapudi/stark8s/api/graph"
+	"github.com/pedapudi/stark8s/pkg/storage"
 )
 
 // PodTTL is how long a pod may stay silent before it is considered gone.
@@ -145,13 +148,15 @@ type segment struct {
 	producer string
 	// op is the operation whose pod holds the segment (empty when the
 	// coordinator holds it).
-	op      string
-	channel string
-	part    int32
-	epoch   int32
-	records int64
-	bytes   int64
-	task    TaskID
+	op       string
+	channel  string
+	part     int32
+	epoch    int32
+	records  int64
+	bytes    int64
+	task     TaskID
+	appendID string
+	offset   int64
 	// delivered is the set of consumer pods that fetched (or were told to
 	// fetch) the segment and have not acknowledged it yet.
 	delivered map[string]bool
@@ -164,8 +169,9 @@ type segment struct {
 	// released: nothing needs the segment any more (fully acknowledged,
 	// dropped at a seal, or lost). Ephemeral released segments are reported
 	// to the holder for deletion once and then forgotten.
-	released bool
-	reported bool
+	released         bool
+	retentionDeleted bool
+	reported         bool
 	// data is set for segments the coordinator itself holds (external
 	// producers).
 	data []Record
@@ -204,9 +210,26 @@ type channel struct {
 	// epochDone is the last epoch each consumer pod reported finished.
 	epochDone map[string]int32
 	// records is the retained record log of a channel with no consumer.
-	records []Record
+	records       []Record
+	history       [][]*segment
+	historyBase   []int64
+	appendIDs     map[string]*segment
+	subscriptions map[string]*subscription
 	// all indexes every segment of the channel that has not been forgotten.
 	all map[string]*segment
+}
+
+type subscription struct {
+	name      string
+	operation string
+	positions []int64
+	inflight  map[int32]subscriptionDelivery
+}
+
+type subscriptionDelivery struct {
+	offset   int64
+	appendID string
+	owner    string
 }
 
 func (c *channel) partitions() int { return int(c.spec.Partitioning.Partitions) }
@@ -241,18 +264,73 @@ type Coordinator struct {
 	now      func() time.Time
 	// wake is closed and replaced whenever a retained record log grows, to
 	// release long-polling readers.
-	wake chan struct{}
+	wake          chan struct{}
+	durable       *storage.Writer
+	tombstoneKeys map[string]bool
+	failed        error
+}
+
+func (co *Coordinator) failure() error {
+	co.mu.Lock()
+	defer co.mu.Unlock()
+	return co.failed
+}
+
+// NewDurable claims the coordinator checkpoint and restores its last state.
+// Claiming a checkpoint fences a previous coordinator writer.
+func NewDurable(ctx context.Context, selfAddr string, store storage.Store, key, writerID string) (*Coordinator, error) {
+	w, checkpoint, err := storage.Claim(ctx, store, key, writerID)
+	if err != nil {
+		return nil, err
+	}
+	co := New(selfAddr)
+	co.durable = w
+	co.tombstoneKeys = map[string]bool{}
+	if len(checkpoint.State) > 0 {
+		if err := co.restore(checkpoint.State); err != nil {
+			return nil, err
+		}
+		co.rebindHeldSegments(selfAddr)
+		co.selfAddr = selfAddr
+	}
+	for _, id := range checkpoint.Tombstones {
+		if err := w.Delete(ctx, "segments/"+id); err != nil {
+			return nil, fmt.Errorf("delete released segment %q: %w", id, err)
+		}
+	}
+	if len(checkpoint.Tombstones) > 0 {
+		if err := co.commitLocked(); err != nil {
+			return nil, fmt.Errorf("clear released segment tombstones: %w", err)
+		}
+	}
+	return co, nil
+}
+
+// rebindHeldSegments makes coordinator-owned records available from a
+// replacement coordinator address.
+func (co *Coordinator) rebindHeldSegments(selfAddr string) {
+	for _, c := range co.channels {
+		for key, s := range c.all {
+			if s.data == nil || s.holder == selfAddr {
+				continue
+			}
+			delete(c.all, key)
+			s.holder = selfAddr
+			c.all[s.key()] = s
+		}
+	}
 }
 
 // New returns an empty coordinator whose own segment server is reachable at
 // selfAddr (host:port).
 func New(selfAddr string) *Coordinator {
 	return &Coordinator{
-		channels: map[string]*channel{},
-		ops:      map[string]*operation{},
-		selfAddr: selfAddr,
-		now:      time.Now,
-		wake:     make(chan struct{}),
+		channels:      map[string]*channel{},
+		ops:           map[string]*operation{},
+		selfAddr:      selfAddr,
+		now:           time.Now,
+		wake:          make(chan struct{}),
+		tombstoneKeys: map[string]bool{},
 	}
 }
 
@@ -276,7 +354,7 @@ func (co *Coordinator) get(name string) (*channel, error) {
 // Configure declares channels. Existing channels keep their state so the
 // controller can call this on every reconcile; new channels are created and
 // channels absent from the list are left untouched.
-func (co *Coordinator) Configure(specs []graph.Channel) {
+func (co *Coordinator) Configure(specs []graph.Channel) error {
 	co.mu.Lock()
 	defer co.mu.Unlock()
 	for _, s := range specs {
@@ -303,8 +381,12 @@ func (co *Coordinator) Configure(specs []graph.Channel) {
 			epochDone:        map[string]int32{},
 			all:              map[string]*segment{},
 			productionClosed: map[int32]bool{},
+			appendIDs:        map[string]*segment{},
+			subscriptions:    map[string]*subscription{},
 		}
 		c.queues = make([][]*segment, s.Partitioning.Partitions)
+		c.history = make([][]*segment, s.Partitioning.Partitions)
+		c.historyBase = make([]int64, s.Partitioning.Partitions)
 		co.channels[s.Name] = c
 		if s.From != "" {
 			co.op(s.From)
@@ -314,6 +396,7 @@ func (co *Coordinator) Configure(specs []graph.Channel) {
 		}
 	}
 	co.markFiniteEpochChannels()
+	return co.commitLocked()
 }
 
 // markFiniteEpochChannels marks every channel in a graph component containing
@@ -447,7 +530,7 @@ func (co *Coordinator) Register(reg PodRegistration) error {
 	if _, ok := o.epochDone[p.name]; !ok {
 		o.epochDone[p.name] = -1
 	}
-	return nil
+	return co.commitLocked()
 }
 
 // touch refreshes a pod's liveness, creating it when unknown.
@@ -489,9 +572,11 @@ func (co *Coordinator) SourceDone(reg PodRegistration) error {
 	}
 	p.done = true
 	if !co.hasInbound(reg.Operation) {
-		return co.recordOperationEpochDone(reg.Operation, reg.Pod, 0)
+		if err := co.recordOperationEpochDone(reg.Operation, reg.Pod, 0); err != nil {
+			return err
+		}
 	}
-	return nil
+	return co.commitLocked()
 }
 
 func (co *Coordinator) requireIncarnation(opName, podName, incarnation string) (*pod, error) {
@@ -512,6 +597,12 @@ func (co *Coordinator) Released(podName string) []string {
 	return out
 }
 
+// ReleasedCommitted is the legacy durable deletion API. Session-aware callers
+// use ReleasedSession so a replaced process cannot delete segment bytes.
+func (co *Coordinator) ReleasedCommitted(podName string) ([]string, error) {
+	return co.ReleasedSession("", podName, "")
+}
+
 // ReleasedSession returns deletable segments after verifying the holder's
 // active process. Process replacement does not discard holder state because
 // the pod's segment volume may survive a container restart.
@@ -525,21 +616,36 @@ func (co *Coordinator) ReleasedSession(opName, podName, incarnation string) ([]s
 	}
 	co.expireAll()
 	var out []string
+	type removal struct {
+		channel *channel
+		key     string
+		segment *segment
+	}
+	var removals []removal
 	for _, c := range co.channels {
-		if c.spec.Durability == graph.DurabilityRetained {
-			continue
-		}
 		for k, s := range c.all {
+			if c.spec.Durability == graph.DurabilityRetained && !s.retentionDeleted {
+				continue
+			}
 			if s.producer != podName || !s.released || s.data != nil {
 				continue
 			}
 			out = append(out, s.id)
+			co.tombstoneKeys[s.id] = true
+			removals = append(removals, removal{c, k, s})
 			delete(c.all, k)
 		}
 	}
 	sort.Strings(out)
 	if out == nil {
 		out = []string{}
+	}
+	if err := co.commitLocked(); err != nil {
+		for _, r := range removals {
+			r.channel.all[r.key] = r.segment
+			delete(co.tombstoneKeys, r.segment.id)
+		}
+		return nil, err
 	}
 	return out, nil
 }
@@ -586,6 +692,16 @@ func (co *Coordinator) returnConsumerDeliveries(opName string, o *operation, id,
 		}
 	}
 	for _, c := range co.channels {
+		for _, sub := range c.subscriptions {
+			if sub.operation != opName {
+				continue
+			}
+			for partition, delivery := range sub.inflight {
+				if deliveryPod(delivery.owner) == id && (all || delivery.owner == deliveryKey(id, incarnation)) {
+					delete(sub.inflight, partition)
+				}
+			}
+		}
 		if c.spec.To != opName {
 			continue
 		}
@@ -700,6 +816,9 @@ func (co *Coordinator) Announce(name, opName string, anns []SegmentAnnouncement)
 func (co *Coordinator) AnnounceSession(name, opName, podName, incarnation string, anns []SegmentAnnouncement) error {
 	co.mu.Lock()
 	defer co.mu.Unlock()
+	if err := co.requireDurableWriterLocked(); err != nil {
+		return err
+	}
 	c, err := co.get(name)
 	if err != nil {
 		return err
@@ -712,15 +831,28 @@ func (co *Coordinator) AnnounceSession(name, opName, podName, incarnation string
 			return err
 		}
 	}
-	if c.sealed {
-		return errf(409, "channel %q is sealed", name)
-	}
+	hasNew := false
 	for _, a := range anns {
 		if a.ID == "" {
+			hasNew = true
 			continue
 		}
 		if a.Channel != "" && a.Channel != name {
 			return errf(400, "segment %q announced for channel %q on channel %q", a.ID, a.Channel, name)
+		}
+		appendID := a.AppendID
+		if appendID == "" {
+			appendID = a.Holder + "/" + a.ID
+		}
+		if prior := c.appendIDs[appendID]; prior != nil && !sameAppend(prior, a, name) {
+			return errf(409, "append %q already committed with different metadata", appendID)
+		}
+		if c.appendIDs[appendID] != nil {
+			continue
+		}
+		hasNew = true
+		if c.sealed {
+			return errf(409, "channel %q is sealed", name)
 		}
 		if c.finiteEpochs && a.Epoch < c.epoch {
 			return errf(400, "segment epoch %d is behind channel epoch %d", a.Epoch, c.epoch)
@@ -729,15 +861,26 @@ func (co *Coordinator) AnnounceSession(name, opName, podName, incarnation string
 			return errf(400, "partition %d out of range for channel %q", a.Partition, name)
 		}
 	}
+	if !hasNew {
+		return nil
+	}
 	for _, a := range anns {
-		c.overflowed += a.Overflowed
 		if a.ID == "" {
+			c.overflowed += a.Overflowed
 			continue
 		}
+		appendID := a.AppendID
+		if appendID == "" {
+			appendID = a.Holder + "/" + a.ID
+		}
+		if c.appendIDs[appendID] != nil {
+			continue
+		}
+		c.overflowed += a.Overflowed
 		s := &segment{
 			id: a.ID, holder: a.Holder, producer: a.Producer, channel: name,
 			part: a.Partition, epoch: a.Epoch, records: a.Records, bytes: a.Bytes, task: a.Task,
-			delivered: map[string]bool{}, acked: map[string]bool{}, retryAfter: map[string]time.Time{},
+			appendID: appendID, delivered: map[string]bool{}, acked: map[string]bool{}, retryAfter: map[string]time.Time{},
 		}
 		if a.Producer == "" {
 			s.producer = opName
@@ -749,7 +892,7 @@ func (co *Coordinator) AnnounceSession(name, opName, podName, incarnation string
 		co.index(c, s)
 	}
 	co.settle()
-	return nil
+	return co.commitLocked()
 }
 
 // index adds a segment to the channel's structures.
@@ -758,6 +901,13 @@ func (co *Coordinator) index(c *channel, s *segment) {
 		return
 	}
 	c.all[s.key()] = s
+	c.appendIDs[s.appendID] = s
+	partition := int(s.part)
+	if c.broadcast() {
+		partition = 0
+	}
+	s.offset = c.historyBase[partition] + int64(len(c.history[partition]))
+	c.history[partition] = append(c.history[partition], s)
 	c.produced += s.records
 	if c.spec.Feedback != nil && s.epoch >= c.spec.Feedback.MaxEpochs {
 		// Beyond the loop bound (Synchronous loops): the record set is
@@ -771,6 +921,14 @@ func (co *Coordinator) index(c *channel, s *segment) {
 		return
 	}
 	c.enqueue(s)
+}
+
+func sameAppend(s *segment, a SegmentAnnouncement, channel string) bool {
+	producer := a.Producer
+	if producer == "" {
+		producer = s.op
+	}
+	return s.id == a.ID && s.holder == a.Holder && s.producer == producer && s.channel == channel && s.part == a.Partition && s.epoch == a.Epoch && s.records == a.Records && s.bytes == a.Bytes && s.task == a.Task
 }
 
 func (c *channel) enqueue(s *segment) {
@@ -824,7 +982,7 @@ func (co *Coordinator) Produce(name, opName string, recs []Record) error {
 		c.produced += int64(len(recs))
 		close(co.wake)
 		co.wake = make(chan struct{})
-		return nil
+		return co.commitLocked()
 	}
 	type pe struct {
 		p int32
@@ -846,15 +1004,25 @@ func (co *Coordinator) Produce(name, opName string, recs []Record) error {
 	}
 	for _, k := range order {
 		co.nextID++
+		id := fmt.Sprintf("ext-%d", co.nextID)
+		if co.durable != nil {
+			body, marshalErr := json.Marshal(groups[k])
+			if marshalErr != nil {
+				return marshalErr
+			}
+			if putErr := co.durable.PutImmutable(context.Background(), "segments/"+id, body); putErr != nil {
+				return putErr
+			}
+		}
 		s := &segment{
-			id: fmt.Sprintf("ext-%d", co.nextID), holder: co.selfAddr, producer: "coordinator",
+			id: id, holder: co.selfAddr, producer: "coordinator",
 			channel: name, part: k.p, epoch: k.e, records: int64(len(groups[k])),
 			delivered: map[string]bool{}, acked: map[string]bool{}, data: groups[k],
 		}
 		co.index(c, s)
 	}
 	co.settle()
-	return nil
+	return co.commitLocked()
 }
 
 // Segment returns the records of a segment the coordinator holds.
@@ -880,7 +1048,7 @@ func (co *Coordinator) Seal(name string) error {
 	}
 	co.seal(c)
 	co.settle()
-	return nil
+	return co.commitLocked()
 }
 
 func (co *Coordinator) seal(c *channel) {
@@ -1024,6 +1192,10 @@ func (co *Coordinator) ConsumeSession(name, opName, podName, incarnation string,
 	if podName == "" {
 		return nil, errf(400, "pod is required")
 	}
+	before, snapshotErr := json.Marshal(co.snapshot())
+	if snapshotErr != nil {
+		return nil, snapshotErr
+	}
 	o := co.op(c.spec.To)
 	p, err := co.requireIncarnation(c.spec.To, podName, incarnation)
 	if err != nil {
@@ -1097,11 +1269,17 @@ func (co *Coordinator) ConsumeSession(name, opName, podName, incarnation string,
 	quiet := c.quiet()
 	resp.Drained = c.sealed && quiet
 	resp.Quiescent = c.finiteEpochs && resp.ProductionClosed && quiet
+	if err := co.commitLocked(); err != nil {
+		if restoreErr := co.restore(before); restoreErr != nil {
+			return nil, fmt.Errorf("commit failed: %v; rollback failed: %w", err, restoreErr)
+		}
+		return nil, err
+	}
 	return resp, nil
 }
 
 func ref(s *segment) SegmentRef {
-	return SegmentRef{ID: s.id, Holder: s.holder, Records: s.records, Epoch: s.epoch}
+	return SegmentRef{ID: s.id, AppendID: s.appendID, Holder: s.holder, Records: s.records, Bytes: s.bytes, Epoch: s.epoch, Offset: s.offset}
 }
 
 // Ack marks segments processed by the acknowledging pods.
@@ -1162,7 +1340,7 @@ func (co *Coordinator) AckSession(name, opName, podName, incarnation string, ack
 		}
 	}
 	co.settle()
-	return nil
+	return co.commitLocked()
 }
 
 func cohortKey(p *pod) string { return fmt.Sprintf("slot:%d", p.cohortSlot) }
@@ -1205,7 +1383,7 @@ func (co *Coordinator) NackSession(name, opName, podName, incarnation string, ac
 		}
 	}
 	co.settle()
-	return nil
+	return co.commitLocked()
 }
 
 func containsSegment(list []*segment, want *segment) bool {
@@ -1312,7 +1490,10 @@ func (co *Coordinator) EpochDoneSession(name, opName, podName, incarnation strin
 		c.epochDone[podName] = epoch
 	}
 	co.touch(c.spec.To, podName, "", 0)
-	return co.recordOperationEpochDone(c.spec.To, podName, epoch)
+	if err := co.recordOperationEpochDone(c.spec.To, podName, epoch); err != nil {
+		return err
+	}
+	return co.commitLocked()
 }
 
 // OperationEpochDone records that a worker finished all callbacks for an
@@ -1335,7 +1516,10 @@ func (co *Coordinator) OperationEpochDoneSession(opName, podName, incarnation st
 	}
 	p.lastSeen = co.now()
 	co.expireAllExcept(opName, podName)
-	return co.recordOperationEpochDone(opName, podName, epoch)
+	if err := co.recordOperationEpochDone(opName, podName, epoch); err != nil {
+		return err
+	}
+	return co.commitLocked()
 }
 
 func (co *Coordinator) recordOperationEpochDone(opName, podName string, epoch int32) error {

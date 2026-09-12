@@ -132,6 +132,9 @@ type SegmentStorage struct {
 // own pool of pods.
 type Operation struct {
 	Name string `json:"name"`
+	// Checkpoint commits application state, consumed input positions, and
+	// durable output manifests together after each finite input segment.
+	Checkpoint bool `json:"checkpoint,omitempty"`
 	// +kubebuilder:default=Drain
 	// +kubebuilder:validation:Enum=Drain;Never
 	Completion Completion `json:"completion,omitempty"`
@@ -144,7 +147,8 @@ type Operation struct {
 	// Slots is how many partitions one replica processes concurrently.
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
-	Slots int32 `json:"slots,omitempty"`
+	Slots      int32           `json:"slots,omitempty"`
+	Collective *CollectiveSpec `json:"collective,omitempty"`
 	// TickInterval makes the operation run on a clock as well as on its
 	// input: every replica calls its Tick handler this often, between passes
 	// over its inbound channels. It suits an operation that polls a feed, a
@@ -175,11 +179,45 @@ type Operation struct {
 	Segments *SegmentStorage `json:"segments,omitempty"`
 }
 
+type CollectivePlacement string
+
+const (
+	CollectivePlacementOrdinary CollectivePlacement = "Ordinary"
+	CollectivePlacementGang     CollectivePlacement = "Gang"
+)
+
+// CollectiveSpec configures one fixed-size finite process group.
+type CollectiveSpec struct {
+	// +kubebuilder:validation:Minimum=2
+	Size int32 `json:"size"`
+	// MaxAttempts includes the initial attempt.
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	MaxAttempts int32 `json:"maxAttempts,omitempty"`
+	// +kubebuilder:default=Ordinary
+	// +kubebuilder:validation:Enum=Ordinary;Gang
+	Placement CollectivePlacement `json:"placement,omitempty"`
+	// Checkpoint identifies a framework-managed checkpoint available to every rank.
+	Checkpoint string `json:"checkpoint,omitempty"`
+}
+
 // CoordinatorSpec configures the per-workload coordinator that tracks
 // partition ownership, segment locations, seals, and epochs.
 type CoordinatorSpec struct {
 	// Image of the coordinator server. Defaults to the controller's own image.
 	Image string `json:"image,omitempty"`
+	// ObjectStore enables durable coordinator checkpoints and worker segments.
+	// Endpoint includes the bucket path. CredentialsSecret contains accessKey,
+	// secretKey, and optionally sessionToken.
+	ObjectStore *ObjectStoreSpec `json:"objectStore,omitempty"`
+}
+
+type ObjectStoreSpec struct {
+	// +kubebuilder:validation:MinLength=1
+	Endpoint string `json:"endpoint"`
+	Region   string `json:"region"`
+	// +kubebuilder:validation:MinLength=1
+	CredentialsSecret string `json:"credentialsSecret"`
 }
 
 // WorkloadSpec is the graph.
