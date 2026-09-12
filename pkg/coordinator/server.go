@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/web"
 )
 
 // Handler exposes the coordinator's control API (the paths declared in
@@ -31,6 +32,17 @@ func Handler(co *Coordinator) http.Handler {
 	})
 	mux.HandleFunc("GET "+PathHealth, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(204)
+	})
+	// The editor. A literal path, so it cannot shadow the channel routes
+	// below: a channel named "editor" is addressed at /channels/editor/... and
+	// is unaffected. Only GET is registered, and the handler reads nothing
+	// from the request, so serving the page adds no way to change anything.
+	mux.HandleFunc("GET "+PathEditor, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		// The page carries the workload's observed state, which changes while
+		// it is open, so an intermediary must not hold on to a copy.
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write(web.Editor)
 	})
 	mux.HandleFunc("POST "+PathRegister, func(w http.ResponseWriter, r *http.Request) {
 		var reg PodRegistration

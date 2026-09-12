@@ -86,7 +86,9 @@ the generated policies are enforced.
   what this design takes from each.
 - [web/editor.html](web/editor.html) — a single-file graph editor and
   viewer for Workloads that converts to and from the YAML;
-  [web/README.md](web/README.md) describes it.
+  [web/README.md](web/README.md) describes it. The coordinator serves the
+  same file at `/editor`, so a running workload can be watched by
+  port-forwarding to it and opening that address.
 
 ## Layout
 
