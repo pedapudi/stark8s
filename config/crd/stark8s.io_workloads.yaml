@@ -54,6 +54,22 @@ spec:
                     Channel is a directed information flow between two operations. It is the
                     only kind of edge in the graph.
                   properties:
+                    combine:
+                      description: |-
+                        Combine names a function the producer applies to records sharing a key
+                        before they are put on the wire, so a stage that emits one record per
+                        fact ships one record per key instead. It is the map-side half of a
+                        reduce-by-key: the consumer still aggregates across producers.
+
+                        The function must be associative and commutative, because the producer
+                        applies it to whatever subset of a key's records happen to be buffered
+                        together. Empty means no combining.
+                      enum:
+                      - Sum
+                      - Min
+                      - Max
+                      - Count
+                      type: string
                     delivery:
                       default: Pipelined
                       description: Delivery says when records become visible to the
@@ -163,6 +179,40 @@ spec:
                       - Drain
                       - Never
                       type: string
+                    egress:
+                      description: |-
+                        Egress lists what this operation may reach outside the workload.
+
+                        The default is nothing. Operation pods are otherwise allowed to reach
+                        only the coordinator, DNS, and the segment port of pods in the same
+                        workload, which is what keeps one operation off another operation's
+                        channels. An operation that has to read a feed, call an API or fetch an
+                        identity token says so here, and the grant applies to that operation
+                        alone; its neighbours are unaffected.
+
+                        Declaring it per operation rather than per workload keeps the grant
+                        visible in the graph, so a reader can see which vertices reach outside
+                        and a reviewer sees the widening in the same change as the code that
+                        needs it.
+                      items:
+                        description: |-
+                          EgressRule grants one operation access to one destination outside the
+                          workload.
+
+                          It is a struct holding a single field rather than a bare destination so
+                          that a narrower grant can be expressed later, by adding an explicit CIDR or
+                          a port list here, without changing the shape of anything already written.
+                        properties:
+                          to:
+                            description: To names the destination.
+                            enum:
+                            - Metadata
+                            - Internet
+                            type: string
+                        required:
+                        - to
+                        type: object
+                      type: array
                     name:
                       type: string
                     scaling:
@@ -8261,6 +8311,18 @@ spec:
                           - containers
                           type: object
                       type: object
+                    tickInterval:
+                      description: |-
+                        TickInterval makes the operation run on a clock as well as on its
+                        input: every replica calls its Tick handler this often, between passes
+                        over its inbound channels. It suits an operation that polls a feed, a
+                        queue or an API on a schedule while taking what to poll for from a
+                        channel. Leave it unset for an operation driven only by records.
+
+                        The handler runs on the same goroutine as record processing, so this is
+                        a floor on the period rather than a guarantee: a long batch of records
+                        delays the next tick.
+                      type: string
                   required:
                   - name
                   - template

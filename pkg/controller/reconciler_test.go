@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -22,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/api/v1alpha1"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
@@ -161,9 +164,9 @@ func mapReduce() *v1alpha1.Workload {
 				{Name: "map", Slots: 2, Scaling: v1alpha1.Scaling{Horizontal: v1alpha1.HorizontalScaling{Min: 1, Max: 4}}, Template: container()},
 				{Name: "reduce", Slots: 1, Scaling: v1alpha1.Scaling{Horizontal: v1alpha1.HorizontalScaling{Min: 1, Max: 3}}, Template: container()},
 			},
-			Channels: []v1alpha1.Channel{
-				{Name: "lines", From: "read", To: "map", Delivery: v1alpha1.DeliveryPipelined},
-				{Name: "shuffle", From: "map", To: "reduce", Delivery: v1alpha1.DeliveryMaterialized},
+			Channels: []graph.Channel{
+				{Name: "lines", From: "read", To: "map", Delivery: graph.DeliveryPipelined},
+				{Name: "shuffle", From: "map", To: "reduce", Delivery: graph.DeliveryMaterialized},
 				{Name: "totals", From: "reduce"},
 			},
 		},
@@ -345,7 +348,7 @@ func TestPerEdgeNetworkPolicies(t *testing.T) {
 	if err := h.c.Get(context.Background(), h.key, wl); err != nil {
 		t.Fatal(err)
 	}
-	wl.Spec.Channels = []v1alpha1.Channel{wl.Spec.Channels[0], wl.Spec.Channels[2]}
+	wl.Spec.Channels = []graph.Channel{wl.Spec.Channels[0], wl.Spec.Channels[2]}
 	if err := h.c.Update(context.Background(), wl); err != nil {
 		t.Fatal(err)
 	}
@@ -437,6 +440,319 @@ func keys(m map[string]networkingv1.NetworkPolicy) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// --- tick interval and externally fed operations -----------------------------
+
+func opNamed(name string) v1alpha1.Operation {
+	return v1alpha1.Operation{
+		Name: name,
+		Template: corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "img"}}},
+		},
+	}
+}
+
+// TestValidateRejectsNegativeTickInterval keeps a typo from becoming a worker
+// that never ticks.
+func TestValidateRejectsNegativeTickInterval(t *testing.T) {
+	op := opNamed("poll")
+	op.TickInterval = &metav1.Duration{Duration: -time.Second}
+	spec := &v1alpha1.WorkloadSpec{
+		Operations: []v1alpha1.Operation{op},
+		Channels:   []graph.Channel{{Name: "config", To: "poll"}},
+	}
+	if err := Validate(spec); err == nil {
+		t.Fatal("a negative tickInterval was accepted")
+	}
+	op.TickInterval = &metav1.Duration{Duration: 30 * time.Second}
+	spec.Operations = []v1alpha1.Operation{op}
+	if err := Validate(spec); err != nil {
+		t.Errorf("a positive tickInterval was rejected: %v", err)
+	}
+}
+
+// TestTickIntervalReachesThePod: the interval is declared on the operation and
+// has to arrive as the environment variable the SDK reads, or the handler
+// never fires in a real cluster.
+func TestTickIntervalReachesThePod(t *testing.T) {
+	wl := mapReduce()
+	for i := range wl.Spec.Operations {
+		if wl.Spec.Operations[i].Name == "map" {
+			wl.Spec.Operations[i].TickInterval = &metav1.Duration{Duration: 90 * time.Second}
+		}
+	}
+	h := newHarness(t, wl)
+	h.reconcile()
+
+	d, _ := h.deployment("wc-map")
+	var got string
+	for _, e := range d.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == coordinator.EnvTickInterval {
+			got = e.Value
+		}
+	}
+	if got != "1m30s" {
+		t.Errorf("%s = %q, want %q", coordinator.EnvTickInterval, got, "1m30s")
+	}
+
+	// An operation without an interval must not carry the variable at all, so
+	// that FromEnv leaves ticking off rather than parsing an empty string.
+	// wc-read is used here because wc-reduce sits behind a Materialized edge
+	// and has no deployment until that edge is sealed.
+	r, ok := h.deployment("wc-read")
+	if !ok {
+		t.Fatal("wc-read has no deployment")
+	}
+	for _, e := range r.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == coordinator.EnvTickInterval {
+			t.Errorf("an operation with no tickInterval carries %s=%q", e.Name, e.Value)
+		}
+	}
+}
+
+// --- per-operation egress -----------------------------------------------------
+
+// policies lists every network policy in the test namespace by name.
+func (h *harness) policies() map[string]networkingv1.NetworkPolicy {
+	h.t.Helper()
+	var l networkingv1.NetworkPolicyList
+	if err := h.c.List(context.Background(), &l, client.InNamespace("default")); err != nil {
+		h.t.Fatal(err)
+	}
+	out := map[string]networkingv1.NetworkPolicy{}
+	for _, p := range l.Items {
+		out[p.Name] = p
+	}
+	return out
+}
+
+// setEgress replaces one operation's egress declaration in the stored spec.
+func (h *harness) setEgress(op string, to ...v1alpha1.EgressDestination) {
+	h.t.Helper()
+	wl := &v1alpha1.Workload{}
+	if err := h.c.Get(context.Background(), h.key, wl); err != nil {
+		h.t.Fatal(err)
+	}
+	for i := range wl.Spec.Operations {
+		if wl.Spec.Operations[i].Name != op {
+			continue
+		}
+		wl.Spec.Operations[i].Egress = nil
+		for _, d := range to {
+			wl.Spec.Operations[i].Egress = append(wl.Spec.Operations[i].Egress, v1alpha1.EgressRule{To: d})
+		}
+	}
+	if err := h.c.Update(context.Background(), wl); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// TestNoEgressLeavesThePoliciesUnchanged is the one that matters most. Adding
+// this field must not widen anything for a workload that does not use it, so
+// the whole set of policies produced without egress is compared against the
+// set produced by the same workload before any operation declares any.
+func TestNoEgressLeavesThePoliciesUnchanged(t *testing.T) {
+	h := newHarness(t, mapReduce())
+	h.reconcile()
+	before := h.policies()
+
+	// Nothing declared anywhere: no egress policy exists at all.
+	for name := range before {
+		if strings.Contains(name, "-egress-") {
+			t.Errorf("a workload that declares no egress produced policy %s", name)
+		}
+	}
+
+	// Reconciling again is a no-op, and the shared operations policy still
+	// grants exactly the three rules it always did.
+	h.reconcile()
+	after := h.policies()
+	if len(before) != len(after) {
+		t.Fatalf("policy count changed from %d to %d across reconciles", len(before), len(after))
+	}
+	ops := after["wc-operations"]
+	if len(ops.Spec.Egress) != 3 {
+		t.Fatalf("the operations policy has %d egress rules, want the original 3: %+v", len(ops.Spec.Egress), ops.Spec.Egress)
+	}
+	for _, rule := range ops.Spec.Egress {
+		for _, peer := range rule.To {
+			if peer.IPBlock != nil {
+				t.Errorf("the shared operations policy gained an ipBlock rule: %+v", peer.IPBlock)
+			}
+		}
+	}
+	if !reflect.DeepEqual(before["wc-operations"].Spec, after["wc-operations"].Spec) {
+		t.Error("the shared operations policy is not stable across reconciles")
+	}
+}
+
+// TestEgressMetadataRule pins the metadata grant: the link-local address on
+// plain HTTP, and nothing else.
+func TestEgressMetadataRule(t *testing.T) {
+	h := newHarness(t, mapReduce())
+	h.setEgress("map", v1alpha1.EgressMetadata)
+	h.reconcile()
+
+	np, ok := h.policies()["wc-egress-map"]
+	if !ok {
+		t.Fatalf("no egress policy for map; have %v", keys(h.policies()))
+	}
+	if np.Spec.PodSelector.MatchLabels[LabelOperation] != "map" {
+		t.Errorf("the policy selects %v, want only map's pods", np.Spec.PodSelector.MatchLabels)
+	}
+	if len(np.Spec.PolicyTypes) != 1 || np.Spec.PolicyTypes[0] != networkingv1.PolicyTypeEgress {
+		t.Errorf("policy types %v, want Egress alone so ingress stays denied", np.Spec.PolicyTypes)
+	}
+	if len(np.Spec.Egress) != 1 {
+		t.Fatalf("%d egress rules, want 1: %+v", len(np.Spec.Egress), np.Spec.Egress)
+	}
+	rule := np.Spec.Egress[0]
+	if len(rule.To) != 1 || rule.To[0].IPBlock == nil || rule.To[0].IPBlock.CIDR != metadataCIDR {
+		t.Errorf("metadata rule targets %+v, want %s", rule.To, metadataCIDR)
+	}
+	if len(rule.Ports) != 1 || rule.Ports[0].Port.IntValue() != 80 {
+		t.Errorf("metadata ports %+v, want TCP 80", rule.Ports)
+	}
+}
+
+// TestEgressInternetExcludesPrivateRanges pins the exclusion. Without it,
+// "reach the internet" would also mean "reach every pod and service in the
+// cluster", which would undo the per-edge isolation the policies exist for.
+// The failure would widen access rather than deny it, so nothing about a
+// running workload would look wrong.
+func TestEgressInternetExcludesPrivateRanges(t *testing.T) {
+	h := newHarness(t, mapReduce())
+	h.setEgress("map", v1alpha1.EgressInternet)
+	h.reconcile()
+
+	np := h.policies()["wc-egress-map"]
+	if len(np.Spec.Egress) != 1 {
+		t.Fatalf("%d egress rules, want 1: %+v", len(np.Spec.Egress), np.Spec.Egress)
+	}
+	rule := np.Spec.Egress[0]
+	if len(rule.To) != 1 || rule.To[0].IPBlock == nil {
+		t.Fatalf("internet rule targets %+v, want one ipBlock", rule.To)
+	}
+	block := rule.To[0].IPBlock
+	if block.CIDR != "0.0.0.0/0" {
+		t.Errorf("internet CIDR %q, want 0.0.0.0/0", block.CIDR)
+	}
+	if len(rule.Ports) != 1 || rule.Ports[0].Port.IntValue() != 443 {
+		t.Errorf("internet ports %+v, want TCP 443", rule.Ports)
+	}
+	for _, want := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"} {
+		found := false
+		for _, got := range block.Except {
+			if got == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("the internet rule does not exclude %s, so it reaches inside the cluster: except=%v", want, block.Except)
+		}
+	}
+	// Link-local is excluded too, so reaching the internet does not quietly
+	// include the metadata server.
+	for _, got := range block.Except {
+		if got == "169.254.0.0/16" {
+			return
+		}
+	}
+	t.Errorf("the internet rule does not exclude link-local, so it also grants the metadata server: except=%v", block.Except)
+}
+
+// TestEgressBothDestinations: the two grants are independent and compose.
+func TestEgressBothDestinations(t *testing.T) {
+	h := newHarness(t, mapReduce())
+	h.setEgress("map", v1alpha1.EgressMetadata, v1alpha1.EgressInternet)
+	h.reconcile()
+
+	np := h.policies()["wc-egress-map"]
+	if len(np.Spec.Egress) != 2 {
+		t.Fatalf("%d egress rules, want 2: %+v", len(np.Spec.Egress), np.Spec.Egress)
+	}
+	ports := map[int]string{}
+	for _, rule := range np.Spec.Egress {
+		if len(rule.Ports) != 1 || len(rule.To) != 1 || rule.To[0].IPBlock == nil {
+			t.Fatalf("unexpected rule shape %+v", rule)
+		}
+		ports[rule.Ports[0].Port.IntValue()] = rule.To[0].IPBlock.CIDR
+	}
+	if ports[80] != metadataCIDR {
+		t.Errorf("port 80 targets %q, want %s", ports[80], metadataCIDR)
+	}
+	if ports[443] != "0.0.0.0/0" {
+		t.Errorf("port 443 targets %q, want 0.0.0.0/0", ports[443])
+	}
+}
+
+// TestEgressIsPerOperation is the whole reason the field sits on the
+// operation. One operation reaching outside must not carry its neighbours
+// with it.
+func TestEgressIsPerOperation(t *testing.T) {
+	h := newHarness(t, mapReduce())
+	h.setEgress("map", v1alpha1.EgressInternet)
+	h.reconcile()
+
+	pols := h.policies()
+	if _, ok := pols["wc-egress-map"]; !ok {
+		t.Fatalf("no egress policy for the operation that asked; have %v", keys(pols))
+	}
+	for _, other := range []string{"read", "reduce"} {
+		if _, ok := pols["wc-egress-"+other]; ok {
+			t.Errorf("operation %s got an egress policy it never asked for", other)
+		}
+	}
+	// The shared policy still selects every operation and still grants only
+	// the original three rules, so the neighbours are where they were.
+	ops := pols["wc-operations"]
+	if ops.Spec.PodSelector.MatchLabels[LabelOperation] != "" {
+		t.Errorf("the shared policy narrowed to %v", ops.Spec.PodSelector.MatchLabels)
+	}
+	if len(ops.Spec.Egress) != 3 {
+		t.Errorf("the shared policy has %d rules, want the original 3", len(ops.Spec.Egress))
+	}
+
+	// Withdrawing the declaration withdraws the grant.
+	h.setEgress("map")
+	h.reconcile()
+	if _, ok := h.policies()["wc-egress-map"]; ok {
+		t.Error("the egress policy outlived the declaration that asked for it")
+	}
+}
+
+// TestValidateRejectsUnknownEgressDestination: a typo has to fail admission
+// rather than be ignored, or it surfaces as a pod that cannot connect with
+// nothing to explain why.
+func TestValidateRejectsUnknownEgressDestination(t *testing.T) {
+	spec := &v1alpha1.WorkloadSpec{
+		Operations: []v1alpha1.Operation{{
+			Name:     "feed",
+			Template: container(),
+			Egress:   []v1alpha1.EgressRule{{To: v1alpha1.EgressDestination("internet")}},
+		}},
+	}
+	err := Validate(spec)
+	if err == nil {
+		t.Fatal("an unknown egress destination was accepted")
+	}
+	for _, want := range []string{"feed", "internet"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+
+	// The two known destinations pass, including both together.
+	spec.Operations[0].Egress = []v1alpha1.EgressRule{{To: v1alpha1.EgressMetadata}, {To: v1alpha1.EgressInternet}}
+	if err := Validate(spec); err != nil {
+		t.Errorf("the known destinations were rejected: %v", err)
+	}
+	// So does an operation that declares none.
+	spec.Operations[0].Egress = nil
+	if err := Validate(spec); err != nil {
+		t.Errorf("an operation with no egress was rejected: %v", err)
+	}
 }
 
 func TestSegmentVolumeSizedFromSpec(t *testing.T) {
