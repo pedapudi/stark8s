@@ -1263,7 +1263,7 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			for _, work := range resp.Work {
 				for _, seg := range work.Segments {
 					if w.checkpoint != nil && w.checkpoint.covers(ch, seg) {
-						acks := []coordinator.SegmentAck{{ID: seg.ID, Holder: seg.Holder, Pod: w.Instance}}
+						acks := []coordinator.SegmentAck{{ID: seg.ID, AppendID: seg.AppendID, Holder: seg.Holder, Pod: w.Instance}}
 						if err := w.retry(ctx, func() error { return w.ack(ch, acks) }); err != nil {
 							return err
 						}
@@ -1276,7 +1276,7 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 							return ctx.Err()
 						}
 						failure := fmt.Sprintf("fetch segment %s from %s: %v", seg.ID, seg.Holder, err)
-						delivery := []coordinator.SegmentAck{{ID: seg.ID, Holder: seg.Holder, Pod: w.Instance, Failure: failure, RetryAfterMillis: 500}}
+						delivery := []coordinator.SegmentAck{{ID: seg.ID, AppendID: seg.AppendID, Holder: seg.Holder, Pod: w.Instance, Failure: failure, RetryAfterMillis: 500}}
 						if nackErr := w.nack(ch, delivery); nackErr != nil {
 							return fmt.Errorf("%s; return delivery: %w", failure, nackErr)
 						}
@@ -1297,7 +1297,7 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 							}
 						}
 					}
-					acks := []coordinator.SegmentAck{{ID: seg.ID, Holder: seg.Holder, Pod: w.Instance}}
+					acks := []coordinator.SegmentAck{{ID: seg.ID, AppendID: seg.AppendID, Holder: seg.Holder, Pod: w.Instance}}
 					if w.checkpoint != nil {
 						if err := w.commitCheckpoint(ctx, h, ch, acks, false, false); err != nil {
 							return err

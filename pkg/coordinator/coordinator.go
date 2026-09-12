@@ -317,6 +317,10 @@ func (co *Coordinator) rebindHeldSegments(selfAddr string) {
 				continue
 			}
 			delete(c.all, key)
+			if c.inflight[key] == s {
+				delete(c.inflight, key)
+				c.inflight[selfAddr+"/"+s.id] = s
+			}
 			s.holder = selfAddr
 			c.all[s.key()] = s
 		}
@@ -899,6 +903,9 @@ func (co *Coordinator) AnnounceSession(name, opName, podName, incarnation string
 
 // index adds a segment to the channel's structures.
 func (co *Coordinator) index(c *channel, s *segment) {
+	if s.appendID == "" {
+		s.appendID = s.producer + "/" + s.id
+	}
 	if _, dup := c.all[s.key()]; dup {
 		return
 	}
@@ -1021,7 +1028,7 @@ func (co *Coordinator) Produce(name, opName string, recs []Record) error {
 			}
 		}
 		s := &segment{
-			id: id, holder: co.selfAddr, producer: "coordinator",
+			id: id, appendID: "coordinator/" + id, holder: co.selfAddr, producer: "coordinator",
 			channel: name, part: k.p, epoch: k.e, records: int64(len(groups[k])),
 			delivered: map[string]bool{}, acked: map[string]bool{}, data: groups[k],
 		}

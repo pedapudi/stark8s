@@ -209,9 +209,10 @@ type ConsumeResponse struct {
 
 // SegmentAck marks a fetched segment as processed by the calling pod.
 type SegmentAck struct {
-	ID     string `json:"id"`
-	Holder string `json:"holder"`
-	Pod    string `json:"pod"`
+	ID       string `json:"id"`
+	AppendID string `json:"appendId,omitempty"`
+	Holder   string `json:"holder"`
+	Pod      string `json:"pod"`
 	// Failure describes why an unfinished delivery was returned. Ack ignores
 	// it; Nack records it for operator diagnostics.
 	Failure string `json:"failure,omitempty"`

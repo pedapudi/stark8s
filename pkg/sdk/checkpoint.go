@@ -83,11 +83,14 @@ func (w *Worker) startCheckpoint(ctx context.Context, h Handlers) error {
 }
 
 func inputKey(channel string, ack coordinator.SegmentAck) string {
+	if ack.AppendID != "" {
+		return channel + "\x00append\x00" + ack.AppendID
+	}
 	return channel + "\x00" + ack.Holder + "\x00" + ack.ID
 }
 
 func (s *checkpointSession) covers(channel string, seg coordinator.SegmentRef) bool {
-	return s.covered[inputKey(channel, coordinator.SegmentAck{ID: seg.ID, Holder: seg.Holder})]
+	return s.covered[inputKey(channel, coordinator.SegmentAck{ID: seg.ID, AppendID: seg.AppendID, Holder: seg.Holder})]
 }
 
 func cloneOutputs(in map[string][]coordinator.SegmentAnnouncement) map[string][]coordinator.SegmentAnnouncement {

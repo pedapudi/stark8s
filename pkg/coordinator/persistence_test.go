@@ -229,6 +229,10 @@ func TestCoordinatorHeldSegmentUsesReplacementAddress(t *testing.T) {
 	if err := co.Produce("input", "", []Record{{Key: "a", Value: 1}}); err != nil {
 		t.Fatal(err)
 	}
+	response, err := co.Consume("input", "sink", "sink-0", 1)
+	if err != nil || len(response.Work) != 1 {
+		t.Fatalf("initial delivery=%+v err=%v", response, err)
+	}
 	restored, err := NewDurable(ctx, "replacement:8090", store, "state", "writer-2")
 	if err != nil {
 		t.Fatal(err)
@@ -237,12 +241,42 @@ func TestCoordinatorHeldSegmentUsesReplacementAddress(t *testing.T) {
 	if !ok || len(records) != 1 || records[0].Key != "a" {
 		t.Fatalf("replacement segment records=%+v ok=%v", records, ok)
 	}
-	response, err := restored.Consume("input", "sink", "sink-0", 1)
+	if err := restored.Ack("input", []SegmentAck{{ID: "ext-1", Holder: "replacement:8090", Pod: "sink-0"}}); err != nil {
+		t.Fatal(err)
+	}
+	metrics := channelMetrics(restored, "input")
+	if metrics.InFlight != 0 || metrics.Pending != 0 || metrics.Acknowledged != 1 {
+		t.Fatalf("replacement acknowledgement: %+v", metrics)
+	}
+}
+
+func TestCoordinatorRestoresEveryExternalInputSegment(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Work) != 1 || len(response.Work[0].Segments) != 1 || response.Work[0].Segments[0].Holder != "replacement:8090" {
-		t.Fatalf("replacement delivery: %+v", response.Work)
+	co, err := NewDurable(ctx, "first:8090", store, "state", "writer-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := co.Configure([]graph.Channel{{Name: "input", To: "sink", Partitioning: graph.Partitioning{Partitions: 2}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.Produce("input", "", []Record{{Key: "a", Value: 1}, {Key: "b", Value: 2}}); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := NewDurable(ctx, "replacement:8090", store, "state", "writer-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"ext-1", "ext-2"} {
+		if records, ok := restored.Segment(id); !ok || len(records) != 1 {
+			t.Fatalf("segment %s records=%+v ok=%v", id, records, ok)
+		}
+	}
+	if metrics := channelMetrics(restored, "input"); metrics.Produced != 2 || metrics.Pending != 2 {
+		t.Fatalf("restored external inputs: %+v", metrics)
 	}
 }
 

@@ -224,10 +224,11 @@ func (co *Coordinator) restore(body []byte) error {
 			all[appendID] = true
 		}
 		legacyAll := !pc.AppendIndex
+		var appendAliases []string
 		for key, ps := range pc.Segments {
 			s := &segment{id: ps.ID, holder: ps.Holder, producer: ps.Producer, op: ps.Operation, channel: ps.Channel, part: ps.Partition, epoch: ps.Epoch, records: ps.Records, bytes: ps.Bytes, durable: ps.Durable || durableHolder(ps.Holder), task: ps.Task, delivered: ps.Delivered, acked: ps.Acked, retryAfter: ps.RetryAfter, appendID: ps.AppendID, offset: ps.Offset, retentionDeleted: ps.RetentionDeleted, lost: ps.Lost, released: ps.Released, reported: ps.Reported, data: ps.Data}
 			if s.appendID == "" {
-				s.appendID = key
+				s.appendID = s.producer + "/" + s.id
 			}
 			if s.delivered == nil {
 				s.delivered = map[string]bool{}
@@ -239,7 +240,11 @@ func (co *Coordinator) restore(body []byte) error {
 				s.retryAfter = map[string]time.Time{}
 			}
 			c.appendIDs[s.appendID] = s
-			if legacyAll || all[s.appendID] {
+			if key != s.appendID {
+				c.appendIDs[key] = s
+				appendAliases = append(appendAliases, key)
+			}
+			if legacyAll || all[key] || all[s.appendID] {
 				c.all[s.key()] = s
 			}
 			if len(s.delivered) > 0 {
@@ -284,6 +289,9 @@ func (co *Coordinator) restore(body []byte) error {
 			if s := c.appendIDs[key]; s != nil {
 				c.held = append(c.held, s)
 			}
+		}
+		for _, key := range appendAliases {
+			delete(c.appendIDs, key)
 		}
 		co.channels[name] = c
 	}

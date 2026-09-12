@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,73 @@ import (
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 	"github.com/pedapudi/stark8s/pkg/storage"
 )
+
+func TestCheckpointRecognizesCoordinatorInputAfterAddressChange(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	segments, _ := storage.NewLocal(t.TempDir())
+	checkpoints, _ := storage.NewLocal(t.TempDir())
+	firstSegments := httptest.NewServer(nil)
+	co, err := coordinator.NewDurable(ctx, strings.TrimPrefix(firstSegments.URL, "http://"), segments, "workload/coordinator.json", "coordinator-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := co.Configure([]graph.Channel{{Name: "input", To: "reduce", Partitioning: graph.Partitioning{Partitions: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	firstSegments.Config.Handler = coordinator.SegmentHandler(co)
+	control := httptest.NewServer(coordinator.Handler(co))
+	if err := co.Produce("input", "", []coordinator.Record{{Key: "one", Value: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.Seal("input"); err != nil {
+		t.Fatal(err)
+	}
+
+	state := 0
+	recordCalls := 0
+	handlers := Handlers{
+		OnRecord: func(_ context.Context, _ *Worker, _ Record) error {
+			recordCalls++
+			state++
+			return nil
+		},
+		Snapshot: func(context.Context) ([]byte, error) { return json.Marshal(state) },
+		Restore:  func(_ context.Context, body []byte) error { return json.Unmarshal(body, &state) },
+	}
+	crashed := errors.New("stop after input checkpoint")
+	first := checkpointTestWorker(control.URL, firstSegments.URL, segments, checkpoints, "reduce-0", "first")
+	first.Outbound = nil
+	first.checkpointAfterCommit = func() error { return crashed }
+	if err := first.Run(ctx, handlers); !errors.Is(err, crashed) {
+		t.Fatalf("first worker: %v", err)
+	}
+	if recordCalls != 1 || state != 1 {
+		t.Fatalf("before replacement calls=%d state=%d", recordCalls, state)
+	}
+	control.Close()
+	firstSegments.Close()
+
+	replacementSegments := httptest.NewServer(nil)
+	co, err = coordinator.NewDurable(ctx, strings.TrimPrefix(replacementSegments.URL, "http://"), segments, "workload/coordinator.json", "coordinator-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacementSegments.Config.Handler = coordinator.SegmentHandler(co)
+	control = httptest.NewServer(coordinator.Handler(co))
+	defer control.Close()
+	defer replacementSegments.Close()
+	replacement := checkpointTestWorker(control.URL, replacementSegments.URL, segments, checkpoints, "reduce-0", "second")
+	replacement.Outbound = nil
+	done := make(chan error, 1)
+	go func() { done <- replacement.Run(ctx, handlers) }()
+	waitForMetric(t, co, "input", func(metric coordinator.ChannelMetrics) bool { return metric.Acknowledged == 1 })
+	if recordCalls != 1 || state != 1 {
+		t.Fatalf("after replacement calls=%d state=%d", recordCalls, state)
+	}
+	cancel()
+	<-done
+}
 
 func TestCheckpointFollowsFixedOwnerAcrossPodReplacement(t *testing.T) {
 	ctx := context.Background()
