@@ -56,6 +56,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/api/v1alpha1"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
@@ -242,34 +243,6 @@ func Validate(s *v1alpha1.WorkloadSpec) error {
 			adj[c.From] = append(adj[c.From], c.To)
 		}
 	}
-	// An operation whose inbound channels all come from outside the workload
-	// never completes. Nothing can say that the outside world has stopped
-	// sending, so the operation keeps consuming, the controller never seals
-	// its outbound channels, and a Materialized edge from it waits on a seal
-	// that cannot come. That is a graph which hangs rather than one which
-	// fails, so reject it here instead.
-	for _, o := range s.Operations {
-		inbound, external := 0, 0
-		for _, c := range s.Channels {
-			if c.To != o.Name {
-				continue
-			}
-			inbound++
-			if c.From == "" {
-				external++
-			}
-		}
-		if inbound == 0 || inbound != external {
-			continue
-		}
-		for _, c := range s.Channels {
-			if c.From == o.Name && c.Delivery == v1alpha1.DeliveryMaterialized {
-				return fmt.Errorf("channel %q is Materialized, but its producer %q is fed only from outside the workload and so never completes; the channel would never be sealed and %q would never start",
-					c.Name, o.Name, c.To)
-			}
-		}
-	}
-
 	const white, grey, black = 0, 1, 2
 	color := map[string]int{}
 	var visit func(string) error
@@ -478,7 +451,7 @@ func mustRunIdle(spec *v1alpha1.WorkloadSpec, op *v1alpha1.Operation) bool {
 		return true
 	}
 	for _, c := range inbound {
-		if c.Delivery != v1alpha1.DeliveryMaterialized {
+		if c.Delivery != graph.DeliveryMaterialized {
 			return true
 		}
 	}
@@ -494,7 +467,7 @@ func (r *Reconciler) reconcileOperation(ctx context.Context, wl *v1alpha1.Worklo
 	// until that channel is sealed. Feedback channels are excluded because
 	// they seal only when the loop terminates.
 	for _, c := range wl.Spec.Inbound(op.Name) {
-		if c.Delivery == v1alpha1.DeliveryMaterialized && c.Feedback == nil && !metrics.channels[c.Name].Sealed {
+		if c.Delivery == graph.DeliveryMaterialized && c.Feedback == nil && !metrics.channels[c.Name].Sealed {
 			return st, nil
 		}
 	}

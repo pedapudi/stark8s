@@ -3,17 +3,16 @@ package sdk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
-	"runtime"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
 
@@ -26,7 +25,7 @@ type harness struct {
 	wg  sync.WaitGroup
 }
 
-func newHarness(t *testing.T, specs []v1alpha1.Channel) (*harness, context.CancelFunc) {
+func newHarness(t *testing.T, specs []graph.Channel) (*harness, context.CancelFunc) {
 	t.Helper()
 	seg := httptest.NewServer(nil)
 	co := coordinator.New(strings.TrimPrefix(seg.URL, "http://"))
@@ -81,8 +80,8 @@ func (h *harness) waitComplete(op string) {
 }
 
 func TestWorkersExchangeSegmentsDirectly(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "words", From: "read", To: "count", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 4}},
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "words", From: "read", To: "count", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4}},
 		{Name: "totals", From: "count"},
 	})
 	defer stop()
@@ -159,11 +158,11 @@ func TestWorkersExchangeSegmentsDirectly(t *testing.T) {
 }
 
 func TestSynchronousLoopRunsSupersteps(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "graph", From: "seed", To: "rank", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2}},
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "graph", From: "seed", To: "rank", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2}},
 		{Name: "contrib", From: "rank", To: "rank",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2},
-			Feedback:     &v1alpha1.Feedback{Mode: v1alpha1.FeedbackSynchronous, MaxEpochs: 4}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackSynchronous, MaxEpochs: 4}},
 		{Name: "ranks", From: "rank"},
 	})
 	defer stop()
@@ -248,11 +247,11 @@ func TestSynchronousLoopRunsSupersteps(t *testing.T) {
 }
 
 func TestAsynchronousLoopDivertsAtBound(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "prompts", To: "agent", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2}},
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "prompts", To: "agent", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2}},
 		{Name: "turns", From: "agent", To: "agent",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2},
-			Feedback:     &v1alpha1.Feedback{Mode: v1alpha1.FeedbackAsynchronous, MaxEpochs: 3, Overflow: "unfinished"}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackAsynchronous, MaxEpochs: 3, Overflow: "unfinished"}},
 		{Name: "unfinished", From: "agent"},
 		{Name: "answers", From: "agent"},
 	})
@@ -316,402 +315,321 @@ func TestSegmentDirFallsBackWhenNotWritable(t *testing.T) {
 	s.remove(id)
 }
 
-// --- ticking and externally fed channels ------------------------------------
-
-// tickWorker builds a worker with a tick interval set.
-func (h *harness) tickWorker(op, instance string, inbound, outbound []string, every time.Duration) *Worker {
-	w := h.worker(op, instance, inbound, outbound)
-	w.TickInterval = every
-	return w
-}
-
-// waitFor blocks until done is closed, and fails the test rather than hanging
-// when it is not. Every test below can deadlock if the change under test is
-// wrong, so none of them may wait forever.
-func waitFor(t *testing.T, done <-chan struct{}, within time.Duration, what string) {
+// combineOutput drains a Retained channel through the coordinator and returns
+// the surviving records keyed by their record key.
+func combineOutput(t *testing.T, h *harness, channel string) map[string]float64 {
 	t.Helper()
-	select {
-	case <-done:
-	case <-time.After(within):
-		t.Fatalf("%s did not happen within %s", what, within)
-	}
-}
-
-// TestExternallyFedChannelDoesNotBlockDrain pins the deadlock. An operation
-// that takes one channel from another operation and one from outside the
-// workload must finish when the first is done. Nothing seals a channel with no
-// producing operation, so counting it would keep the operation open forever:
-// OnDrain would never run, the operation would never report done, its outbound
-// channels would never be sealed, and any consumer behind a Materialized edge
-// would wait for a seal that cannot come.
-func TestExternallyFedChannelDoesNotBlockDrain(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "work", From: "gen", To: "poll"},
-		// No From: fed from outside through the records API.
-		{Name: "config", To: "poll"},
-		{Name: "out", From: "poll"},
-	})
-	defer stop()
-
-	// A configuration record is waiting before the operation starts, so the
-	// test also shows that an external channel is still consumed rather than
-	// merely ignored.
-	if err := h.co.Produce("config", "", []coordinator.Record{{Key: "region", Value: "north"}}); err != nil {
-		t.Fatal(err)
-	}
-
-	h.run(h.worker("gen", "gen-0", nil, []string{"work"}), Handlers{
-		Source: func(ctx context.Context, w *Worker) error {
-			for i := 0; i < 3; i++ {
-				if err := w.Emit("work", fmt.Sprintf("w%d", i), i); err != nil {
-					return err
-				}
-			}
-			return nil
-		},
-	})
-
-	var mu sync.Mutex
-	byChannel := map[string]int{}
-	drained := make(chan struct{})
-	h.run(h.worker("poll", "poll-0", []string{"config", "work"}, []string{"out"}), Handlers{
-		OnRecord: func(ctx context.Context, w *Worker, r Record) error {
-			mu.Lock()
-			byChannel[r.Channel]++
-			mu.Unlock()
-			return nil
-		},
-		OnDrain: func(ctx context.Context, w *Worker) error {
-			close(drained)
-			return nil
-		},
-	})
-
-	// The controller's job: seal a completed operation's outbound channels.
-	// Nothing ever does this for "config", which is the whole point.
-	h.waitComplete("gen")
-	if err := h.co.Seal("work"); err != nil {
-		t.Fatal(err)
-	}
-
-	waitFor(t, drained, 20*time.Second, "OnDrain on an operation with an externally fed inbound channel")
-
-	mu.Lock()
-	defer mu.Unlock()
-	if byChannel["work"] != 3 {
-		t.Errorf("consumed %d records on work, want 3", byChannel["work"])
-	}
-	if byChannel["config"] != 1 {
-		t.Errorf("consumed %d records on config, want the 1 produced from outside", byChannel["config"])
-	}
-}
-
-// TestExternallyFedChannelDoesNotBlockCompletion is the same rule one layer
-// down. The worker deciding it has drained is not enough: the coordinator
-// gates completion on every inbound channel being sealed too, and the
-// controller seals an operation's outbound channels only once the coordinator
-// calls it complete. Both layers have to agree or a Materialized edge
-// downstream still waits forever.
-func TestExternallyFedChannelDoesNotBlockCompletion(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "work", From: "gen", To: "poll"},
-		{Name: "config", To: "poll"},
-		{Name: "out", From: "poll"},
-	})
-	defer stop()
-
-	h.run(h.worker("gen", "gen-0", nil, []string{"work"}), Handlers{
-		Source: func(ctx context.Context, w *Worker) error {
-			return w.Emit("work", "w0", 1)
-		},
-	})
-	h.run(h.worker("poll", "poll-0", []string{"config", "work"}, []string{"out"}), Handlers{
-		OnRecord: func(ctx context.Context, w *Worker, r Record) error { return nil },
-	})
-
-	h.waitComplete("gen")
-	if err := h.co.Seal("work"); err != nil {
-		t.Fatal(err)
-	}
-	h.waitComplete("poll")
-}
-
-// TestTickFiresOnTheInterval checks both halves of the schedule: it fires
-// repeatedly, and it does not fire faster than the interval. The operation
-// consumes one externally fed channel, which never drains, so the loop keeps
-// running for the whole test.
-func TestTickFiresOnTheInterval(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "config", To: "poll"},
-		{Name: "out", From: "poll"},
-	})
-	defer stop()
-
-	const every = 20 * time.Millisecond
-	const want = 8
-	// ceiling separates a tick scheduled against the clock from one that
-	// merely rides the idle backoff. The backoff doubles from 100ms to a
-	// two-second ceiling, so without capping the sleep at the next tick these
-	// gaps would run to hundreds of milliseconds and then to seconds.
-	const ceiling = 500 * time.Millisecond
-
-	var mu sync.Mutex
-	var at []time.Time
-	enough := make(chan struct{})
-	h.run(h.tickWorker("poll", "poll-0", []string{"config"}, []string{"out"}, every), Handlers{
-		Tick: func(ctx context.Context, w *Worker) error {
-			mu.Lock()
-			defer mu.Unlock()
-			at = append(at, time.Now())
-			if len(at) == want {
-				close(enough)
-			}
-			return nil
-		},
-	})
-
-	waitFor(t, enough, 20*time.Second, fmt.Sprintf("%d ticks at %s", want, every))
-
-	mu.Lock()
-	defer mu.Unlock()
-	// The interval is a floor. Consecutive ticks are measured from the end of
-	// the previous handler, so no gap may be shorter than it. A millisecond of
-	// slack absorbs clock granularity.
-	for i := 1; i < len(at); i++ {
-		gap := at[i].Sub(at[i-1])
-		if gap < every-time.Millisecond {
-			t.Errorf("tick %d came %s after tick %d, closer than the %s interval", i, gap, i-1, every)
-		}
-		if gap > ceiling {
-			t.Errorf("tick %d came %s after tick %d, far past the %s interval: the idle backoff is outrunning the clock", i, gap, i-1, every)
-		}
-	}
-	t.Logf("%d ticks at a %s interval over %s", len(at), every, at[len(at)-1].Sub(at[0]))
-}
-
-// goroutineID returns the calling goroutine's id, read from its own stack.
-// Nothing in production should do this. A test may, because the property
-// being checked here is exactly which goroutine a handler runs on.
-func goroutineID(t *testing.T) uint64 {
-	t.Helper()
-	var buf [64]byte
-	n := runtime.Stack(buf[:], false)
-	// The first line reads "goroutine 123 [running]:".
-	fields := strings.Fields(string(buf[:n]))
-	if len(fields) < 2 {
-		t.Fatalf("cannot read a goroutine id from %q", string(buf[:n]))
-	}
-	id, err := strconv.ParseUint(fields[1], 10, 64)
-	if err != nil {
-		t.Fatalf("cannot read a goroutine id from %q: %v", string(buf[:n]), err)
-	}
-	return id
-}
-
-// TestTickNeverOverlapsOnRecord is the safety argument for calling Tick from
-// the consume loop rather than from a goroutine of its own. The handlers share
-// the emit buffers and the worker's epoch field, neither of which is guarded,
-// so overlapping them would corrupt both.
-//
-// The check is goroutine identity, because that is the actual property and it
-// holds on every run. Watching for a collision instead would be statistical:
-// a Tick moved onto its own goroutine is only spawned between passes over the
-// inbound channels, so whether it lands inside a record handler depends on how
-// the records happen to be batched, and a run that saw no collision would
-// prove nothing. Same goroutine implies no overlap and needs no luck.
-//
-// Two weaker detectors run alongside it and cost nothing: a flag that catches
-// a collision if one does occur, and a counter touched by both handlers with
-// no synchronisation, which makes -race report an overlap.
-func TestTickNeverOverlapsOnRecord(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "work", From: "gen", To: "poll"},
-		{Name: "config", To: "poll"},
-		{Name: "out", From: "poll"},
-	})
-	defer stop()
-
-	const records = 200
-	h.run(h.worker("gen", "gen-0", nil, []string{"work"}), Handlers{
-		Source: func(ctx context.Context, w *Worker) error {
-			for i := 0; i < records; i++ {
-				if err := w.Emit("work", fmt.Sprintf("w%d", i), i); err != nil {
-					return err
-				}
-			}
-			return nil
-		},
-	})
-
-	var inHandler atomic.Int32
-	var overlaps atomic.Int32
-	var ticks atomic.Int32
-	var recordGo, tickGo atomic.Uint64
-	// unguarded is touched by both handlers with no synchronisation at all.
-	// If they ever overlap, -race reports it.
-	unguarded := 0
-	consumed := 0
-
-	enter := func() func() {
-		if !inHandler.CompareAndSwap(0, 1) {
-			overlaps.Add(1)
-		}
-		return func() { inHandler.Store(0) }
-	}
-
-	drained := make(chan struct{})
-	h.run(h.tickWorker("poll", "poll-0", []string{"config", "work"}, []string{"out"}, time.Millisecond), Handlers{
-		OnRecord: func(ctx context.Context, w *Worker, r Record) error {
-			defer enter()()
-			recordGo.Store(goroutineID(t))
-			unguarded++
-			consumed++
-			// Both handlers dwell, so that a Tick running anywhere else has a
-			// wide window to land inside this one. Without the dwell the
-			// handlers are so short that an overlapping Tick usually misses
-			// them and the flag alone would not see it.
-			time.Sleep(200 * time.Microsecond)
-			return nil
-		},
-		Tick: func(ctx context.Context, w *Worker) error {
-			defer enter()()
-			tickGo.Store(goroutineID(t))
-			unguarded++
-			ticks.Add(1)
-			time.Sleep(200 * time.Microsecond)
-			return nil
-		},
-		OnDrain: func(ctx context.Context, w *Worker) error {
-			close(drained)
-			return nil
-		},
-	})
-
-	h.waitComplete("gen")
-	if err := h.co.Seal("work"); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, drained, 20*time.Second, "OnDrain on a ticking operation")
-
-	if ticks.Load() == 0 {
-		t.Fatal("Tick never fired, so the no-overlap result proves nothing")
-	}
-	if consumed == 0 {
-		t.Fatal("no records were consumed, so the no-overlap result proves nothing")
-	}
-	if r, k := recordGo.Load(), tickGo.Load(); r != k {
-		t.Errorf("OnRecord ran on goroutine %d and Tick on goroutine %d; Tick must run on the consume loop's own goroutine, which is what lets the two share the emit buffers and the epoch field without a lock", r, k)
-	}
-	if n := overlaps.Load(); n != 0 {
-		t.Errorf("Tick and OnRecord overlapped %d times", n)
-	}
-	if consumed != records {
-		t.Errorf("consumed %d records, want %d", consumed, records)
-	}
-	if unguarded != consumed+int(ticks.Load()) {
-		t.Errorf("the unguarded counter reads %d, want %d; the two handlers interleaved", unguarded, consumed+int(ticks.Load()))
-	}
-	t.Logf("%d records and %d ticks on one goroutine, no overlap", consumed, ticks.Load())
-}
-
-// TestTickingOperationStillCompletes is the combined case the feature exists
-// for: an operation driven by both a channel and a clock, which still finishes
-// when its bounded input is done.
-func TestTickingOperationStillCompletes(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "work", From: "gen", To: "poll"},
-		{Name: "out", From: "poll"},
-	})
-	defer stop()
-
-	h.run(h.worker("gen", "gen-0", nil, []string{"work"}), Handlers{
-		Source: func(ctx context.Context, w *Worker) error {
-			for i := 0; i < 20; i++ {
-				if err := w.Emit("work", fmt.Sprintf("w%d", i), i); err != nil {
-					return err
-				}
-			}
-			return nil
-		},
-	})
-
-	var ticks atomic.Int32
-	h.run(h.tickWorker("poll", "poll-0", []string{"work"}, []string{"out"}, 2*time.Millisecond), Handlers{
-		OnRecord: func(ctx context.Context, w *Worker, r Record) error { return nil },
-		Tick: func(ctx context.Context, w *Worker) error {
-			ticks.Add(1)
-			// Emitting from Tick must reach the channel like any other output.
-			return w.Emit("out", "tick", ticks.Load())
-		},
-	})
-
-	h.waitComplete("gen")
-	if err := h.co.Seal("work"); err != nil {
-		t.Fatal(err)
-	}
-	h.waitComplete("poll")
-
-	if ticks.Load() == 0 {
-		t.Fatal("the operation completed without ticking once")
-	}
-	recs, _, err := h.co.Records("out", "", 0, 0)
+	recs, _, err := h.co.Records(channel, "", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(recs) != int(ticks.Load()) {
-		t.Errorf("out carries %d records for %d ticks; records emitted from Tick are being lost", len(recs), ticks.Load())
+	out := map[string]float64{}
+	for _, r := range recs {
+		n, ok := r.Value.(float64)
+		if !ok {
+			t.Fatalf("record %q value %v is not a number", r.Key, r.Value)
+		}
+		out[r.Key] = n
+	}
+	return out
+}
+
+// A channel that declares Combine folds records sharing a key before they go
+// on the wire, so the segment carries one record per key instead of one per
+// emitted fact. This is the map-side half of a reduce-by-key.
+func TestCombineFoldsRecordsBeforeTheWire(t *testing.T) {
+	for _, tc := range []struct {
+		mode graph.CombineMode
+		want map[string]float64
+	}{
+		{graph.CombineSum, map[string]float64{"a": 6, "b": 40}},
+		{graph.CombineMin, map[string]float64{"a": 1, "b": 10}},
+		{graph.CombineMax, map[string]float64{"a": 3, "b": 30}},
+		{graph.CombineCount, map[string]float64{"a": 3, "b": 2}},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			h, done := newHarness(t, []graph.Channel{{
+				Name: "out", From: "src", Durability: graph.DurabilityRetained,
+				Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 1},
+				Combine:      tc.mode,
+			}})
+			defer done()
+			w := h.worker("src", "src-0", nil, []string{"out"})
+			h.run(w, Handlers{Source: func(ctx context.Context, w *Worker) error {
+				for _, e := range []struct {
+					k string
+					v int
+				}{{"a", 1}, {"b", 10}, {"a", 2}, {"b", 30}, {"a", 3}} {
+					if err := w.Emit("out", e.k, e.v); err != nil {
+						return err
+					}
+				}
+				return nil
+			}})
+			h.waitComplete("src")
+
+			got := combineOutput(t, h, "out")
+			if len(got) != len(tc.want) {
+				t.Fatalf("%s emitted %d records, want %d (one per key): %v", tc.mode, len(got), len(tc.want), got)
+			}
+			for k, want := range tc.want {
+				if got[k] != want {
+					t.Fatalf("%s key %q = %v, want %v", tc.mode, k, got[k], want)
+				}
+			}
+			// Five facts went in; the combined channel must carry two records.
+			if m := h.co.Metrics().Channels[0]; m.Produced != 2 {
+				t.Fatalf("%s put %d records on the wire, want 2 from 5 facts", tc.mode, m.Produced)
+			}
+		})
 	}
 }
 
-// TestTickWithoutInboundChannelsIsRejected: an operation with no inbound
-// channels runs Source and never reaches the loop that calls Tick, so the
-// handler would sit there uncalled. Run says so instead, before it touches
-// the network.
-func TestTickWithoutInboundChannelsIsRejected(t *testing.T) {
-	w := &Worker{Operation: "poll", Instance: "poll-0", TickInterval: time.Second}
-	err := w.Run(context.Background(), Handlers{
-		Tick: func(ctx context.Context, w *Worker) error { return nil },
-	})
-	if err == nil {
-		t.Fatal("a Tick handler with no inbound channels was accepted")
-	}
-	if !strings.Contains(err.Error(), "no inbound channels") {
-		t.Errorf("error is %q, want it to name the missing inbound channels", err)
+// Without Combine the same program ships every fact, which is the behaviour
+// the feature exists to avoid and the regression guard for the default path.
+func TestWithoutCombineEveryFactGoesOnTheWire(t *testing.T) {
+	h, done := newHarness(t, []graph.Channel{{
+		Name: "out", From: "src", Durability: graph.DurabilityRetained,
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 1},
+	}})
+	defer done()
+	w := h.worker("src", "src-0", nil, []string{"out"})
+	h.run(w, Handlers{Source: func(ctx context.Context, w *Worker) error {
+		for i := 0; i < 5; i++ {
+			if err := w.Emit("out", "a", 1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}})
+	h.waitComplete("src")
+	if m := h.co.Metrics().Channels[0]; m.Produced != 5 {
+		t.Fatalf("uncombined channel produced %d records, want 5", m.Produced)
 	}
 }
 
-// TestAllExternalInboundNeverDrains: an operation fed only from outside the
-// workload has no bounded input, and nothing can ever say the outside world
-// has stopped sending. Draining it would report done before it had processed
-// anything and abandon the stream it exists to serve, so it stays in the loop
-// instead. This is what lets a poller keep polling.
-func TestAllExternalInboundNeverDrains(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "config", To: "poll"},
-		{Name: "out", From: "poll"},
+// A non-numeric record on an arithmetic combine channel is a programming
+// error and must be reported at the Emit that caused it, not silently dropped
+// or deferred to a decode failure in the consumer.
+func TestCombineRejectsNonNumericValues(t *testing.T) {
+	h, done := newHarness(t, []graph.Channel{{
+		Name: "out", From: "src", Durability: graph.DurabilityRetained,
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 1},
+		Combine:      graph.CombineSum,
+	}})
+	defer done()
+	w := h.worker("src", "src-0", nil, []string{"out"})
+	if err := w.Emit("out", "a", "not a number"); err == nil {
+		t.Fatal("Emit accepted a string on a Sum channel")
+	} else if !strings.Contains(err.Error(), "must be a number") {
+		t.Fatalf("unhelpful error: %v", err)
+	}
+}
+
+func TestCombineModeIdempotence(t *testing.T) {
+	for mode, want := range map[graph.CombineMode]bool{
+		graph.CombineMin: true, graph.CombineMax: true,
+		graph.CombineSum: false, graph.CombineCount: false,
+	} {
+		if got := mode.Idempotent(); got != want {
+			t.Fatalf("%s.Idempotent() = %v, want %v", mode, got, want)
+		}
+	}
+}
+
+func TestSynchronousLoopDoesNotStallOnIdlePods(t *testing.T) {
+	const supersteps = 8
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "graph", From: "seed", To: "rank", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4}},
+		{Name: "contrib", From: "rank", To: "rank",
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackSynchronous, MaxEpochs: supersteps}},
 	})
 	defer stop()
 
-	var ticks atomic.Int32
-	drained := make(chan struct{})
-	h.run(h.tickWorker("poll", "poll-0", []string{"config"}, []string{"out"}, 5*time.Millisecond), Handlers{
-		Tick: func(ctx context.Context, w *Worker) error {
-			ticks.Add(1)
-			return nil
-		},
-		OnDrain: func(ctx context.Context, w *Worker) error {
-			close(drained)
+	h.run(h.worker("seed", "seed-0", nil, []string{"graph"}), Handlers{
+		Source: func(ctx context.Context, w *Worker) error { return w.Emit("graph", "only", 1.0) },
+	})
+	for _, inst := range []string{"rank-0", "rank-1"} {
+		w := h.worker("rank", inst, []string{"graph", "contrib"}, []string{"contrib"})
+		w.SetFeedback([]string{"contrib"}, []string{"contrib"})
+		keys := map[string]bool{}
+		h.run(w, Handlers{
+			OnRecord: func(ctx context.Context, w *Worker, r Record) error {
+				keys[r.Key] = true
+				return nil
+			},
+			OnEpochEnd: func(ctx context.Context, w *Worker, epoch int32) error {
+				for k := range keys {
+					if err := w.Emit("contrib", k, 1.0); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		})
+	}
+	h.waitComplete("seed")
+	if err := h.co.Seal("graph"); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	h.waitComplete("rank")
+	if elapsed, budget := time.Since(start), supersteps*time.Second; elapsed > budget {
+		t.Fatalf("%d supersteps took %v, over the %v budget", supersteps, elapsed, budget)
+	}
+}
+
+func TestUnfetchableSegmentFailsInsteadOfHanging(t *testing.T) {
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "s", From: "produce", To: "consume", Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 1}},
+	})
+	defer stop()
+
+	// A segment announced by a pod that is no longer serving it. The
+	// coordinator still queues it, and nothing can ever fetch it.
+	if err := h.co.Announce("s", "produce", []coordinator.SegmentAnnouncement{{
+		ID: "seg-gone", Channel: "s", Records: 1, Bytes: 2,
+		Holder: "127.0.0.1:1", Producer: "produce-0",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	errc := make(chan error, 1)
+	w := h.worker("consume", "consume-0", []string{"s"}, nil)
+	go func() { errc <- w.Run(h.ctx, Handlers{}) }()
+	select {
+	case err := <-errc:
+		if err == nil || !strings.Contains(err.Error(), "seg-gone") {
+			t.Fatalf("Run returned %v, want an error naming the segment it could not fetch", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned: a segment that cannot be fetched hangs the worker instead of failing it")
+	}
+}
+
+func TestSegmentFetchStopsWhenResponseBodyStalls(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("["))
+		w.(http.Flusher).Flush()
+		<-release
+	}))
+	defer func() {
+		close(release)
+		srv.Close()
+	}()
+	w := &Worker{}
+	w.init()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := w.fetchRetry(ctx, coordinator.SegmentRef{ID: "stalled", Holder: strings.TrimPrefix(srv.URL, "http://")})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("fetch returned %v, want context deadline", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("fetch took %v after cancellation", elapsed)
+	}
+}
+
+func TestLargeRecordsFlushOnBytes(t *testing.T) {
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "big", From: "a", To: "b", Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 1}},
+		{Name: "small", From: "a", To: "b", Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 1}},
+	})
+	defer stop()
+	w := h.worker("a", "a-0", nil, []string{"big", "small"})
+
+	// Ten records of 1 MiB each: 10 MiB buffered, nowhere near the 500
+	// records the count threshold waits for.
+	value := strings.Repeat("x", 1<<20)
+	for i := 0; i < 10; i++ {
+		if err := w.Emit("big", fmt.Sprintf("k%d", i), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(w.unannounced["big"]); n < 2 {
+		t.Fatalf("10 MiB in 10 records produced %d segments, want at least 2: the buffer grows without bound until it holds %d records", n, flushRecords)
+	}
+
+	// Small records still flush on the count alone, at exactly the same
+	// point as before.
+	for i := 0; i < flushRecords-1; i++ {
+		if err := w.Emit("small", "k", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(w.unannounced["small"]); n != 0 {
+		t.Fatalf("%d small records produced %d segments, want none before the %dth", flushRecords-1, n, flushRecords)
+	}
+	if err := w.Emit("small", "k", 0); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(w.unannounced["small"]); n != 1 {
+		t.Fatalf("%d small records produced %d segments, want exactly 1", flushRecords, n)
+	}
+}
+
+func TestTickFiresWhileWaitingForInputSeal(t *testing.T) {
+	h, stop := newHarness(t, []graph.Channel{{Name: "input", To: "poll"}})
+	defer stop()
+	w := h.worker("poll", "poll-0", []string{"input"}, nil)
+	w.TickInterval = 10 * time.Millisecond
+	ticked := make(chan struct{}, 1)
+	h.run(w, Handlers{Tick: func(context.Context, *Worker) error {
+		select {
+		case ticked <- struct{}{}:
+		default:
+		}
+		return nil
+	}})
+	select {
+	case <-ticked:
+	case <-time.After(time.Second):
+		t.Fatal("Tick did not run while the worker waited for input")
+	}
+}
+
+func TestExternalInputMustBeSealedBeforeCompletion(t *testing.T) {
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "bounded", From: "source", To: "sink"},
+		{Name: "external", To: "sink"},
+	})
+	defer stop()
+	if err := h.co.Produce("external", "", []coordinator.Record{{Key: "config", Value: "ready"}}); err != nil {
+		t.Fatal(err)
+	}
+	h.run(h.worker("source", "source-0", nil, []string{"bounded"}), Handlers{
+		Source: func(context.Context, *Worker) error { return nil },
+	})
+	seen := make(chan struct{}, 1)
+	h.run(h.worker("sink", "sink-0", []string{"bounded", "external"}, nil), Handlers{
+		OnRecord: func(_ context.Context, _ *Worker, r Record) error {
+			if r.Channel == "external" {
+				seen <- struct{}{}
+			}
 			return nil
 		},
 	})
-
+	h.waitComplete("source")
+	if err := h.co.Seal("bounded"); err != nil {
+		t.Fatal(err)
+	}
 	select {
-	case <-drained:
-		t.Fatal("an operation fed only from outside the workload reported drained; it would stop serving its stream")
-	case <-time.After(300 * time.Millisecond):
+	case <-seen:
+	case <-time.After(time.Second):
+		t.Fatal("external input was not consumed")
 	}
-	if ticks.Load() == 0 {
-		t.Error("the operation neither drained nor ticked, so it is not running at all")
+	time.Sleep(200 * time.Millisecond)
+	for _, op := range h.co.Metrics().Operations {
+		if op.Name == "sink" && op.Complete {
+			t.Fatal("sink completed before its external input was sealed")
+		}
 	}
-	t.Logf("still running after 300ms with %d ticks and no drain", ticks.Load())
+	if err := h.co.Seal("external"); err != nil {
+		t.Fatal(err)
+	}
+	h.waitComplete("sink")
 }

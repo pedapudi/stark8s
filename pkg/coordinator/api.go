@@ -17,7 +17,7 @@
 // also serves them on the segment API.
 package coordinator
 
-import "github.com/pedapudi/stark8s/api/v1alpha1"
+import "github.com/pedapudi/stark8s/api/graph"
 
 // Ports and paths.
 const (
@@ -25,6 +25,8 @@ const (
 	ControlPort = 8080
 	// SegmentPort is where every worker pod (and the coordinator) serves
 	// segments: GET /segments/{id} returns the segment's records as JSON.
+	// Worker pods also serve GET /blobs/{id}, the pass-by-reference payload
+	// of a record, as a byte stream. The coordinator never sees either.
 	SegmentPort = 8090
 
 	// OperationHeader names the calling operation. When token verification
@@ -35,9 +37,12 @@ const (
 	// the last record scanned, to pass as `after` on the next call.
 	RecordsNextHeader = "X-Stark8s-Next"
 
-	PathTopology = "/topology"      // PUT  []v1alpha1.Channel; GET -> []v1alpha1.Channel (pods read partitioning and feedback settings)
-	PathMetrics  = "/metrics"       // GET  Metrics
-	PathHealth   = "/healthz"       // GET
+	PathTopology = "/topology" // PUT/GET []graph.Channel
+	PathMetrics  = "/metrics"  // GET Metrics
+	PathHealth   = "/healthz"
+	// PathEditor serves the graph editor with observed topology and metrics.
+	PathEditor = "/editor"
+
 	PathRegister = "/pods/register" // POST PodRegistration (also the heartbeat; repeat every 5s)
 	// PathSourceDone: the pod has emitted everything it will emit. Source
 	// pods post it after their Source handler; Drain pods post it after
@@ -135,9 +140,9 @@ type ConsumeResponse struct {
 	Epoch int32 `json:"epoch"`
 	// Quiescent: Synchronous feedback with nothing pending or in flight at the
 	// current epoch; the consumer should finish the epoch and report it.
-	Quiescent bool                  `json:"quiescent"`
-	MaxEpochs int32                 `json:"maxEpochs,omitempty"`
-	Mode      v1alpha1.FeedbackMode `json:"mode,omitempty"`
+	Quiescent bool               `json:"quiescent"`
+	MaxEpochs int32              `json:"maxEpochs,omitempty"`
+	Mode      graph.FeedbackMode `json:"mode,omitempty"`
 }
 
 // SegmentAck marks a fetched segment as processed by the calling pod.

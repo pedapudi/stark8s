@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/api/v1alpha1"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
@@ -161,9 +162,9 @@ func mapReduce() *v1alpha1.Workload {
 				{Name: "map", Slots: 2, Scaling: v1alpha1.Scaling{Horizontal: v1alpha1.HorizontalScaling{Min: 1, Max: 4}}, Template: container()},
 				{Name: "reduce", Slots: 1, Scaling: v1alpha1.Scaling{Horizontal: v1alpha1.HorizontalScaling{Min: 1, Max: 3}}, Template: container()},
 			},
-			Channels: []v1alpha1.Channel{
-				{Name: "lines", From: "read", To: "map", Delivery: v1alpha1.DeliveryPipelined},
-				{Name: "shuffle", From: "map", To: "reduce", Delivery: v1alpha1.DeliveryMaterialized},
+			Channels: []graph.Channel{
+				{Name: "lines", From: "read", To: "map", Delivery: graph.DeliveryPipelined},
+				{Name: "shuffle", From: "map", To: "reduce", Delivery: graph.DeliveryMaterialized},
 				{Name: "totals", From: "reduce"},
 			},
 		},
@@ -345,7 +346,7 @@ func TestPerEdgeNetworkPolicies(t *testing.T) {
 	if err := h.c.Get(context.Background(), h.key, wl); err != nil {
 		t.Fatal(err)
 	}
-	wl.Spec.Channels = []v1alpha1.Channel{wl.Spec.Channels[0], wl.Spec.Channels[2]}
+	wl.Spec.Channels = []graph.Channel{wl.Spec.Channels[0], wl.Spec.Channels[2]}
 	if err := h.c.Update(context.Background(), wl); err != nil {
 		t.Fatal(err)
 	}
@@ -450,47 +451,6 @@ func opNamed(name string) v1alpha1.Operation {
 	}
 }
 
-// TestValidateRejectsMaterializedBehindAnExternallyFedOperation: an operation
-// whose every inbound channel comes from outside the workload never completes,
-// because nothing can say the outside world has stopped sending. The
-// controller seals an operation's outbound channels only once it completes, so
-// a Materialized edge from such an operation waits on a seal that cannot come
-// and its consumer never starts. That graph hangs, so it is refused.
-func TestValidateRejectsMaterializedBehindAnExternallyFedOperation(t *testing.T) {
-	spec := &v1alpha1.WorkloadSpec{
-		Operations: []v1alpha1.Operation{opNamed("poll"), opNamed("sink")},
-		Channels: []v1alpha1.Channel{
-			{Name: "config", To: "poll"},
-			{Name: "out", From: "poll", To: "sink", Delivery: v1alpha1.DeliveryMaterialized},
-		},
-	}
-	err := Validate(spec)
-	if err == nil {
-		t.Fatal("a Materialized channel behind an operation fed only from outside was accepted; it would hang")
-	}
-	for _, want := range []string{"out", "poll", "sink"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error %q does not name %q", err, want)
-		}
-	}
-
-	// The same graph is fine when the edge is Pipelined, because a Pipelined
-	// consumer does not wait for a seal.
-	spec.Channels[1].Delivery = v1alpha1.DeliveryPipelined
-	if err := Validate(spec); err != nil {
-		t.Errorf("a Pipelined edge from the same operation was rejected: %v", err)
-	}
-
-	// And fine when the operation also has an inbound channel with a producer,
-	// because that one can be sealed and so the operation can complete.
-	spec.Channels[1].Delivery = v1alpha1.DeliveryMaterialized
-	spec.Operations = append(spec.Operations, opNamed("gen"))
-	spec.Channels = append(spec.Channels, v1alpha1.Channel{Name: "work", From: "gen", To: "poll"})
-	if err := Validate(spec); err != nil {
-		t.Errorf("an operation with one producer-backed inbound channel was rejected: %v", err)
-	}
-}
-
 // TestValidateRejectsNegativeTickInterval keeps a typo from becoming a worker
 // that never ticks.
 func TestValidateRejectsNegativeTickInterval(t *testing.T) {
@@ -498,7 +458,7 @@ func TestValidateRejectsNegativeTickInterval(t *testing.T) {
 	op.TickInterval = &metav1.Duration{Duration: -time.Second}
 	spec := &v1alpha1.WorkloadSpec{
 		Operations: []v1alpha1.Operation{op},
-		Channels:   []v1alpha1.Channel{{Name: "config", To: "poll"}},
+		Channels:   []graph.Channel{{Name: "config", To: "poll"}},
 	}
 	if err := Validate(spec); err == nil {
 		t.Fatal("a negative tickInterval was accepted")

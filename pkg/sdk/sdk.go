@@ -15,6 +15,11 @@
 // with no consuming operation are posted to the coordinator instead, which
 // keeps them for external readers.
 //
+// A large payload can bypass the record encoding entirely: EmitBlob streams
+// it into a file of its own beside the segments and emits a small record
+// referring to it, and OpenBlob streams it back from the holder. See blob.go
+// for the rule binding a blob's lifetime to its carrying segment.
+//
 // Run implements the completion and loop protocols so application code only
 // handles records. A worker never exits on its own: once its work is done
 // it keeps heartbeating and serving the segments it holds until ctx ends,
@@ -39,7 +44,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
 
@@ -56,6 +61,11 @@ type wireRecord struct {
 	Key   string          `json:"key"`
 	Value json.RawMessage `json:"value"`
 	Epoch int32           `json:"epoch"`
+	// blob is the id of the blob this record refers to, for a record from
+	// EmitBlob. It is producer-local bookkeeping: it stays out of the segment
+	// (the handle in Value is what travels) and binds the blob's lifetime to
+	// the segment this record is flushed into.
+	blob string
 }
 
 // Handlers are the application callbacks. All are optional.
@@ -103,6 +113,22 @@ type bufKey struct {
 	epoch     int32
 }
 
+// Thresholds at which an output buffer becomes a segment. Whichever trips
+// first wins.
+const (
+	// flushRecords caps a segment's record count. The per-record and
+	// per-segment costs are what dominate for the small records most
+	// operations emit, so this is the threshold that usually decides.
+	flushRecords = 500
+	// flushBytes caps a buffer's accumulated encoded size, so an operation
+	// emitting large values cannot hold an unbounded amount of memory while
+	// waiting for the 500th record. 4 MiB is small enough that a pod with a
+	// few dozen live buffers stays well inside a normal container limit, and
+	// large enough that it never fires for records under ~8 KiB, which
+	// leaves the record threshold in charge of the common case.
+	flushBytes = 4 << 20
+)
+
 // Worker is one pod of an operation.
 type Worker struct {
 	Coordinator string
@@ -122,18 +148,26 @@ type Worker struct {
 	// TickInterval is how often Handlers.Tick is called. Zero leaves the
 	// operation driven entirely by its records.
 	TickInterval time.Duration
+	runContext   context.Context
 
 	feedback    map[string]bool
 	feedbackOut map[string]bool
 
 	client *http.Client
-	specs  map[string]v1alpha1.Channel
+	// blobClient transfers blob payloads; unlike client it has no overall
+	// timeout, because a blob may be arbitrarily large.
+	blobClient *http.Client
+	specs      map[string]graph.Channel
 
-	buffers     map[bufKey][]wireRecord
-	order       []bufKey
-	rr          map[string]uint64
-	unannounced map[string][]coordinator.SegmentAnnouncement
-	overflowed  map[string]int64
+	buffers map[bufKey][]wireRecord
+	// combineIndex maps a buffered record key to its slot in buffers, for
+	// channels that declare a Combine function.
+	combineIndex map[bufKey]map[string]int
+	bufBytes     map[bufKey]int
+	order        []bufKey
+	rr           map[string]uint64
+	unannounced  map[string][]coordinator.SegmentAnnouncement
+	overflowed   map[string]int64
 
 	epoch    int32
 	maxEpoch int32
@@ -200,8 +234,12 @@ func (w *Worker) init() {
 	if w.client == nil {
 		w.client = &http.Client{Timeout: 60 * time.Second}
 	}
+	if w.blobClient == nil {
+		w.blobClient = newBlobClient()
+	}
 	if w.buffers == nil {
 		w.buffers = map[bufKey][]wireRecord{}
+		w.bufBytes = map[bufKey]int{}
 		w.rr = map[string]uint64{}
 		w.unannounced = map[string][]coordinator.SegmentAnnouncement{}
 		w.overflowed = map[string]int64{}
@@ -253,11 +291,17 @@ func (w *Worker) MaxEpochs() int32 { return w.maxEpoch }
 
 // --- segment store --------------------------------------------------------
 
-// segmentStore keeps this pod's segments as JSON files, one per segment.
+// segmentStore keeps this pod's segments as JSON files, one per segment, and
+// the blobs those segments refer to as files of their own.
 type segmentStore struct {
 	dir string
 	mu  sync.Mutex
 	seq uint64
+	// blobs maps a blob id to the segments that still reference it, and
+	// segBlobs is the reverse index. Both are producer-local; see blob.go for
+	// the lifetime rule they implement.
+	blobs    map[string]*blobRef
+	segBlobs map[string][]string
 }
 
 func openStore(dir, instance string) (*segmentStore, error) {
@@ -314,7 +358,12 @@ func (s *segmentStore) serve(rw http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(rw, f)
 }
 
-func (s *segmentStore) remove(id string) { _ = os.Remove(s.path(id)) }
+// remove deletes a released segment and, with it, the blobs no other segment
+// of this pod still refers to.
+func (s *segmentStore) remove(id string) {
+	_ = os.Remove(s.path(id))
+	s.releaseBlobs(id)
+}
 
 // --- emitting -------------------------------------------------------------
 
@@ -328,6 +377,13 @@ func (s *segmentStore) remove(id string) { _ = os.Remove(s.path(id)) }
 // loop's Overflow channel, or dropped and counted when none is declared.
 // Full buffers are flushed as segments; Flush sends the rest.
 func (w *Worker) Emit(channel, key string, value any) error {
+	return w.emit(channel, key, value, "")
+}
+
+// emit is Emit with the id of the blob the value refers to, empty for an
+// ordinary record. The id travels with the buffered record so that flushing
+// can bind the blob to the segment it lands in.
+func (w *Worker) emit(channel, key string, value any, blob string) error {
 	w.init()
 	spec, err := w.spec(channel)
 	if err != nil {
@@ -340,27 +396,32 @@ func (w *Worker) Emit(channel, key string, value any) error {
 	epoch := w.epoch
 	if w.feedbackOut[channel] {
 		epoch = w.epoch + 1
-		if spec.Feedback != nil && spec.Feedback.Mode == v1alpha1.FeedbackAsynchronous && epoch >= spec.Feedback.MaxEpochs {
+		if spec.Feedback != nil && spec.Feedback.Mode == graph.FeedbackAsynchronous && epoch >= spec.Feedback.MaxEpochs {
 			if spec.Feedback.Overflow == "" {
 				w.overflowed[channel]++
+				if blob != "" && w.store != nil {
+					// The record is dropped at the loop bound, so nothing will
+					// ever reference the blob.
+					w.store.dropBlob(blob)
+				}
 				return nil
 			}
-			return w.buffer(spec.Feedback.Overflow, key, b, epoch)
+			return w.buffer(spec.Feedback.Overflow, key, b, epoch, blob)
 		}
 	}
-	return w.buffer(channel, key, b, epoch)
+	return w.buffer(channel, key, b, epoch, blob)
 }
 
-func (w *Worker) buffer(channel, key string, value json.RawMessage, epoch int32) error {
+func (w *Worker) buffer(channel, key string, value json.RawMessage, epoch int32, blob string) error {
 	spec, err := w.spec(channel)
 	if err != nil {
 		return err
 	}
 	var p int32
 	switch {
-	case spec.To == "" || spec.Partitioning.Mode == v1alpha1.PartitionBroadcast:
+	case spec.To == "" || spec.Partitioning.Mode == graph.PartitionBroadcast:
 		p = 0
-	case spec.Partitioning.Mode == v1alpha1.PartitionHash:
+	case spec.Partitioning.Mode == graph.PartitionHash:
 		p = int32(coordinator.HashPartition(key, int(spec.Partitioning.Partitions)))
 	default:
 		p = int32(w.rr[channel] % uint64(spec.Partitioning.Partitions))
@@ -370,33 +431,124 @@ func (w *Worker) buffer(channel, key string, value json.RawMessage, epoch int32)
 	if _, ok := w.buffers[k]; !ok {
 		w.order = append(w.order, k)
 	}
-	w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: value, Epoch: epoch})
-	if len(w.buffers[k]) >= 500 {
+	if spec.Combine != "" {
+		if blob != "" {
+			return fmt.Errorf("channel %q combines numeric records and cannot carry blobs", channel)
+		}
+		if err := w.combine(k, spec.Combine, key, value, epoch); err != nil {
+			return err
+		}
+		// The buffer now holds one record per distinct key, so the flush
+		// threshold bounds distinct keys rather than facts. That is the point:
+		// a stage emitting many records per key ships far fewer.
+		if len(w.buffers[k]) >= flushRecords || w.bufBytes[k] >= flushBytes {
+			return w.flushBuffer(k)
+		}
+		return nil
+	}
+	w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: value, Epoch: epoch, blob: blob})
+	w.bufBytes[k] += len(key) + len(value)
+	if len(w.buffers[k]) >= flushRecords || w.bufBytes[k] >= flushBytes {
 		return w.flushBuffer(k)
 	}
 	return nil
 }
 
+// combine folds a record into the buffered record for the same key, applying
+// the channel's function. The buffered slice stays the source of truth so that
+// flushBuffer, the byte accounting and the ordering guarantees all keep
+// working unchanged; combineIndex only says where in it each key lives.
+func (w *Worker) combine(k bufKey, mode graph.CombineMode, key string, value json.RawMessage, epoch int32) error {
+	if w.combineIndex == nil {
+		w.combineIndex = map[bufKey]map[string]int{}
+	}
+	idx, ok := w.combineIndex[k]
+	if !ok {
+		idx = map[string]int{}
+		w.combineIndex[k] = idx
+	}
+
+	if mode == graph.CombineCount {
+		// Count ignores the emitted value, so it is the one mode that accepts
+		// a null and the one that cannot fail on a non-numeric record.
+		if at, seen := idx[key]; seen {
+			var n float64
+			if err := json.Unmarshal(w.buffers[k][at].Value, &n); err != nil {
+				return fmt.Errorf("combine Count on channel %q key %q: %w", k.channel, key, err)
+			}
+			return w.setCombined(k, at, n+1)
+		}
+		idx[key] = len(w.buffers[k])
+		b, _ := json.Marshal(1)
+		w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: b, Epoch: epoch})
+		w.bufBytes[k] += len(key) + len(b)
+		return nil
+	}
+
+	var incoming float64
+	if err := json.Unmarshal(value, &incoming); err != nil {
+		return fmt.Errorf("combine %s on channel %q key %q: value must be a number: %w", mode, k.channel, key, err)
+	}
+	at, seen := idx[key]
+	if !seen {
+		idx[key] = len(w.buffers[k])
+		w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: value, Epoch: epoch})
+		w.bufBytes[k] += len(key) + len(value)
+		return nil
+	}
+	var held float64
+	if err := json.Unmarshal(w.buffers[k][at].Value, &held); err != nil {
+		return fmt.Errorf("combine %s on channel %q key %q: %w", mode, k.channel, key, err)
+	}
+	switch mode {
+	case graph.CombineSum:
+		held += incoming
+	case graph.CombineMin:
+		if incoming < held {
+			held = incoming
+		}
+	case graph.CombineMax:
+		if incoming > held {
+			held = incoming
+		}
+	default:
+		return fmt.Errorf("channel %q: unknown combine mode %q", k.channel, mode)
+	}
+	return w.setCombined(k, at, held)
+}
+
+// setCombined rewrites a buffered record in place, keeping the byte accounting
+// consistent with the new encoding.
+func (w *Worker) setCombined(k bufKey, at int, v float64) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	w.bufBytes[k] += len(b) - len(w.buffers[k][at].Value)
+	w.buffers[k][at].Value = b
+	return nil
+}
+
 // spec returns the declared channel, loading the topology on first use.
-func (w *Worker) spec(channel string) (v1alpha1.Channel, error) {
+func (w *Worker) spec(channel string) (graph.Channel, error) {
 	if w.specs == nil {
 		if err := w.loadTopology(); err != nil {
-			return v1alpha1.Channel{}, err
+			return graph.Channel{}, err
 		}
 	}
 	s, ok := w.specs[channel]
 	if !ok {
-		return v1alpha1.Channel{}, fmt.Errorf("channel %q is not declared in the topology", channel)
+		return graph.Channel{}, fmt.Errorf("channel %q is not declared in the topology", channel)
 	}
 	return s, nil
 }
 
 func (w *Worker) loadTopology() error {
-	var specs []v1alpha1.Channel
+	var specs []graph.Channel
 	if err := w.do("GET", coordinator.PathTopology, nil, &specs); err != nil {
 		return err
 	}
-	m := map[string]v1alpha1.Channel{}
+	m := map[string]graph.Channel{}
 	for _, s := range specs {
 		if s.Partitioning.Partitions <= 0 {
 			s.Partitioning.Partitions = 1
@@ -413,18 +565,32 @@ func (w *Worker) flushBuffer(k bufKey) error {
 	recs := w.buffers[k]
 	if len(recs) == 0 {
 		delete(w.buffers, k)
+		delete(w.combineIndex, k)
+		delete(w.bufBytes, k)
 		return nil
 	}
 	spec, err := w.spec(k.channel)
 	if err != nil {
 		return err
 	}
+	var blobs []string
+	for _, r := range recs {
+		if r.blob != "" {
+			blobs = append(blobs, r.blob)
+		}
+	}
 	if spec.To == "" {
 		body, _ := json.Marshal(recs)
 		if err := w.do("POST", coordinator.PathChannels+"/"+k.channel+coordinator.SuffixRecords, body, nil); err != nil {
 			return err
 		}
+		// A channel with no consuming operation has no segment and so no
+		// release signal: blobs referenced from it stay bound to nothing and
+		// live until the pod does, which is what an external reader of a
+		// retained record log needs.
 		delete(w.buffers, k)
+		delete(w.combineIndex, k)
+		delete(w.bufBytes, k)
 		return nil
 	}
 	if w.store == nil {
@@ -436,7 +602,12 @@ func (w *Worker) flushBuffer(k bufKey) error {
 	if err != nil {
 		return err
 	}
+	// Bind before announcing: from the moment a consumer can learn of the
+	// segment, releasing it must also release its blobs.
+	w.store.bind(id, blobs)
 	delete(w.buffers, k)
+	delete(w.combineIndex, k)
+	delete(w.bufBytes, k)
 	w.unannounced[k.channel] = append(w.unannounced[k.channel], coordinator.SegmentAnnouncement{
 		ID: id, Channel: k.channel, Partition: k.partition, Epoch: k.epoch,
 		Records: int64(len(recs)), Bytes: size, Holder: w.addr, Producer: w.Instance, Task: w.task,
@@ -536,8 +707,12 @@ func (w *Worker) ack(ch string, acks []coordinator.SegmentAck) error {
 }
 
 // fetch reads a segment from its holder.
-func (w *Worker) fetch(ref coordinator.SegmentRef) ([]wireRecord, error) {
-	resp, err := w.client.Get("http://" + ref.Holder + "/segments/" + ref.ID)
+func (w *Worker) fetch(ctx context.Context, ref coordinator.SegmentRef) ([]wireRecord, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+ref.Holder+"/segments/"+ref.ID, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := w.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -591,6 +766,7 @@ func (w *Worker) serveSegments() error {
 	w.addr = net.JoinHostPort(host, strconv.Itoa(port))
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /segments/{id}", store.serve)
+	mux.HandleFunc("GET "+blobRoute+"{id}", store.serveBlob)
 	go func() { _ = http.Serve(ln, mux) }()
 	w.store = store
 	return nil
@@ -598,12 +774,50 @@ func (w *Worker) serveSegments() error {
 
 // --- running --------------------------------------------------------------
 
+// Consume polling. When a poll finds nothing the worker sleeps, doubling the
+// sleep from pollFloor up to a ceiling.
+const (
+	pollFloor = 100 * time.Millisecond
+	// pollCeiling applies outside a Synchronous loop, where a pod that finds
+	// nothing is idle because its producers are slow and there is nothing
+	// for it to react to promptly.
+	pollCeiling = 2 * time.Second
+	// barrierPollCeiling applies while an inbound Synchronous feedback
+	// channel is driving the epoch. There every pod is idle by definition
+	// while it waits at the barrier, so pollCeiling saturates and the pod
+	// can then sleep for up to another 2s after the barrier releases -- dead
+	// time comparable to a whole superstep, on every superstep.
+	//
+	// 250ms bounds that wakeup delay while keeping the request rate modest:
+	// one consume per inbound channel per pod per 250ms, so 4 requests per
+	// second per channel from each pod. A 200-pod operation with two inbound
+	// channels asks the coordinator for at most 1600 consumes/s, each a
+	// short critical section under the coordinator's single mutex. Polling
+	// harder would trade a shared bottleneck for latency the barrier does
+	// not actually have.
+	barrierPollCeiling = 250 * time.Millisecond
+)
+
+// Fetching a segment from its holder. The coordinator has no way to hand a
+// delivered segment back to the pending queue on request, so a consumer that
+// cannot fetch one has only two options: retry, or stop. It retries this
+// many times, doubling the wait from fetchRetryFloor to fetchRetryCeiling --
+// about 5s in total, enough to ride out a holder restart or a network blip
+// -- and then fails.
+const (
+	fetchAttempts     = 6
+	fetchRetryFloor   = 200 * time.Millisecond
+	fetchRetryCeiling = 2 * time.Second
+	fetchRetryBudget  = 6 * time.Second
+)
+
 // Run executes the worker: it registers, starts heartbeats and the segment
 // server, loads the topology, and then drives the source or the
 // poll/process/ack loop. When the work is done it idles until ctx ends,
 // returning nil; handler errors abort the worker.
 func (w *Worker) Run(ctx context.Context, h Handlers) error {
 	w.init()
+	w.runContext = ctx
 	// A handler combination that can never fire is a programming mistake, so
 	// it is caught here, before the worker touches the network. Tick is
 	// driven by the loop that polls inbound channels, and an operation with
@@ -635,6 +849,7 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 		} else if err != nil {
 			log.Printf("%s: output channel already sealed; source output was produced by an earlier pod", w.Instance)
 			w.buffers = map[bufKey][]wireRecord{}
+			w.bufBytes = map[bufKey]int{}
 		}
 		if err := w.retry(ctx, w.reportDone); err != nil {
 			return err
@@ -643,53 +858,11 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 		return w.idle(ctx)
 	}
 
-	// external is the set of inbound channels that no operation produces
-	// into. They are fed from outside the workload through the records API,
-	// and bounded counts the rest.
-	//
-	// The distinction decides when this operation is finished. A channel with
-	// no producing operation is never sealed, because sealing is what the
-	// controller does when a producing operation completes and there is no
-	// producer here to complete. A channel reports drained only once it is
-	// sealed, so an external channel reports drained never. Counting it in
-	// the drain test would hold the operation open for a seal that cannot
-	// come: OnDrain would never run, the operation would never report done,
-	// its outbound channels would never be sealed, and every consumer behind
-	// a Materialized edge downstream would wait forever. So completion is
-	// decided by the channels that have a producer, and an external topic
-	// left open forever does not by itself keep the operation running.
-	//
-	// An operation whose inbound channels are ALL external is a different
-	// case, and it does not finish. There is no bounded input to wait for and
-	// nothing can ever say the outside world has stopped sending, so the
-	// operation stays in this loop consuming and ticking until its context
-	// ends. Draining it instead would be worse: it would report done before
-	// processing anything and quietly discard the stream it exists to serve.
-	// Such an operation cannot feed a Materialized channel, because that edge
-	// waits on a seal that requires a completion which will never happen.
-	// Validate rejects that graph rather than letting it hang.
-	//
-	// The epoch barrier below is left alone. A Synchronous loop that also
-	// takes an external side input still refuses to advance while that input
-	// is unsealed, which is the behaviour this change does not attempt to
-	// fix; no example combines the two.
-	external := map[string]bool{}
-	bounded := 0
-	for _, ch := range w.Inbound {
-		spec, err := w.spec(ch)
-		if err != nil {
-			return err
-		}
-		if spec.From == "" {
-			external[ch] = true
-			continue
-		}
-		bounded++
-	}
-	if len(external) > 0 {
-		log.Printf("%s: %d of %d inbound channels have no producing operation; completion follows the other %d",
-			w.Instance, len(external), len(w.Inbound), bounded)
-	}
+	backoff := pollFloor
+	// observedEpoch is the last epoch this pod saw, so that a barrier
+	// release puts the poll rate back at the floor even when the pod then
+	// finds no work of its own in the new superstep.
+	observedEpoch := int32(-1)
 
 	ticking := h.Tick != nil && w.TickInterval > 0
 	if h.Tick != nil && !ticking {
@@ -697,7 +870,6 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 	}
 	nextTick := time.Now().Add(w.TickInterval)
 
-	backoff := 100 * time.Millisecond
 	for ctx.Err() == nil {
 		progressed := false
 		allDrained := true
@@ -712,19 +884,28 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			}
 			if w.feedback[ch] {
 				w.maxEpoch = resp.MaxEpochs
-				if resp.Mode != v1alpha1.FeedbackAsynchronous {
+				if resp.Mode != graph.FeedbackAsynchronous {
 					w.syncLoop = true
 					w.epoch = resp.Epoch
 				}
 			}
 			for _, work := range resp.Work {
 				for _, seg := range work.Segments {
-					recs, err := w.fetch(seg)
+					recs, err := w.fetchRetry(ctx, seg)
 					if err != nil {
-						// The segment stays in flight; it is redelivered if
-						// this pod expires or marked lost if the holder does.
-						log.Printf("fetch segment %s: %v", seg.ID, err)
-						continue
+						if ctx.Err() != nil {
+							return ctx.Err()
+						}
+						// Skipping the segment is not an option: it stays in
+						// flight, so the channel never goes quiet, Drained
+						// never becomes true, OnDrain never runs and the
+						// workload hangs silently. The coordinator returns an
+						// in-flight segment to the pending queue only when it
+						// expires the consumer holding it, which needs this
+						// pod to stop heartbeating. So fail: the pod exits
+						// naming the cause, the Deployment replaces it, and
+						// the coordinator re-queues the segment after PodTTL.
+						return fmt.Errorf("consuming %s: %w", ch, err)
 					}
 					progressed = true
 					w.task = coordinator.TaskID{Channel: ch, Partition: work.Partition, Epoch: seg.Epoch}
@@ -750,16 +931,20 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 					}
 				}
 			}
-			if !resp.Drained && !external[ch] {
+			if !resp.Drained {
 				allDrained = false
 			}
-			if w.feedback[ch] && resp.Mode != v1alpha1.FeedbackAsynchronous && !resp.Quiescent {
+			if w.feedback[ch] && resp.Mode != graph.FeedbackAsynchronous && !resp.Quiescent {
 				allQuiet = false
 			}
 			if !w.feedback[ch] && !resp.Drained {
 				// A loop cannot end an epoch while non-loop inputs still flow.
 				allQuiet = false
 			}
+		}
+		if w.epoch != observedEpoch {
+			observedEpoch = w.epoch
+			backoff = pollFloor
 		}
 
 		// Tick runs here: on this goroutine, between passes over the inbound
@@ -777,12 +962,11 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			// than the interval does not come due again the instant it returns.
 			nextTick = time.Now().Add(w.TickInterval)
 		}
-
 		if progressed {
-			backoff = 100 * time.Millisecond
+			backoff = pollFloor
 			continue
 		}
-		if allDrained && bounded > 0 {
+		if allDrained {
 			if h.OnDrain != nil {
 				if err := h.OnDrain(ctx, w); err != nil {
 					return err
@@ -817,10 +1001,20 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			w.lastDone = w.epoch
 			continue
 		}
+		ceiling := pollCeiling
+		if w.syncLoop {
+			ceiling = barrierPollCeiling
+		}
+		if backoff > ceiling {
+			backoff = ceiling
+		}
 		// The idle backoff must not outrun the clock. Without this cap a
 		// worker that has settled at the two-second ceiling would serve a
 		// hundred-millisecond tick interval two seconds late.
 		wait := backoff
+		if wait > ceiling {
+			wait = ceiling
+		}
 		if ticking {
 			if d := time.Until(nextTick); d < wait {
 				wait = d
@@ -829,11 +1023,41 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 		if wait > 0 {
 			time.Sleep(wait)
 		}
-		if backoff < 2*time.Second {
+		if backoff < ceiling {
 			backoff *= 2
 		}
 	}
 	return ctx.Err()
+}
+
+// fetchRetry fetches a segment, riding out a transient failure of its holder
+// for a bounded number of attempts.
+func (w *Worker) fetchRetry(ctx context.Context, seg coordinator.SegmentRef) ([]wireRecord, error) {
+	retryCtx, cancel := context.WithTimeout(ctx, fetchRetryBudget)
+	defer cancel()
+	wait := fetchRetryFloor
+	var err error
+	for i := 0; i < fetchAttempts && retryCtx.Err() == nil; i++ {
+		var recs []wireRecord
+		if recs, err = w.fetch(retryCtx, seg); err == nil {
+			return recs, nil
+		}
+		log.Printf("fetch segment %s from %s (attempt %d of %d): %v", seg.ID, seg.Holder, i+1, fetchAttempts, err)
+		if i == fetchAttempts-1 {
+			break
+		}
+		select {
+		case <-retryCtx.Done():
+		case <-time.After(wait):
+		}
+		if wait < fetchRetryCeiling {
+			wait *= 2
+		}
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return nil, fmt.Errorf("fetch segment %s from %s: giving up after %d attempts: %w", seg.ID, seg.Holder, fetchAttempts, err)
 }
 
 // idle keeps the pod alive after its work is done: heartbeats continue,
