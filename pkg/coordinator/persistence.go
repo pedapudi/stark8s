@@ -82,6 +82,7 @@ type persistedSegment struct {
 	ID, Holder, Producer, Operation, Channel string
 	Partition, Epoch                         int32
 	Records, Bytes                           int64
+	Durable                                  bool
 	Task                                     TaskID
 	Delivered, Acked                         map[string]bool
 	RetryAfter                               map[string]time.Time
@@ -145,7 +146,7 @@ func (co *Coordinator) snapshot() persistedCoordinator {
 	for name, c := range co.channels {
 		pc := persistedChannel{Spec: c.spec, Sealed: c.sealed, Produced: c.produced, Overflowed: c.overflowed, Lost: c.lost, Acknowledged: c.acknowledged, LatestDeliveryFailure: c.latestDeliveryFailure, Epoch: c.epoch, FiniteEpochs: c.finiteEpochs, MaxEpochs: c.maxEpochs, ProductionClosed: c.productionClosed, RoundRobin: c.rr, Segments: map[string]persistedSegment{}, Cursor: c.cursor, EpochDone: c.epochDone, Records: c.records, AppendIndex: true, HistoryBase: c.historyBase, Subscriptions: map[string]persistedSubscription{}}
 		for appendID, s := range c.appendIDs {
-			pc.Segments[appendID] = persistedSegment{ID: s.id, Holder: s.holder, Producer: s.producer, Operation: s.op, Channel: s.channel, Partition: s.part, Epoch: s.epoch, Records: s.records, Bytes: s.bytes, Task: s.task, Delivered: s.delivered, Acked: s.acked, RetryAfter: s.retryAfter, AppendID: s.appendID, Offset: s.offset, RetentionDeleted: s.retentionDeleted, Lost: s.lost, Released: s.released, Reported: s.reported, Data: s.data}
+			pc.Segments[appendID] = persistedSegment{ID: s.id, Holder: s.holder, Producer: s.producer, Operation: s.op, Channel: s.channel, Partition: s.part, Epoch: s.epoch, Records: s.records, Bytes: s.bytes, Durable: s.durable, Task: s.task, Delivered: s.delivered, Acked: s.acked, RetryAfter: s.retryAfter, AppendID: s.appendID, Offset: s.offset, RetentionDeleted: s.retentionDeleted, Lost: s.lost, Released: s.released, Reported: s.reported, Data: s.data}
 		}
 		for _, s := range c.all {
 			pc.All = append(pc.All, s.appendID)
@@ -224,7 +225,7 @@ func (co *Coordinator) restore(body []byte) error {
 		}
 		legacyAll := !pc.AppendIndex
 		for key, ps := range pc.Segments {
-			s := &segment{id: ps.ID, holder: ps.Holder, producer: ps.Producer, op: ps.Operation, channel: ps.Channel, part: ps.Partition, epoch: ps.Epoch, records: ps.Records, bytes: ps.Bytes, task: ps.Task, delivered: ps.Delivered, acked: ps.Acked, retryAfter: ps.RetryAfter, appendID: ps.AppendID, offset: ps.Offset, retentionDeleted: ps.RetentionDeleted, lost: ps.Lost, released: ps.Released, reported: ps.Reported, data: ps.Data}
+			s := &segment{id: ps.ID, holder: ps.Holder, producer: ps.Producer, op: ps.Operation, channel: ps.Channel, part: ps.Partition, epoch: ps.Epoch, records: ps.Records, bytes: ps.Bytes, durable: ps.Durable || durableHolder(ps.Holder), task: ps.Task, delivered: ps.Delivered, acked: ps.Acked, retryAfter: ps.RetryAfter, appendID: ps.AppendID, offset: ps.Offset, retentionDeleted: ps.RetentionDeleted, lost: ps.Lost, released: ps.Released, reported: ps.Reported, data: ps.Data}
 			if s.appendID == "" {
 				s.appendID = key
 			}

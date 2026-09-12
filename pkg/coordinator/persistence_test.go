@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/pkg/storage"
@@ -67,6 +68,48 @@ func TestDurableCoordinatorRestoresPublicationDeliveryAndExternalRecords(t *test
 	}
 	if len(work.Work) != 0 {
 		t.Fatalf("in-flight delivery was duplicated: %+v", work)
+	}
+}
+
+func TestDurableWorkerSegmentSurvivesProducerExpiryAfterRestore(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	co, err := NewDurable(ctx, "coordinator:8090", store, "state", "writer-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	co.now = func() time.Time { return now }
+	if err := co.Configure([]graph.Channel{{Name: "values", From: "transform", To: "reduce", Partitioning: graph.Partitioning{Partitions: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.Register(PodRegistration{Operation: "transform", Pod: "transform-0", Incarnation: "first", Slots: 1}); err != nil {
+		t.Fatal(err)
+	}
+	announcement := SegmentAnnouncement{ID: "output-1", Holder: "https://objects.example/workload", Producer: "transform-0", Records: 2, Durable: true}
+	if err := co.AnnounceSession("values", "transform", "transform-0", "first", []SegmentAnnouncement{announcement}); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := NewDurable(ctx, "replacement:8090", store, "state", "writer-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored.now = func() time.Time { return now.Add(PodTTL + time.Second) }
+	if om := operationMetrics(restored, "transform"); om.HoldsUnconsumed {
+		t.Fatalf("durable segment holds producer compute: %+v", om)
+	}
+	if err := restored.Register(PodRegistration{Operation: "reduce", Pod: "reduce-0", Incarnation: "first", Slots: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if metrics := channelMetrics(restored, "values"); metrics.Lost != 0 {
+		t.Fatalf("durable segment reported lost: %+v", metrics)
+	}
+	response, err := restored.ConsumeSession("values", "reduce", "reduce-0", "first", 1)
+	if err != nil || len(response.Work) != 1 || len(response.Work[0].Segments) != 1 {
+		t.Fatalf("durable work=%+v err=%v", response, err)
 	}
 }
 

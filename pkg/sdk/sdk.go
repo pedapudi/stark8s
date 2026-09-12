@@ -835,7 +835,7 @@ func (w *Worker) flushBuffer(k bufKey) error {
 	delete(w.bufBytes, k)
 	w.unannounced[k.channel] = append(w.unannounced[k.channel], coordinator.SegmentAnnouncement{
 		ID: id, Channel: k.channel, Partition: k.partition, Epoch: k.epoch,
-		Records: int64(len(recs)), Bytes: size, Holder: holder, Producer: w.Instance, Task: w.task,
+		Records: int64(len(recs)), Bytes: size, Holder: holder, Producer: w.Instance, Durable: w.DurableSegments != nil, Task: w.task,
 	})
 	return nil
 }

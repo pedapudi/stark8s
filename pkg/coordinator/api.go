@@ -134,7 +134,9 @@ type SegmentAnnouncement struct {
 	Bytes     int64  `json:"bytes"`
 	Holder    string `json:"holder"` // host:port of the segment server
 	Producer  string `json:"producer"`
-	Task      TaskID `json:"task"`
+	// Durable reports that the segment bytes live independently of Producer.
+	Durable bool   `json:"durable,omitempty"`
+	Task    TaskID `json:"task"`
 	// Overflowed counts records the producer dropped at the loop bound of
 	// an Asynchronous feedback channel (no Overflow channel declared). An
 	// announcement with an empty ID and Overflowed > 0 reports drops only.

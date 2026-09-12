@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -154,6 +155,7 @@ type segment struct {
 	epoch    int32
 	records  int64
 	bytes    int64
+	durable  bool
 	task     TaskID
 	appendID string
 	offset   int64
@@ -759,7 +761,7 @@ func deliveryPod(key string) string {
 func (co *Coordinator) expireHolder(podName string) {
 	for _, c := range co.channels {
 		for _, s := range c.all {
-			if s.producer != podName || s.released || s.lost {
+			if s.producer != podName || s.durable || s.released || s.lost {
 				continue
 			}
 			co.markLost(c, s)
@@ -879,7 +881,7 @@ func (co *Coordinator) AnnounceSession(name, opName, podName, incarnation string
 		c.overflowed += a.Overflowed
 		s := &segment{
 			id: a.ID, holder: a.Holder, producer: a.Producer, channel: name,
-			part: a.Partition, epoch: a.Epoch, records: a.Records, bytes: a.Bytes, task: a.Task,
+			part: a.Partition, epoch: a.Epoch, records: a.Records, bytes: a.Bytes, durable: a.Durable || durableHolder(a.Holder), task: a.Task,
 			appendID: appendID, delivered: map[string]bool{}, acked: map[string]bool{}, retryAfter: map[string]time.Time{},
 		}
 		if a.Producer == "" {
@@ -928,7 +930,11 @@ func sameAppend(s *segment, a SegmentAnnouncement, channel string) bool {
 	if producer == "" {
 		producer = s.op
 	}
-	return s.id == a.ID && s.holder == a.Holder && s.producer == producer && s.channel == channel && s.part == a.Partition && s.epoch == a.Epoch && s.records == a.Records && s.bytes == a.Bytes && s.task == a.Task
+	return s.id == a.ID && s.holder == a.Holder && s.producer == producer && s.channel == channel && s.part == a.Partition && s.epoch == a.Epoch && s.records == a.Records && s.bytes == a.Bytes && s.durable == (a.Durable || durableHolder(a.Holder)) && s.task == a.Task
+}
+
+func durableHolder(holder string) bool {
+	return strings.HasPrefix(holder, "http://") || strings.HasPrefix(holder, "https://")
 }
 
 func (c *channel) enqueue(s *segment) {
@@ -1789,7 +1795,7 @@ func (co *Coordinator) operationMetrics(name string) OperationMetrics {
 		}
 		if c.spec.Durability != graph.DurabilityRetained {
 			for _, s := range c.all {
-				if s.data == nil && !s.released && s.op == name {
+				if s.data == nil && !s.durable && !s.released && s.op == name {
 					om.HoldsUnconsumed = true
 				}
 			}
