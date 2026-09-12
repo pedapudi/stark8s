@@ -17,7 +17,7 @@
 // also serves them on the segment API.
 package coordinator
 
-import "github.com/pedapudi/stark8s/api/v1alpha1"
+import "github.com/pedapudi/stark8s/api/graph"
 
 // Ports and paths.
 const (
@@ -25,19 +25,29 @@ const (
 	ControlPort = 8080
 	// SegmentPort is where every worker pod (and the coordinator) serves
 	// segments: GET /segments/{id} returns the segment's records as JSON.
+	// Worker pods also serve GET /blobs/{id}, the pass-by-reference payload
+	// of a record, as a byte stream. The coordinator never sees either.
 	SegmentPort = 8090
 
 	// OperationHeader names the calling operation. When token verification
 	// is enabled the coordinator derives the operation from the bearer
 	// token's ServiceAccount instead and rejects a mismatching header.
 	OperationHeader = "X-Stark8s-Operation"
+	// IncarnationHeader identifies one worker process within a pod. Workers
+	// create a fresh value at startup and send it on every state-changing
+	// request.
+	IncarnationHeader = "X-Stark8s-Incarnation"
 	// RecordsNextHeader on a GET records response is the log offset following
 	// the last record scanned, to pass as `after` on the next call.
 	RecordsNextHeader = "X-Stark8s-Next"
 
-	PathTopology = "/topology"      // PUT  []v1alpha1.Channel; GET -> []v1alpha1.Channel (pods read partitioning and feedback settings)
-	PathMetrics  = "/metrics"       // GET  Metrics
-	PathHealth   = "/healthz"       // GET
+	PathTopology          = "/topology"           // PUT/GET []graph.Channel
+	PathMetrics           = "/metrics"            // GET Metrics
+	PathPrometheusMetrics = "/metrics/prometheus" // GET Prometheus text exposition
+	PathHealth            = "/healthz"            // GET
+	// PathEditor serves the graph editor with observed topology and metrics.
+	PathEditor = "/editor"
+
 	PathRegister = "/pods/register" // POST PodRegistration (also the heartbeat; repeat every 5s)
 	// PathSourceDone: the pod has emitted everything it will emit. Source
 	// pods post it after their Source handler; Drain pods post it after
@@ -53,15 +63,29 @@ const (
 	SuffixSegments  = "/segments"   // POST []SegmentAnnouncement (producer)
 	SuffixConsume   = "/consume"    // GET ?pod=&max= -> ConsumeResponse
 	SuffixAck       = "/ack"        // POST []SegmentAck
+	SuffixNack      = "/nack"       // POST []SegmentAck (return unfinished deliveries)
 	SuffixSeal      = "/seal"       // POST
 	SuffixEpochDone = "/epoch-done" // POST ?pod=&epoch=  (Synchronous feedback)
 	// GET records returns []Record from offset `after` in the channel's retained
 	// log (filtered by key when given), long-polling up to `wait` for new
 	// records; the response header RecordsNextHeader carries the offset to
 	// pass as `after` on the next call.
-	SuffixRecords     = "/records"    // POST []Record (external producer); GET ?key=&after=&wait= (external consumer)
-	SuffixOperationsD = "/operations" // reserved
+	SuffixRecords = "/records" // POST []Record (external producer); GET ?key=&after=&wait= (external consumer)
+	// PathOperations carries the replica count the controller wants for each
+	// operation. A Broadcast channel is finished with only once every replica
+	// of its consumer has acknowledged it, and the coordinator cannot count
+	// replicas that have not registered yet, so the controller publishes the
+	// number it is scaling to.
+	PathOperations = "/operations" // PUT []OperationSpec
 )
+
+// OperationSpec is what the controller publishes about one operation.
+type OperationSpec struct {
+	Name string `json:"name"`
+	// Replicas is the count the controller is scaling the operation to. It
+	// also defines the progress obligations before those replicas register.
+	Replicas int32 `json:"replicas"`
+}
 
 // Record is one unit of information on a channel.
 type Record struct {
@@ -75,6 +99,9 @@ type Record struct {
 type PodRegistration struct {
 	Operation string `json:"operation"`
 	Pod       string `json:"pod"`
+	// Incarnation is unique to the process lifetime. An empty value selects
+	// the legacy protocol, which cannot recover a same-pod process restart.
+	Incarnation string `json:"incarnation,omitempty"`
 	// Addr is host:port of the pod's segment server.
 	Addr string `json:"addr"`
 	// Slots is the pod's concurrent partition capacity.
@@ -135,9 +162,14 @@ type ConsumeResponse struct {
 	Epoch int32 `json:"epoch"`
 	// Quiescent: Synchronous feedback with nothing pending or in flight at the
 	// current epoch; the consumer should finish the epoch and report it.
-	Quiescent bool                  `json:"quiescent"`
-	MaxEpochs int32                 `json:"maxEpochs,omitempty"`
-	Mode      v1alpha1.FeedbackMode `json:"mode,omitempty"`
+	Quiescent bool `json:"quiescent"`
+	// ProductionClosed reports that no producer may add records at Epoch.
+	// Queued records may remain and must still be consumed.
+	ProductionClosed bool `json:"productionClosed"`
+	// FiniteEpochs reports that scalar epoch progress applies to this channel.
+	FiniteEpochs bool               `json:"finiteEpochs"`
+	MaxEpochs    int32              `json:"maxEpochs,omitempty"`
+	Mode         graph.FeedbackMode `json:"mode,omitempty"`
 }
 
 // SegmentAck marks a fetched segment as processed by the calling pod.
@@ -145,20 +177,32 @@ type SegmentAck struct {
 	ID     string `json:"id"`
 	Holder string `json:"holder"`
 	Pod    string `json:"pod"`
+	// Failure describes why an unfinished delivery was returned. Ack ignores
+	// it; Nack records it for operator diagnostics.
+	Failure string `json:"failure,omitempty"`
+	// RetryAfterMillis delays redelivery to this process. Zero makes the
+	// delivery immediately eligible.
+	RetryAfterMillis int64 `json:"retryAfterMillis,omitempty"`
 }
 
 // ChannelMetrics reports one channel.
 type ChannelMetrics struct {
-	Name       string `json:"name"`
-	From       string `json:"from"`
-	To         string `json:"to"`
-	Sealed     bool   `json:"sealed"`
-	Pending    int64  `json:"pending"`  // records in unconsumed segments
-	InFlight   int64  `json:"inFlight"` // records in fetched, unacknowledged segments
-	Produced   int64  `json:"produced"`
-	Epoch      int32  `json:"epoch"`
-	Overflowed int64  `json:"overflowed"`
-	Lost       int64  `json:"lost"`
+	Name             string `json:"name"`
+	From             string `json:"from"`
+	To               string `json:"to"`
+	Sealed           bool   `json:"sealed"`
+	Pending          int64  `json:"pending"`  // records in unconsumed segments
+	InFlight         int64  `json:"inFlight"` // records in fetched, unacknowledged segments
+	Produced         int64  `json:"produced"`
+	Epoch            int32  `json:"epoch"`
+	Overflowed       int64  `json:"overflowed"`
+	// Lost counts records whose segment holder expired before consumption.
+	Lost             int64  `json:"lost"`
+	ProductionClosed bool   `json:"productionClosed"`
+	// Acknowledged counts records accepted from individual consumers. A
+	// Broadcast record contributes once for each intended replica.
+	Acknowledged          int64  `json:"acknowledged"`
+	LatestDeliveryFailure string `json:"latestDeliveryFailure,omitempty"`
 	// PendingByPartition supports skew detection by a planner.
 	PendingByPartition []int64 `json:"pendingByPartition,omitempty"`
 }
@@ -199,4 +243,7 @@ const (
 	EnvFeedback    = "STARK8S_FEEDBACK"     // inbound feedback channels
 	EnvFeedbackOut = "STARK8S_FEEDBACK_OUT" // outbound feedback channels
 	EnvSegmentDir  = "STARK8S_SEGMENT_DIR"  // local segment store; default /var/lib/stark8s/segments
+	// EnvTickInterval is a Go duration such as "30s". Absent or empty leaves
+	// the operation driven only by its records.
+	EnvTickInterval = "STARK8S_TICK_INTERVAL"
 )

@@ -10,14 +10,12 @@ import (
 	"time"
 )
 
-// The SDK is Go and a language model is not. A worker links the SDK, and the
-// thing that generates or trains runs beside it in the same pod behind a
+// A worker links the SDK, while generation and training run beside it behind a
 // localhost HTTP contract. The worker stays the SDK client and keeps the loop
 // protocol; the sidecar only has to answer two requests.
 //
-// The seam is an interface so the whole graph can be tested on CPU against a
-// deterministic stub, the way examples/newsdesk tests against a fake model.
-// The networked implementations below are the only ones that need a GPU.
+// The interface lets the graph test use a deterministic backend. The networked
+// implementations connect the same handlers to an external backend.
 type generator interface {
 	// Generate draws n completions for one prompt under the checkpoint the
 	// worker was last told to load.

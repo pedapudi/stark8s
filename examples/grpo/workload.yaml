@@ -3,8 +3,7 @@
 # The shape is fixed when the Workload is submitted: the group size and the
 # task set are hyperparameters, and nothing branches on what a rollout came
 # back with. That is what separates this from a search tree or a rollout that
-# spawns according to a policy, which docs/ray-mapping.md lists as not
-# expressible.
+# spawns according to a policy, which a fixed graph cannot express.
 #
 #   prompts --batch--> rollout --completions--> reward --scored--> advantage
 #                         ^                                            |
