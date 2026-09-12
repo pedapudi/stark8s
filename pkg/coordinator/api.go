@@ -35,9 +35,12 @@ const (
 	// the last record scanned, to pass as `after` on the next call.
 	RecordsNextHeader = "X-Stark8s-Next"
 
-	PathTopology = "/topology"      // PUT  []graph.Channel; GET -> []graph.Channel (pods read partitioning and feedback settings)
-	PathMetrics  = "/metrics"       // GET  Metrics
-	PathHealth   = "/healthz"       // GET
+	PathTopology = "/topology" // PUT/GET []graph.Channel
+	PathMetrics  = "/metrics"  // GET Metrics
+	PathHealth   = "/healthz"
+	// PathEditor serves the graph editor with observed topology and metrics.
+	PathEditor = "/editor"
+
 	PathRegister = "/pods/register" // POST PodRegistration (also the heartbeat; repeat every 5s)
 	// PathSourceDone: the pod has emitted everything it will emit. Source
 	// pods post it after their Source handler; Drain pods post it after
