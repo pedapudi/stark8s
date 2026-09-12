@@ -7,6 +7,7 @@ package v1alpha1
 import (
 	"github.com/pedapudi/stark8s/api/graph"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -87,6 +88,45 @@ type EgressRule struct {
 	To EgressDestination `json:"to"`
 }
 
+// SegmentStorage sizes the local volume that holds the segments an
+// operation's pods produce. It is per pod, not per operation: every replica
+// gets a volume this size and requests this much disk, so an operation that
+// produces a total spread over N replicas needs roughly a total/N here, and
+// the cluster is asked for Size times the replica count.
+//
+// How much has to fit depends on the outbound channels:
+//
+//   - Ephemeral: a segment is deleted once every consumer has acknowledged
+//     it, so the volume has to hold the peak unacknowledged output. On a
+//     Materialized channel that is the replica's whole output, since the
+//     consumer is not started until the channel seals.
+//   - Retained with a consumer: the coordinator never releases retained
+//     segments back to their producer, so the volume has to hold everything
+//     the replica produces for as long as its pod runs.
+//   - No consumer at all: nothing reaches this volume. The coordinator forces
+//     such a channel to Retained and the worker posts its records to the
+//     coordinator instead of writing a segment, so Size does nothing for an
+//     operation whose only output is a terminal channel.
+//
+// Sizing the volume is a scheduling statement, not a durability one. Segments
+// live and die with the pod holding them: an operation that completes is
+// scaled to zero, and retained segments go with it.
+//
+// Declaring it is what tells the scheduler the pods need disk. Left unset the
+// volume is a bare emptyDir with no size, and its capacity is whatever the
+// cluster's defaults allow.
+type SegmentStorage struct {
+	// Size is the capacity of the segment volume. The controller sets it as
+	// the volume's sizeLimit and as a floor under the first container's
+	// ephemeral-storage request, which is what the scheduler places the pod
+	// by. No limit is set: a pod's ephemeral-storage limit is charged the
+	// volume together with every container's writable layer and logs, so a
+	// limit equal to Size would evict the pod before the volume filled. A
+	// template whose containers do add up to a limit keeps it, and one that
+	// does not exceed Size is rejected rather than raised.
+	Size resource.Quantity `json:"size"`
+}
+
 // Operation is a vertex of the graph: one logical computation backed by its
 // own pool of pods.
 type Operation struct {
@@ -129,6 +169,10 @@ type Operation struct {
 	// and a reviewer sees the widening in the same change as the code that
 	// needs it.
 	Egress []EgressRule `json:"egress,omitempty"`
+	// Segments sizes the local volume this operation's pods keep their
+	// produced segments in. A pod template that declares its own volume named
+	// stark8s-segments sizes it instead, and the two cannot both be set.
+	Segments *SegmentStorage `json:"segments,omitempty"`
 }
 
 // CoordinatorSpec configures the per-workload coordinator that tracks
