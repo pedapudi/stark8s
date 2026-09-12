@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -22,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/api/v1alpha1"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
@@ -161,9 +163,9 @@ func mapReduce() *v1alpha1.Workload {
 				{Name: "map", Slots: 2, Scaling: v1alpha1.Scaling{Horizontal: v1alpha1.HorizontalScaling{Min: 1, Max: 4}}, Template: container()},
 				{Name: "reduce", Slots: 1, Scaling: v1alpha1.Scaling{Horizontal: v1alpha1.HorizontalScaling{Min: 1, Max: 3}}, Template: container()},
 			},
-			Channels: []v1alpha1.Channel{
-				{Name: "lines", From: "read", To: "map", Delivery: v1alpha1.DeliveryPipelined},
-				{Name: "shuffle", From: "map", To: "reduce", Delivery: v1alpha1.DeliveryMaterialized},
+			Channels: []graph.Channel{
+				{Name: "lines", From: "read", To: "map", Delivery: graph.DeliveryPipelined},
+				{Name: "shuffle", From: "map", To: "reduce", Delivery: graph.DeliveryMaterialized},
 				{Name: "totals", From: "reduce"},
 			},
 		},
@@ -345,7 +347,7 @@ func TestPerEdgeNetworkPolicies(t *testing.T) {
 	if err := h.c.Get(context.Background(), h.key, wl); err != nil {
 		t.Fatal(err)
 	}
-	wl.Spec.Channels = []v1alpha1.Channel{wl.Spec.Channels[0], wl.Spec.Channels[2]}
+	wl.Spec.Channels = []graph.Channel{wl.Spec.Channels[0], wl.Spec.Channels[2]}
 	if err := h.c.Update(context.Background(), wl); err != nil {
 		t.Fatal(err)
 	}
@@ -437,6 +439,75 @@ func keys(m map[string]networkingv1.NetworkPolicy) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// --- tick interval and externally fed operations -----------------------------
+
+func opNamed(name string) v1alpha1.Operation {
+	return v1alpha1.Operation{
+		Name: name,
+		Template: corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "img"}}},
+		},
+	}
+}
+
+// TestValidateRejectsNegativeTickInterval keeps a typo from becoming a worker
+// that never ticks.
+func TestValidateRejectsNegativeTickInterval(t *testing.T) {
+	op := opNamed("poll")
+	op.TickInterval = &metav1.Duration{Duration: -time.Second}
+	spec := &v1alpha1.WorkloadSpec{
+		Operations: []v1alpha1.Operation{op},
+		Channels:   []graph.Channel{{Name: "config", To: "poll"}},
+	}
+	if err := Validate(spec); err == nil {
+		t.Fatal("a negative tickInterval was accepted")
+	}
+	op.TickInterval = &metav1.Duration{Duration: 30 * time.Second}
+	spec.Operations = []v1alpha1.Operation{op}
+	if err := Validate(spec); err != nil {
+		t.Errorf("a positive tickInterval was rejected: %v", err)
+	}
+}
+
+// TestTickIntervalReachesThePod: the interval is declared on the operation and
+// has to arrive as the environment variable the SDK reads, or the handler
+// never fires in a real cluster.
+func TestTickIntervalReachesThePod(t *testing.T) {
+	wl := mapReduce()
+	for i := range wl.Spec.Operations {
+		if wl.Spec.Operations[i].Name == "map" {
+			wl.Spec.Operations[i].TickInterval = &metav1.Duration{Duration: 90 * time.Second}
+		}
+	}
+	h := newHarness(t, wl)
+	h.reconcile()
+
+	d, _ := h.deployment("wc-map")
+	var got string
+	for _, e := range d.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == coordinator.EnvTickInterval {
+			got = e.Value
+		}
+	}
+	if got != "1m30s" {
+		t.Errorf("%s = %q, want %q", coordinator.EnvTickInterval, got, "1m30s")
+	}
+
+	// An operation without an interval must not carry the variable at all, so
+	// that FromEnv leaves ticking off rather than parsing an empty string.
+	// wc-read is used here because wc-reduce sits behind a Materialized edge
+	// and has no deployment until that edge is sealed.
+	r, ok := h.deployment("wc-read")
+	if !ok {
+		t.Fatal("wc-read has no deployment")
+	}
+	for _, e := range r.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == coordinator.EnvTickInterval {
+			t.Errorf("an operation with no tickInterval carries %s=%q", e.Name, e.Value)
+		}
+	}
 }
 
 // --- per-operation egress -----------------------------------------------------

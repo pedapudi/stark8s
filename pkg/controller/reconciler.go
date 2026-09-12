@@ -56,6 +56,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/api/v1alpha1"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
@@ -203,6 +204,9 @@ func Validate(s *v1alpha1.WorkloadSpec) error {
 		// Zero is the unset value and means one slot.
 		if o.Slots < 0 {
 			return fmt.Errorf("operation %q: slots must be at least 1", o.Name)
+		}
+		if o.TickInterval != nil && o.TickInterval.Duration < 0 {
+			return fmt.Errorf("operation %q: tickInterval must not be negative", o.Name)
 		}
 		for _, e := range o.Egress {
 			switch e.To {
@@ -458,7 +462,7 @@ func mustRunIdle(spec *v1alpha1.WorkloadSpec, op *v1alpha1.Operation) bool {
 		return true
 	}
 	for _, c := range inbound {
-		if c.Delivery != v1alpha1.DeliveryMaterialized {
+		if c.Delivery != graph.DeliveryMaterialized {
 			return true
 		}
 	}
@@ -474,7 +478,7 @@ func (r *Reconciler) reconcileOperation(ctx context.Context, wl *v1alpha1.Worklo
 	// until that channel is sealed. Feedback channels are excluded because
 	// they seal only when the loop terminates.
 	for _, c := range wl.Spec.Inbound(op.Name) {
-		if c.Delivery == v1alpha1.DeliveryMaterialized && c.Feedback == nil && !metrics.channels[c.Name].Sealed {
+		if c.Delivery == graph.DeliveryMaterialized && c.Feedback == nil && !metrics.channels[c.Name].Sealed {
 			return st, nil
 		}
 	}
@@ -574,6 +578,9 @@ func (r *Reconciler) podTemplate(wl *v1alpha1.Workload, op *v1alpha1.Operation) 
 		{Name: coordinator.EnvFeedback, Value: strings.Join(fb, ",")},
 		{Name: coordinator.EnvFeedbackOut, Value: strings.Join(fbOut, ",")},
 		{Name: coordinator.EnvSegmentDir, Value: SegmentDir},
+	}
+	if op.TickInterval != nil && op.TickInterval.Duration > 0 {
+		env = append(env, corev1.EnvVar{Name: coordinator.EnvTickInterval, Value: op.TickInterval.Duration.String()})
 	}
 	hasVolume := false
 	for _, v := range tpl.Spec.Volumes {

@@ -3,14 +3,16 @@ package sdk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
 
@@ -23,7 +25,7 @@ type harness struct {
 	wg  sync.WaitGroup
 }
 
-func newHarness(t *testing.T, specs []v1alpha1.Channel) (*harness, context.CancelFunc) {
+func newHarness(t *testing.T, specs []graph.Channel) (*harness, context.CancelFunc) {
 	t.Helper()
 	seg := httptest.NewServer(nil)
 	co := coordinator.New(strings.TrimPrefix(seg.URL, "http://"))
@@ -78,8 +80,8 @@ func (h *harness) waitComplete(op string) {
 }
 
 func TestWorkersExchangeSegmentsDirectly(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "words", From: "read", To: "count", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 4}},
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "words", From: "read", To: "count", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4}},
 		{Name: "totals", From: "count"},
 	})
 	defer stop()
@@ -156,11 +158,11 @@ func TestWorkersExchangeSegmentsDirectly(t *testing.T) {
 }
 
 func TestSynchronousLoopRunsSupersteps(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "graph", From: "seed", To: "rank", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2}},
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "graph", From: "seed", To: "rank", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2}},
 		{Name: "contrib", From: "rank", To: "rank",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2},
-			Feedback:     &v1alpha1.Feedback{Mode: v1alpha1.FeedbackSynchronous, MaxEpochs: 4}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackSynchronous, MaxEpochs: 4}},
 		{Name: "ranks", From: "rank"},
 	})
 	defer stop()
@@ -245,11 +247,11 @@ func TestSynchronousLoopRunsSupersteps(t *testing.T) {
 }
 
 func TestAsynchronousLoopDivertsAtBound(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "prompts", To: "agent", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2}},
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "prompts", To: "agent", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2}},
 		{Name: "turns", From: "agent", To: "agent",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2},
-			Feedback:     &v1alpha1.Feedback{Mode: v1alpha1.FeedbackAsynchronous, MaxEpochs: 3, Overflow: "unfinished"}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackAsynchronous, MaxEpochs: 3, Overflow: "unfinished"}},
 		{Name: "unfinished", From: "agent"},
 		{Name: "answers", From: "agent"},
 	})
@@ -311,4 +313,323 @@ func TestSegmentDirFallsBackWhenNotWritable(t *testing.T) {
 		t.Fatalf("write: %s %d %v", id, n, err)
 	}
 	s.remove(id)
+}
+
+// combineOutput drains a Retained channel through the coordinator and returns
+// the surviving records keyed by their record key.
+func combineOutput(t *testing.T, h *harness, channel string) map[string]float64 {
+	t.Helper()
+	recs, _, err := h.co.Records(channel, "", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]float64{}
+	for _, r := range recs {
+		n, ok := r.Value.(float64)
+		if !ok {
+			t.Fatalf("record %q value %v is not a number", r.Key, r.Value)
+		}
+		out[r.Key] = n
+	}
+	return out
+}
+
+// A channel that declares Combine folds records sharing a key before they go
+// on the wire, so the segment carries one record per key instead of one per
+// emitted fact. This is the map-side half of a reduce-by-key.
+func TestCombineFoldsRecordsBeforeTheWire(t *testing.T) {
+	for _, tc := range []struct {
+		mode graph.CombineMode
+		want map[string]float64
+	}{
+		{graph.CombineSum, map[string]float64{"a": 6, "b": 40}},
+		{graph.CombineMin, map[string]float64{"a": 1, "b": 10}},
+		{graph.CombineMax, map[string]float64{"a": 3, "b": 30}},
+		{graph.CombineCount, map[string]float64{"a": 3, "b": 2}},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			h, done := newHarness(t, []graph.Channel{{
+				Name: "out", From: "src", Durability: graph.DurabilityRetained,
+				Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 1},
+				Combine:      tc.mode,
+			}})
+			defer done()
+			w := h.worker("src", "src-0", nil, []string{"out"})
+			h.run(w, Handlers{Source: func(ctx context.Context, w *Worker) error {
+				for _, e := range []struct {
+					k string
+					v int
+				}{{"a", 1}, {"b", 10}, {"a", 2}, {"b", 30}, {"a", 3}} {
+					if err := w.Emit("out", e.k, e.v); err != nil {
+						return err
+					}
+				}
+				return nil
+			}})
+			h.waitComplete("src")
+
+			got := combineOutput(t, h, "out")
+			if len(got) != len(tc.want) {
+				t.Fatalf("%s emitted %d records, want %d (one per key): %v", tc.mode, len(got), len(tc.want), got)
+			}
+			for k, want := range tc.want {
+				if got[k] != want {
+					t.Fatalf("%s key %q = %v, want %v", tc.mode, k, got[k], want)
+				}
+			}
+			// Five facts went in; the combined channel must carry two records.
+			if m := h.co.Metrics().Channels[0]; m.Produced != 2 {
+				t.Fatalf("%s put %d records on the wire, want 2 from 5 facts", tc.mode, m.Produced)
+			}
+		})
+	}
+}
+
+// Without Combine the same program ships every fact, which is the behaviour
+// the feature exists to avoid and the regression guard for the default path.
+func TestWithoutCombineEveryFactGoesOnTheWire(t *testing.T) {
+	h, done := newHarness(t, []graph.Channel{{
+		Name: "out", From: "src", Durability: graph.DurabilityRetained,
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 1},
+	}})
+	defer done()
+	w := h.worker("src", "src-0", nil, []string{"out"})
+	h.run(w, Handlers{Source: func(ctx context.Context, w *Worker) error {
+		for i := 0; i < 5; i++ {
+			if err := w.Emit("out", "a", 1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}})
+	h.waitComplete("src")
+	if m := h.co.Metrics().Channels[0]; m.Produced != 5 {
+		t.Fatalf("uncombined channel produced %d records, want 5", m.Produced)
+	}
+}
+
+// A non-numeric record on an arithmetic combine channel is a programming
+// error and must be reported at the Emit that caused it, not silently dropped
+// or deferred to a decode failure in the consumer.
+func TestCombineRejectsNonNumericValues(t *testing.T) {
+	h, done := newHarness(t, []graph.Channel{{
+		Name: "out", From: "src", Durability: graph.DurabilityRetained,
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 1},
+		Combine:      graph.CombineSum,
+	}})
+	defer done()
+	w := h.worker("src", "src-0", nil, []string{"out"})
+	if err := w.Emit("out", "a", "not a number"); err == nil {
+		t.Fatal("Emit accepted a string on a Sum channel")
+	} else if !strings.Contains(err.Error(), "must be a number") {
+		t.Fatalf("unhelpful error: %v", err)
+	}
+}
+
+func TestCombineModeIdempotence(t *testing.T) {
+	for mode, want := range map[graph.CombineMode]bool{
+		graph.CombineMin: true, graph.CombineMax: true,
+		graph.CombineSum: false, graph.CombineCount: false,
+	} {
+		if got := mode.Idempotent(); got != want {
+			t.Fatalf("%s.Idempotent() = %v, want %v", mode, got, want)
+		}
+	}
+}
+
+func TestSynchronousLoopDoesNotStallOnIdlePods(t *testing.T) {
+	const supersteps = 8
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "graph", From: "seed", To: "rank", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4}},
+		{Name: "contrib", From: "rank", To: "rank",
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackSynchronous, MaxEpochs: supersteps}},
+	})
+	defer stop()
+
+	h.run(h.worker("seed", "seed-0", nil, []string{"graph"}), Handlers{
+		Source: func(ctx context.Context, w *Worker) error { return w.Emit("graph", "only", 1.0) },
+	})
+	for _, inst := range []string{"rank-0", "rank-1"} {
+		w := h.worker("rank", inst, []string{"graph", "contrib"}, []string{"contrib"})
+		w.SetFeedback([]string{"contrib"}, []string{"contrib"})
+		keys := map[string]bool{}
+		h.run(w, Handlers{
+			OnRecord: func(ctx context.Context, w *Worker, r Record) error {
+				keys[r.Key] = true
+				return nil
+			},
+			OnEpochEnd: func(ctx context.Context, w *Worker, epoch int32) error {
+				for k := range keys {
+					if err := w.Emit("contrib", k, 1.0); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		})
+	}
+	h.waitComplete("seed")
+	if err := h.co.Seal("graph"); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	h.waitComplete("rank")
+	if elapsed, budget := time.Since(start), supersteps*time.Second; elapsed > budget {
+		t.Fatalf("%d supersteps took %v, over the %v budget", supersteps, elapsed, budget)
+	}
+}
+
+func TestUnfetchableSegmentFailsInsteadOfHanging(t *testing.T) {
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "s", From: "produce", To: "consume", Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 1}},
+	})
+	defer stop()
+
+	// A segment announced by a pod that is no longer serving it. The
+	// coordinator still queues it, and nothing can ever fetch it.
+	if err := h.co.Announce("s", "produce", []coordinator.SegmentAnnouncement{{
+		ID: "seg-gone", Channel: "s", Records: 1, Bytes: 2,
+		Holder: "127.0.0.1:1", Producer: "produce-0",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	errc := make(chan error, 1)
+	w := h.worker("consume", "consume-0", []string{"s"}, nil)
+	go func() { errc <- w.Run(h.ctx, Handlers{}) }()
+	select {
+	case err := <-errc:
+		if err == nil || !strings.Contains(err.Error(), "seg-gone") {
+			t.Fatalf("Run returned %v, want an error naming the segment it could not fetch", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned: a segment that cannot be fetched hangs the worker instead of failing it")
+	}
+}
+
+func TestSegmentFetchStopsWhenResponseBodyStalls(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("["))
+		w.(http.Flusher).Flush()
+		<-release
+	}))
+	defer func() {
+		close(release)
+		srv.Close()
+	}()
+	w := &Worker{}
+	w.init()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := w.fetchRetry(ctx, coordinator.SegmentRef{ID: "stalled", Holder: strings.TrimPrefix(srv.URL, "http://")})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("fetch returned %v, want context deadline", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("fetch took %v after cancellation", elapsed)
+	}
+}
+
+func TestLargeRecordsFlushOnBytes(t *testing.T) {
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "big", From: "a", To: "b", Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 1}},
+		{Name: "small", From: "a", To: "b", Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 1}},
+	})
+	defer stop()
+	w := h.worker("a", "a-0", nil, []string{"big", "small"})
+
+	// Ten records of 1 MiB each: 10 MiB buffered, nowhere near the 500
+	// records the count threshold waits for.
+	value := strings.Repeat("x", 1<<20)
+	for i := 0; i < 10; i++ {
+		if err := w.Emit("big", fmt.Sprintf("k%d", i), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(w.unannounced["big"]); n < 2 {
+		t.Fatalf("10 MiB in 10 records produced %d segments, want at least 2: the buffer grows without bound until it holds %d records", n, flushRecords)
+	}
+
+	// Small records still flush on the count alone, at exactly the same
+	// point as before.
+	for i := 0; i < flushRecords-1; i++ {
+		if err := w.Emit("small", "k", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(w.unannounced["small"]); n != 0 {
+		t.Fatalf("%d small records produced %d segments, want none before the %dth", flushRecords-1, n, flushRecords)
+	}
+	if err := w.Emit("small", "k", 0); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(w.unannounced["small"]); n != 1 {
+		t.Fatalf("%d small records produced %d segments, want exactly 1", flushRecords, n)
+	}
+}
+
+func TestTickFiresWhileWaitingForInputSeal(t *testing.T) {
+	h, stop := newHarness(t, []graph.Channel{{Name: "input", To: "poll"}})
+	defer stop()
+	w := h.worker("poll", "poll-0", []string{"input"}, nil)
+	w.TickInterval = 10 * time.Millisecond
+	ticked := make(chan struct{}, 1)
+	h.run(w, Handlers{Tick: func(context.Context, *Worker) error {
+		select {
+		case ticked <- struct{}{}:
+		default:
+		}
+		return nil
+	}})
+	select {
+	case <-ticked:
+	case <-time.After(time.Second):
+		t.Fatal("Tick did not run while the worker waited for input")
+	}
+}
+
+func TestExternalInputMustBeSealedBeforeCompletion(t *testing.T) {
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "bounded", From: "source", To: "sink"},
+		{Name: "external", To: "sink"},
+	})
+	defer stop()
+	if err := h.co.Produce("external", "", []coordinator.Record{{Key: "config", Value: "ready"}}); err != nil {
+		t.Fatal(err)
+	}
+	h.run(h.worker("source", "source-0", nil, []string{"bounded"}), Handlers{
+		Source: func(context.Context, *Worker) error { return nil },
+	})
+	seen := make(chan struct{}, 1)
+	h.run(h.worker("sink", "sink-0", []string{"bounded", "external"}, nil), Handlers{
+		OnRecord: func(_ context.Context, _ *Worker, r Record) error {
+			if r.Channel == "external" {
+				seen <- struct{}{}
+			}
+			return nil
+		},
+	})
+	h.waitComplete("source")
+	if err := h.co.Seal("bounded"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-seen:
+	case <-time.After(time.Second):
+		t.Fatal("external input was not consumed")
+	}
+	time.Sleep(200 * time.Millisecond)
+	for _, op := range h.co.Metrics().Operations {
+		if op.Name == "sink" && op.Complete {
+			t.Fatal("sink completed before its external input was sealed")
+		}
+	}
+	if err := h.co.Seal("external"); err != nil {
+		t.Fatal(err)
+	}
+	h.waitComplete("sink")
 }
