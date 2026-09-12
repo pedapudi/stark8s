@@ -3,7 +3,9 @@ package sdk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -505,6 +507,33 @@ func TestUnfetchableSegmentFailsInsteadOfHanging(t *testing.T) {
 	}
 }
 
+func TestSegmentFetchStopsWhenResponseBodyStalls(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("["))
+		w.(http.Flusher).Flush()
+		<-release
+	}))
+	defer func() {
+		close(release)
+		srv.Close()
+	}()
+	w := &Worker{}
+	w.init()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := w.fetchRetry(ctx, coordinator.SegmentRef{ID: "stalled", Holder: strings.TrimPrefix(srv.URL, "http://")})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("fetch returned %v, want context deadline", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("fetch took %v after cancellation", elapsed)
+	}
+}
+
 func TestLargeRecordsFlushOnBytes(t *testing.T) {
 	h, stop := newHarness(t, []graph.Channel{
 		{Name: "big", From: "a", To: "b", Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 1}},
@@ -541,4 +570,66 @@ func TestLargeRecordsFlushOnBytes(t *testing.T) {
 	if n := len(w.unannounced["small"]); n != 1 {
 		t.Fatalf("%d small records produced %d segments, want exactly 1", flushRecords, n)
 	}
+}
+
+func TestTickFiresWhileWaitingForInputSeal(t *testing.T) {
+	h, stop := newHarness(t, []graph.Channel{{Name: "input", To: "poll"}})
+	defer stop()
+	w := h.worker("poll", "poll-0", []string{"input"}, nil)
+	w.TickInterval = 10 * time.Millisecond
+	ticked := make(chan struct{}, 1)
+	h.run(w, Handlers{Tick: func(context.Context, *Worker) error {
+		select {
+		case ticked <- struct{}{}:
+		default:
+		}
+		return nil
+	}})
+	select {
+	case <-ticked:
+	case <-time.After(time.Second):
+		t.Fatal("Tick did not run while the worker waited for input")
+	}
+}
+
+func TestExternalInputMustBeSealedBeforeCompletion(t *testing.T) {
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "bounded", From: "source", To: "sink"},
+		{Name: "external", To: "sink"},
+	})
+	defer stop()
+	if err := h.co.Produce("external", "", []coordinator.Record{{Key: "config", Value: "ready"}}); err != nil {
+		t.Fatal(err)
+	}
+	h.run(h.worker("source", "source-0", nil, []string{"bounded"}), Handlers{
+		Source: func(context.Context, *Worker) error { return nil },
+	})
+	seen := make(chan struct{}, 1)
+	h.run(h.worker("sink", "sink-0", []string{"bounded", "external"}, nil), Handlers{
+		OnRecord: func(_ context.Context, _ *Worker, r Record) error {
+			if r.Channel == "external" {
+				seen <- struct{}{}
+			}
+			return nil
+		},
+	})
+	h.waitComplete("source")
+	if err := h.co.Seal("bounded"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-seen:
+	case <-time.After(time.Second):
+		t.Fatal("external input was not consumed")
+	}
+	time.Sleep(200 * time.Millisecond)
+	for _, op := range h.co.Metrics().Operations {
+		if op.Name == "sink" && op.Complete {
+			t.Fatal("sink completed before its external input was sealed")
+		}
+	}
+	if err := h.co.Seal("external"); err != nil {
+		t.Fatal(err)
+	}
+	h.waitComplete("sink")
 }

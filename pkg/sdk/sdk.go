@@ -80,9 +80,30 @@ type Handlers struct {
 	// is quiescent at the given epoch, before the barrier advances. Emit
 	// next-epoch records here. It is called at most once per epoch.
 	OnEpochEnd func(ctx context.Context, w *Worker, epoch int32) error
-	// OnDrain is called once when every inbound channel is drained. Emit
-	// final results here; the worker then reports done and idles.
+	// OnDrain is called once when every inbound channel that has a producing
+	// operation is drained. Emit final results here; the worker then reports
+	// done and idles.
 	OnDrain func(ctx context.Context, w *Worker) error
+	// Tick is called on an interval, for operations that have work to do on a
+	// clock as well as on their input: polling a feed, a queue or an API,
+	// where a channel supplies what to poll for.
+	//
+	// It runs on the goroutine that consumes records, between passes over the
+	// inbound channels, so it never overlaps OnRecord and the two may share
+	// state without a lock. That is deliberate. The emit buffers are a plain
+	// map keyed by channel, partition and epoch, and Worker.epoch is a field
+	// rewritten for every record consumed, so a Tick running anywhere else
+	// would race with record processing on both.
+	//
+	// The cost of that choice is that a slow Tick delays record processing by
+	// its own duration, and a slow batch of records delays Tick. The interval
+	// is a floor on the period, never a guarantee.
+	//
+	// Tick needs Worker.TickInterval set. It is only reached by the loop that
+	// polls inbound channels, so an operation with no inbound channels runs
+	// Source instead and never ticks; Run rejects that combination rather
+	// than letting the handler sit there uncalled.
+	Tick func(ctx context.Context, w *Worker) error
 }
 
 // bufKey identifies one output buffer: a segment in the making.
@@ -124,6 +145,10 @@ type Worker struct {
 	// ":8090". Tests may set "127.0.0.1:0" to run several workers in one
 	// process.
 	SegmentListen string
+	// TickInterval is how often Handlers.Tick is called. Zero leaves the
+	// operation driven entirely by its records.
+	TickInterval time.Duration
+	runContext   context.Context
 
 	feedback    map[string]bool
 	feedbackOut map[string]bool
@@ -177,6 +202,16 @@ func FromEnv() (*Worker, error) {
 	}
 	for _, f := range split(os.Getenv(coordinator.EnvFeedbackOut)) {
 		w.feedbackOut[f] = true
+	}
+	if v := strings.TrimSpace(os.Getenv(coordinator.EnvTickInterval)); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("%s=%q: %w", coordinator.EnvTickInterval, v, err)
+		}
+		if d < 0 {
+			return nil, fmt.Errorf("%s=%q: the tick interval must not be negative", coordinator.EnvTickInterval, v)
+		}
+		w.TickInterval = d
 	}
 	if w.Coordinator == "" || w.Operation == "" {
 		return nil, fmt.Errorf("%s and %s must be set", coordinator.EnvCoordinator, coordinator.EnvOperation)
@@ -782,6 +817,14 @@ const (
 // returning nil; handler errors abort the worker.
 func (w *Worker) Run(ctx context.Context, h Handlers) error {
 	w.init()
+	w.runContext = ctx
+	// A handler combination that can never fire is a programming mistake, so
+	// it is caught here, before the worker touches the network. Tick is
+	// driven by the loop that polls inbound channels, and an operation with
+	// none of those runs Source instead and reaches that loop never.
+	if h.Tick != nil && len(w.Inbound) == 0 {
+		return fmt.Errorf("operation %s has a Tick handler and no inbound channels: Tick is driven by the loop that polls inbound channels, so give the operation a channel to consume or move the work into Source", w.Operation)
+	}
 	if err := w.serveSegments(); err != nil {
 		return err
 	}
@@ -820,6 +863,13 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 	// release puts the poll rate back at the floor even when the pod then
 	// finds no work of its own in the new superstep.
 	observedEpoch := int32(-1)
+
+	ticking := h.Tick != nil && w.TickInterval > 0
+	if h.Tick != nil && !ticking {
+		log.Printf("%s: a Tick handler is set but the tick interval is zero, so Tick is never called", w.Instance)
+	}
+	nextTick := time.Now().Add(w.TickInterval)
+
 	for ctx.Err() == nil {
 		progressed := false
 		allDrained := true
@@ -896,6 +946,22 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			observedEpoch = w.epoch
 			backoff = pollFloor
 		}
+
+		// Tick runs here: on this goroutine, between passes over the inbound
+		// channels, and never inside one. It is placed before the progressed
+		// check so that a busy operation still ticks; putting it after would
+		// starve the clock exactly when the input is heaviest.
+		if ticking && !time.Now().Before(nextTick) {
+			if err := h.Tick(ctx, w); err != nil {
+				return err
+			}
+			if err := w.retry(ctx, w.Flush); err != nil {
+				return err
+			}
+			// Measured from the end of the handler, so a Tick that runs longer
+			// than the interval does not come due again the instant it returns.
+			nextTick = time.Now().Add(w.TickInterval)
+		}
 		if progressed {
 			backoff = pollFloor
 			continue
@@ -942,7 +1008,21 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 		if backoff > ceiling {
 			backoff = ceiling
 		}
-		time.Sleep(backoff)
+		// The idle backoff must not outrun the clock. Without this cap a
+		// worker that has settled at the two-second ceiling would serve a
+		// hundred-millisecond tick interval two seconds late.
+		wait := backoff
+		if wait > ceiling {
+			wait = ceiling
+		}
+		if ticking {
+			if d := time.Until(nextTick); d < wait {
+				wait = d
+			}
+		}
+		if wait > 0 {
+			time.Sleep(wait)
+		}
 		if backoff < ceiling {
 			backoff *= 2
 		}

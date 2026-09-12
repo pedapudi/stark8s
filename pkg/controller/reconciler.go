@@ -205,6 +205,9 @@ func Validate(s *v1alpha1.WorkloadSpec) error {
 		if o.Slots < 0 {
 			return fmt.Errorf("operation %q: slots must be at least 1", o.Name)
 		}
+		if o.TickInterval != nil && o.TickInterval.Duration < 0 {
+			return fmt.Errorf("operation %q: tickInterval must not be negative", o.Name)
+		}
 	}
 	chans := map[string]bool{}
 	for _, c := range s.Channels {
@@ -564,6 +567,9 @@ func (r *Reconciler) podTemplate(wl *v1alpha1.Workload, op *v1alpha1.Operation) 
 		{Name: coordinator.EnvFeedback, Value: strings.Join(fb, ",")},
 		{Name: coordinator.EnvFeedbackOut, Value: strings.Join(fbOut, ",")},
 		{Name: coordinator.EnvSegmentDir, Value: SegmentDir},
+	}
+	if op.TickInterval != nil && op.TickInterval.Duration > 0 {
+		env = append(env, corev1.EnvVar{Name: coordinator.EnvTickInterval, Value: op.TickInterval.Duration.String()})
 	}
 	hasVolume := false
 	for _, v := range tpl.Spec.Volumes {

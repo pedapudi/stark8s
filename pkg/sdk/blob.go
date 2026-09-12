@@ -15,8 +15,8 @@ package sdk
 // bytes back from the holder. Neither side ever holds the payload in memory,
 // and the payload is never JSON-encoded.
 //
-// LIFETIME RULE. A blob lives exactly as long as the segment carrying the
-// record that references it.
+// LIFETIME RULE. While the producing pod remains alive, a blob is retained
+// until the segment carrying the record that references it is released.
 //
 //   - The blob file is written before the referencing record is buffered, so
 //     the blob exists by the time any consumer can learn of it.
@@ -26,10 +26,10 @@ package sdk
 //     has acknowledged it. For a Broadcast channel that means every consumer
 //     replica.
 //
-// The consequence for application code: OpenBlob is guaranteed to succeed for
-// the duration of the OnRecord call that received the record, because the
-// worker acknowledges the segment only after OnRecord returns. A reader kept
-// past the return of OnRecord may find the blob already deleted. An HTTP read
+// The worker does not release the segment during the OnRecord call that
+// received it. The producing pod can still fail, because blobs share the
+// segment store's pod-local durability. A reader kept past OnRecord may find
+// the blob already deleted. An HTTP read
 // already in progress is not truncated by a release -- the holder keeps the
 // file open for the length of the copy, and on a POSIX filesystem the data
 // survives the unlink until that descriptor closes -- but a fetch started
@@ -41,6 +41,7 @@ package sdk
 // this feature deliberately is not.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -135,18 +136,27 @@ func (w *Worker) EmitBlob(channel, key string, r io.Reader) error {
 //
 // It returns ErrNotBlob for a record that carries no handle, and an error
 // naming the blob and its holder when the holder is unreachable or no longer
-// has the blob. It never blocks indefinitely: connecting and receiving the
-// response header are bounded, only the body transfer is not.
+// has the blob. OpenBlob uses the worker's Run context when available.
 func (w *Worker) OpenBlob(rec Record) (io.ReadCloser, int64, error) {
+	ctx := w.runContext
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return w.OpenBlobContext(ctx, rec)
+}
+
+// OpenBlobContext streams a blob and cancels connection setup, response
+// waiting, and body reads when ctx ends.
+func (w *Worker) OpenBlobContext(ctx context.Context, rec Record) (io.ReadCloser, int64, error) {
 	w.init()
 	h, ok := rec.Blob()
 	if !ok {
 		return nil, 0, fmt.Errorf("channel %s key %s: %w", rec.Channel, rec.Key, ErrNotBlob)
 	}
-	return w.openBlob(h)
+	return w.openBlob(ctx, h)
 }
 
-func (w *Worker) openBlob(h BlobHandle) (io.ReadCloser, int64, error) {
+func (w *Worker) openBlob(ctx context.Context, h BlobHandle) (io.ReadCloser, int64, error) {
 	url := "http://" + h.Holder + blobRoute + h.Blob
 	var err error
 	// Bounded retry, in the spirit of the segment fetch: a few quick attempts
@@ -155,10 +165,18 @@ func (w *Worker) openBlob(h BlobHandle) (io.ReadCloser, int64, error) {
 	// without its payload and the segment is redelivered if this pod dies.
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return nil, 0, ctx.Err()
+			case <-time.After(time.Duration(attempt) * 200 * time.Millisecond):
+			}
 		}
 		var resp *http.Response
-		resp, err = w.blobClient.Get(url)
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if requestErr != nil {
+			return nil, 0, requestErr
+		}
+		resp, err = w.blobClient.Do(req)
 		if err != nil {
 			continue
 		}

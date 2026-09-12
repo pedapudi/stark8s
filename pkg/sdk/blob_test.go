@@ -11,6 +11,8 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -312,6 +314,34 @@ func TestBlobMissingOnHolderFailsWithoutRetrying(t *testing.T) {
 	_, _, err := w.OpenBlob(Record{Channel: "docs", Key: "k", Value: handle})
 	if err == nil || !strings.Contains(err.Error(), "gone") || !strings.Contains(err.Error(), "404") {
 		t.Fatalf("missing blob: %v", err)
+	}
+}
+
+func TestOpenBlobContextStopsAStalledBody(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("partial"))
+		w.(http.Flusher).Flush()
+		<-release
+	}))
+	defer func() {
+		close(release)
+		srv.Close()
+	}()
+	handle, _ := json.Marshal(BlobHandle{
+		Blob: "stalled", Holder: strings.TrimPrefix(srv.URL, "http://"), Size: 100,
+	})
+	w := &Worker{}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	r, _, err := w.OpenBlobContext(ctx, Record{Channel: "docs", Key: "k", Value: handle})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err := io.ReadAll(r); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("body read returned %v, want context deadline", err)
 	}
 }
 
