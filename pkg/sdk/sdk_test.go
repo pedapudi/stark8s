@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
 
@@ -23,7 +23,7 @@ type harness struct {
 	wg  sync.WaitGroup
 }
 
-func newHarness(t *testing.T, specs []v1alpha1.Channel) (*harness, context.CancelFunc) {
+func newHarness(t *testing.T, specs []graph.Channel) (*harness, context.CancelFunc) {
 	t.Helper()
 	seg := httptest.NewServer(nil)
 	co := coordinator.New(strings.TrimPrefix(seg.URL, "http://"))
@@ -78,8 +78,8 @@ func (h *harness) waitComplete(op string) {
 }
 
 func TestWorkersExchangeSegmentsDirectly(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "words", From: "read", To: "count", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 4}},
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "words", From: "read", To: "count", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4}},
 		{Name: "totals", From: "count"},
 	})
 	defer stop()
@@ -156,11 +156,11 @@ func TestWorkersExchangeSegmentsDirectly(t *testing.T) {
 }
 
 func TestSynchronousLoopRunsSupersteps(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "graph", From: "seed", To: "rank", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2}},
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "graph", From: "seed", To: "rank", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2}},
 		{Name: "contrib", From: "rank", To: "rank",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2},
-			Feedback:     &v1alpha1.Feedback{Mode: v1alpha1.FeedbackSynchronous, MaxEpochs: 4}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackSynchronous, MaxEpochs: 4}},
 		{Name: "ranks", From: "rank"},
 	})
 	defer stop()
@@ -245,11 +245,11 @@ func TestSynchronousLoopRunsSupersteps(t *testing.T) {
 }
 
 func TestAsynchronousLoopDivertsAtBound(t *testing.T) {
-	h, stop := newHarness(t, []v1alpha1.Channel{
-		{Name: "prompts", To: "agent", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2}},
+	h, stop := newHarness(t, []graph.Channel{
+		{Name: "prompts", To: "agent", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2}},
 		{Name: "turns", From: "agent", To: "agent",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2},
-			Feedback:     &v1alpha1.Feedback{Mode: v1alpha1.FeedbackAsynchronous, MaxEpochs: 3, Overflow: "unfinished"}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackAsynchronous, MaxEpochs: 3, Overflow: "unfinished"}},
 		{Name: "unfinished", From: "agent"},
 		{Name: "answers", From: "agent"},
 	})
@@ -337,18 +337,18 @@ func combineOutput(t *testing.T, h *harness, channel string) map[string]float64 
 // emitted fact. This is the map-side half of a reduce-by-key.
 func TestCombineFoldsRecordsBeforeTheWire(t *testing.T) {
 	for _, tc := range []struct {
-		mode v1alpha1.CombineMode
+		mode graph.CombineMode
 		want map[string]float64
 	}{
-		{v1alpha1.CombineSum, map[string]float64{"a": 6, "b": 40}},
-		{v1alpha1.CombineMin, map[string]float64{"a": 1, "b": 10}},
-		{v1alpha1.CombineMax, map[string]float64{"a": 3, "b": 30}},
-		{v1alpha1.CombineCount, map[string]float64{"a": 3, "b": 2}},
+		{graph.CombineSum, map[string]float64{"a": 6, "b": 40}},
+		{graph.CombineMin, map[string]float64{"a": 1, "b": 10}},
+		{graph.CombineMax, map[string]float64{"a": 3, "b": 30}},
+		{graph.CombineCount, map[string]float64{"a": 3, "b": 2}},
 	} {
 		t.Run(string(tc.mode), func(t *testing.T) {
-			h, done := newHarness(t, []v1alpha1.Channel{{
-				Name: "out", From: "src", Durability: v1alpha1.DurabilityRetained,
-				Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 1},
+			h, done := newHarness(t, []graph.Channel{{
+				Name: "out", From: "src", Durability: graph.DurabilityRetained,
+				Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 1},
 				Combine:      tc.mode,
 			}})
 			defer done()
@@ -386,9 +386,9 @@ func TestCombineFoldsRecordsBeforeTheWire(t *testing.T) {
 // Without Combine the same program ships every fact, which is the behaviour
 // the feature exists to avoid and the regression guard for the default path.
 func TestWithoutCombineEveryFactGoesOnTheWire(t *testing.T) {
-	h, done := newHarness(t, []v1alpha1.Channel{{
-		Name: "out", From: "src", Durability: v1alpha1.DurabilityRetained,
-		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 1},
+	h, done := newHarness(t, []graph.Channel{{
+		Name: "out", From: "src", Durability: graph.DurabilityRetained,
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 1},
 	}})
 	defer done()
 	w := h.worker("src", "src-0", nil, []string{"out"})
@@ -410,10 +410,10 @@ func TestWithoutCombineEveryFactGoesOnTheWire(t *testing.T) {
 // error and must be reported at the Emit that caused it, not silently dropped
 // or deferred to a decode failure in the consumer.
 func TestCombineRejectsNonNumericValues(t *testing.T) {
-	h, done := newHarness(t, []v1alpha1.Channel{{
-		Name: "out", From: "src", Durability: v1alpha1.DurabilityRetained,
-		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 1},
-		Combine:      v1alpha1.CombineSum,
+	h, done := newHarness(t, []graph.Channel{{
+		Name: "out", From: "src", Durability: graph.DurabilityRetained,
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 1},
+		Combine:      graph.CombineSum,
 	}})
 	defer done()
 	w := h.worker("src", "src-0", nil, []string{"out"})
@@ -425,9 +425,9 @@ func TestCombineRejectsNonNumericValues(t *testing.T) {
 }
 
 func TestCombineModeIdempotence(t *testing.T) {
-	for mode, want := range map[v1alpha1.CombineMode]bool{
-		v1alpha1.CombineMin: true, v1alpha1.CombineMax: true,
-		v1alpha1.CombineSum: false, v1alpha1.CombineCount: false,
+	for mode, want := range map[graph.CombineMode]bool{
+		graph.CombineMin: true, graph.CombineMax: true,
+		graph.CombineSum: false, graph.CombineCount: false,
 	} {
 		if got := mode.Idempotent(); got != want {
 			t.Fatalf("%s.Idempotent() = %v, want %v", mode, got, want)

@@ -39,7 +39,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
 
@@ -103,7 +103,7 @@ type Worker struct {
 	feedbackOut map[string]bool
 
 	client *http.Client
-	specs  map[string]v1alpha1.Channel
+	specs  map[string]graph.Channel
 
 	buffers map[bufKey][]wireRecord
 	// combineIndex maps a buffered record key to its slot in buffers, for
@@ -309,7 +309,7 @@ func (w *Worker) Emit(channel, key string, value any) error {
 	epoch := w.epoch
 	if w.feedbackOut[channel] {
 		epoch = w.epoch + 1
-		if spec.Feedback != nil && spec.Feedback.Mode == v1alpha1.FeedbackAsynchronous && epoch >= spec.Feedback.MaxEpochs {
+		if spec.Feedback != nil && spec.Feedback.Mode == graph.FeedbackAsynchronous && epoch >= spec.Feedback.MaxEpochs {
 			if spec.Feedback.Overflow == "" {
 				w.overflowed[channel]++
 				return nil
@@ -327,9 +327,9 @@ func (w *Worker) buffer(channel, key string, value json.RawMessage, epoch int32)
 	}
 	var p int32
 	switch {
-	case spec.To == "" || spec.Partitioning.Mode == v1alpha1.PartitionBroadcast:
+	case spec.To == "" || spec.Partitioning.Mode == graph.PartitionBroadcast:
 		p = 0
-	case spec.Partitioning.Mode == v1alpha1.PartitionHash:
+	case spec.Partitioning.Mode == graph.PartitionHash:
 		p = int32(coordinator.HashPartition(key, int(spec.Partitioning.Partitions)))
 	default:
 		p = int32(w.rr[channel] % uint64(spec.Partitioning.Partitions))
@@ -362,7 +362,7 @@ func (w *Worker) buffer(channel, key string, value json.RawMessage, epoch int32)
 // the channel's function. The buffered slice stays the source of truth so that
 // flushBuffer, the byte accounting and the ordering guarantees all keep
 // working unchanged; combineIndex only says where in it each key lives.
-func (w *Worker) combine(k bufKey, mode v1alpha1.CombineMode, key string, value json.RawMessage, epoch int32) error {
+func (w *Worker) combine(k bufKey, mode graph.CombineMode, key string, value json.RawMessage, epoch int32) error {
 	if w.combineIndex == nil {
 		w.combineIndex = map[bufKey]map[string]int{}
 	}
@@ -372,7 +372,7 @@ func (w *Worker) combine(k bufKey, mode v1alpha1.CombineMode, key string, value 
 		w.combineIndex[k] = idx
 	}
 
-	if mode == v1alpha1.CombineCount {
+	if mode == graph.CombineCount {
 		// Count ignores the emitted value, so it is the one mode that accepts
 		// a null and the one that cannot fail on a non-numeric record.
 		if at, seen := idx[key]; seen {
@@ -403,13 +403,13 @@ func (w *Worker) combine(k bufKey, mode v1alpha1.CombineMode, key string, value 
 		return fmt.Errorf("combine %s on channel %q key %q: %w", mode, k.channel, key, err)
 	}
 	switch mode {
-	case v1alpha1.CombineSum:
+	case graph.CombineSum:
 		held += incoming
-	case v1alpha1.CombineMin:
+	case graph.CombineMin:
 		if incoming < held {
 			held = incoming
 		}
-	case v1alpha1.CombineMax:
+	case graph.CombineMax:
 		if incoming > held {
 			held = incoming
 		}
@@ -431,25 +431,25 @@ func (w *Worker) setCombined(k bufKey, at int, v float64) error {
 }
 
 // spec returns the declared channel, loading the topology on first use.
-func (w *Worker) spec(channel string) (v1alpha1.Channel, error) {
+func (w *Worker) spec(channel string) (graph.Channel, error) {
 	if w.specs == nil {
 		if err := w.loadTopology(); err != nil {
-			return v1alpha1.Channel{}, err
+			return graph.Channel{}, err
 		}
 	}
 	s, ok := w.specs[channel]
 	if !ok {
-		return v1alpha1.Channel{}, fmt.Errorf("channel %q is not declared in the topology", channel)
+		return graph.Channel{}, fmt.Errorf("channel %q is not declared in the topology", channel)
 	}
 	return s, nil
 }
 
 func (w *Worker) loadTopology() error {
-	var specs []v1alpha1.Channel
+	var specs []graph.Channel
 	if err := w.do("GET", coordinator.PathTopology, nil, &specs); err != nil {
 		return err
 	}
-	m := map[string]v1alpha1.Channel{}
+	m := map[string]graph.Channel{}
 	for _, s := range specs {
 		if s.Partitioning.Partitions <= 0 {
 			s.Partitioning.Partitions = 1
@@ -707,7 +707,7 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			}
 			if w.feedback[ch] {
 				w.maxEpoch = resp.MaxEpochs
-				if resp.Mode != v1alpha1.FeedbackAsynchronous {
+				if resp.Mode != graph.FeedbackAsynchronous {
 					w.syncLoop = true
 					w.epoch = resp.Epoch
 				}
@@ -748,7 +748,7 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			if !resp.Drained {
 				allDrained = false
 			}
-			if w.feedback[ch] && resp.Mode != v1alpha1.FeedbackAsynchronous && !resp.Quiescent {
+			if w.feedback[ch] && resp.Mode != graph.FeedbackAsynchronous && !resp.Quiescent {
 				allQuiet = false
 			}
 			if !w.feedback[ch] && !resp.Drained {

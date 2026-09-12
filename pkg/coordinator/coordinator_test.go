@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 )
 
 var segSeq int64
@@ -83,9 +83,9 @@ func operationMetrics(co *Coordinator, name string) OperationMetrics {
 
 func TestMaterializedGatesUntilSealed(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{{Name: "s", From: "a", To: "b",
-		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 4},
-		Delivery:     v1alpha1.DeliveryMaterialized}})
+	co.Configure([]graph.Channel{{Name: "s", From: "a", To: "b",
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4},
+		Delivery:     graph.DeliveryMaterialized}})
 	register(t, co, "b", "b-0")
 	announce(t, co, "s", "a", "a-0", 1, 0, 2)
 	if err := co.Announce("s", "zzz", []SegmentAnnouncement{{ID: "x", Records: 1}}); err == nil {
@@ -109,9 +109,9 @@ func TestMaterializedGatesUntilSealed(t *testing.T) {
 
 func TestHashChannelsIntoOneOperationAreCoPartitioned(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{
-		{Name: "left", From: "a", To: "join", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 8}},
-		{Name: "right", From: "b", To: "join", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 8}},
+	co.Configure([]graph.Channel{
+		{Name: "left", From: "a", To: "join", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 8}},
+		{Name: "right", From: "b", To: "join", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 8}},
 	})
 	pods := []string{"j-0", "j-1", "j-2"}
 	for _, p := range pods {
@@ -166,8 +166,8 @@ func TestExpiredConsumerRedelivers(t *testing.T) {
 	co := New("self:8090")
 	now := time.Now()
 	co.now = func() time.Time { return now }
-	co.Configure([]v1alpha1.Channel{{Name: "s", From: "a", To: "b",
-		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 2}}})
+	co.Configure([]graph.Channel{{Name: "s", From: "a", To: "b",
+		Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 2}}})
 	register(t, co, "a", "a-0")
 	register(t, co, "b", "dead")
 	announce(t, co, "s", "a", "a-0", 0, 0, 1)
@@ -195,8 +195,8 @@ func TestExpiredHolderLosesSegmentsWithoutBlocking(t *testing.T) {
 	co := New("self:8090")
 	now := time.Now()
 	co.now = func() time.Time { return now }
-	co.Configure([]v1alpha1.Channel{{Name: "s", From: "a", To: "b",
-		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 2}}})
+	co.Configure([]graph.Channel{{Name: "s", From: "a", To: "b",
+		Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 2}}})
 	register(t, co, "a", "a-0")
 	register(t, co, "b", "b-0")
 	announce(t, co, "s", "a", "a-0", 0, 0, 4)
@@ -231,14 +231,14 @@ func TestExpiredHolderLosesSegmentsWithoutBlocking(t *testing.T) {
 
 func TestSynchronousBarrierAndTermination(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{{Name: "fb", From: "r", To: "r",
-		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2},
-		Feedback:     &v1alpha1.Feedback{MaxEpochs: 3}}})
+	co.Configure([]graph.Channel{{Name: "fb", From: "r", To: "r",
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2},
+		Feedback:     &graph.Feedback{MaxEpochs: 3}}})
 	register(t, co, "r", "r-0")
 	// Epoch-1 segments are held while epoch 0 is current.
 	announce(t, co, "fb", "r", "r-0", 0, 1, 1)
 	n, resp := drain(t, co, "fb", "r", "r-0")
-	if n != 0 || !resp.Quiescent || resp.Epoch != 0 || resp.Mode != v1alpha1.FeedbackSynchronous {
+	if n != 0 || !resp.Quiescent || resp.Epoch != 0 || resp.Mode != graph.FeedbackSynchronous {
 		t.Fatalf("epoch 0: n=%d resp=%+v", n, resp)
 	}
 	if m := channelMetrics(co, "fb"); m.Pending != 1 {
@@ -275,9 +275,9 @@ func TestSynchronousBarrierAndTermination(t *testing.T) {
 
 func TestSynchronousBarrierWaitsForEveryPod(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{{Name: "fb", From: "r", To: "r",
-		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2},
-		Feedback:     &v1alpha1.Feedback{MaxEpochs: 2}}})
+	co.Configure([]graph.Channel{{Name: "fb", From: "r", To: "r",
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2},
+		Feedback:     &graph.Feedback{MaxEpochs: 2}}})
 	register(t, co, "r", "r-0")
 	register(t, co, "r", "r-1")
 	drain(t, co, "fb", "r", "r-0")
@@ -294,11 +294,11 @@ func TestSynchronousBarrierWaitsForEveryPod(t *testing.T) {
 
 func TestAsynchronousLoopDeliversImmediatelyAndTerminates(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{
-		{Name: "in", From: "src", To: "agent", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2}},
+	co.Configure([]graph.Channel{
+		{Name: "in", From: "src", To: "agent", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2}},
 		{Name: "loop", From: "agent", To: "agent",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 2},
-			Feedback:     &v1alpha1.Feedback{Mode: v1alpha1.FeedbackAsynchronous, MaxEpochs: 3, Overflow: "spill"}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 2},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackAsynchronous, MaxEpochs: 3, Overflow: "spill"}},
 		{Name: "spill", From: "agent"},
 	})
 	register(t, co, "src", "src-0")
@@ -309,7 +309,7 @@ func TestAsynchronousLoopDeliversImmediatelyAndTerminates(t *testing.T) {
 	announce(t, co, "loop", "agent", "ag-0", 0, 1, 1)
 	announce(t, co, "loop", "agent", "ag-0", 1, 2, 1)
 	resp, _ := co.Consume("loop", "agent", "ag-0", 10)
-	if resp.Mode != v1alpha1.FeedbackAsynchronous || resp.MaxEpochs != 3 || resp.Quiescent {
+	if resp.Mode != graph.FeedbackAsynchronous || resp.MaxEpochs != 3 || resp.Quiescent {
 		t.Fatalf("async consume: %+v", resp)
 	}
 	got := 0
@@ -355,8 +355,8 @@ func TestAsynchronousLoopDeliversImmediatelyAndTerminates(t *testing.T) {
 
 func TestBroadcastDeliversToEveryPod(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{
-		{Name: "bc", From: "a", To: "b", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionBroadcast}},
+	co.Configure([]graph.Channel{
+		{Name: "bc", From: "a", To: "b", Partitioning: graph.Partitioning{Mode: graph.PartitionBroadcast}},
 	})
 	register(t, co, "a", "a-0")
 	register(t, co, "b", "b-0")
@@ -381,8 +381,8 @@ func TestBroadcastDeliversToEveryPod(t *testing.T) {
 
 func TestExternalProduceAndKeyFilteredLongPoll(t *testing.T) {
 	co := New("self:8090")
-	co.Configure([]v1alpha1.Channel{
-		{Name: "in", To: "w", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 4}},
+	co.Configure([]graph.Channel{
+		{Name: "in", To: "w", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4}},
 		{Name: "out", From: "w"},
 	})
 	register(t, co, "w", "w-0")
@@ -451,10 +451,10 @@ func TestHoldsUnconsumedAndCompleteTransitions(t *testing.T) {
 	co := New("self:8090")
 	now := time.Now()
 	co.now = func() time.Time { return now }
-	co.Configure([]v1alpha1.Channel{
-		{Name: "s", From: "src", To: "b", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 2}},
-		{Name: "kept", From: "src", To: "c", Durability: v1alpha1.DurabilityRetained,
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 1}},
+	co.Configure([]graph.Channel{
+		{Name: "s", From: "src", To: "b", Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 2}},
+		{Name: "kept", From: "src", To: "c", Durability: graph.DurabilityRetained,
+			Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 1}},
 	})
 	register(t, co, "src", "src-0")
 	register(t, co, "src", "src-1")
@@ -523,8 +523,8 @@ func TestPendingByPartitionAndHTTPRoundTrip(t *testing.T) {
 	co := New("self:8090")
 	srv := httptest.NewServer(Handler(co))
 	defer srv.Close()
-	body, _ := json.Marshal([]v1alpha1.Channel{{Name: "s", From: "a", To: "b",
-		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 3}}})
+	body, _ := json.Marshal([]graph.Channel{{Name: "s", From: "a", To: "b",
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 3}}})
 	req, _ := http.NewRequest("PUT", srv.URL+PathTopology, bytesReader(body))
 	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != 204 {
 		t.Fatalf("topology: %v %v", err, resp)

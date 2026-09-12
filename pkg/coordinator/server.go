@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/web"
 )
 
@@ -16,7 +16,7 @@ import (
 func Handler(co *Coordinator) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT "+PathTopology, func(w http.ResponseWriter, r *http.Request) {
-		var specs []v1alpha1.Channel
+		var specs []graph.Channel
 		if err := json.NewDecoder(r.Body).Decode(&specs); err != nil {
 			http.Error(w, err.Error(), 400)
 			return

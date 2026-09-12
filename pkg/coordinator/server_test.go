@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/web"
 )
 
@@ -19,10 +19,10 @@ import (
 func editorServer(t *testing.T) (*Coordinator, *httptest.Server) {
 	t.Helper()
 	co := New("coordinator:8090")
-	co.Configure([]v1alpha1.Channel{
-		{Name: "in", To: "map", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 2}},
-		{Name: "shuffle", From: "map", To: "reduce", Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 4}, Delivery: v1alpha1.DeliveryMaterialized},
-		{Name: "editor", From: "reduce", Durability: v1alpha1.DurabilityRetained},
+	co.Configure([]graph.Channel{
+		{Name: "in", To: "map", Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 2}},
+		{Name: "shuffle", From: "map", To: "reduce", Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 4}, Delivery: graph.DeliveryMaterialized},
+		{Name: "editor", From: "reduce", Durability: graph.DurabilityRetained},
 	})
 	srv := httptest.NewServer(Handler(co))
 	t.Cleanup(srv.Close)
@@ -153,7 +153,7 @@ func TestEditorInputsAreServed(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("GET %s returned %d", PathTopology, resp.StatusCode)
 	}
-	var topo []v1alpha1.Channel
+	var topo []graph.Channel
 	if err := json.Unmarshal(body, &topo); err != nil {
 		t.Fatalf("the topology is not a channel list: %v (%s)", err, truncate(body))
 	}
@@ -163,7 +163,7 @@ func TestEditorInputsAreServed(t *testing.T) {
 	// The page builds its operation list out of the producer and consumer
 	// names, so those two fields carry the graph and must survive the round
 	// trip through JSON.
-	byName := map[string]v1alpha1.Channel{}
+	byName := map[string]graph.Channel{}
 	for _, c := range topo {
 		byName[c.Name] = c
 	}
@@ -174,10 +174,10 @@ func TestEditorInputsAreServed(t *testing.T) {
 	if sh.From != "map" || sh.To != "reduce" {
 		t.Errorf("shuffle reads from %q to %q, want map to reduce", sh.From, sh.To)
 	}
-	if sh.Partitioning.Mode != v1alpha1.PartitionHash || sh.Partitioning.Partitions != 4 {
+	if sh.Partitioning.Mode != graph.PartitionHash || sh.Partitioning.Partitions != 4 {
 		t.Errorf("shuffle carries partitioning %+v", sh.Partitioning)
 	}
-	if sh.Delivery != v1alpha1.DeliveryMaterialized {
+	if sh.Delivery != graph.DeliveryMaterialized {
 		t.Errorf("shuffle carries delivery %q", sh.Delivery)
 	}
 

@@ -56,6 +56,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/api/v1alpha1"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 )
@@ -447,7 +448,7 @@ func mustRunIdle(spec *v1alpha1.WorkloadSpec, op *v1alpha1.Operation) bool {
 		return true
 	}
 	for _, c := range inbound {
-		if c.Delivery != v1alpha1.DeliveryMaterialized {
+		if c.Delivery != graph.DeliveryMaterialized {
 			return true
 		}
 	}
@@ -463,7 +464,7 @@ func (r *Reconciler) reconcileOperation(ctx context.Context, wl *v1alpha1.Worklo
 	// until that channel is sealed. Feedback channels are excluded because
 	// they seal only when the loop terminates.
 	for _, c := range wl.Spec.Inbound(op.Name) {
-		if c.Delivery == v1alpha1.DeliveryMaterialized && c.Feedback == nil && !metrics.channels[c.Name].Sealed {
+		if c.Delivery == graph.DeliveryMaterialized && c.Feedback == nil && !metrics.channels[c.Name].Sealed {
 			return st, nil
 		}
 	}
