@@ -90,7 +90,10 @@ func inputKey(channel string, ack coordinator.SegmentAck) string {
 }
 
 func (s *checkpointSession) covers(channel string, seg coordinator.SegmentRef) bool {
-	return s.covered[inputKey(channel, coordinator.SegmentAck{ID: seg.ID, AppendID: seg.AppendID, Holder: seg.Holder})]
+	if seg.AppendID != "" && s.covered[inputKey(channel, coordinator.SegmentAck{ID: seg.ID, AppendID: seg.AppendID})] {
+		return true
+	}
+	return s.covered[inputKey(channel, coordinator.SegmentAck{ID: seg.ID, Holder: seg.Holder})]
 }
 
 func cloneOutputs(in map[string][]coordinator.SegmentAnnouncement) map[string][]coordinator.SegmentAnnouncement {

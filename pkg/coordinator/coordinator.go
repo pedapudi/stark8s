@@ -1324,7 +1324,7 @@ func (co *Coordinator) AckSession(name, opName, podName, incarnation string, ack
 		if acknowledgingPod == nil {
 			acknowledgingPod = co.op(c.spec.To).pods[ackPod]
 		}
-		s, ok := c.all[a.Holder+"/"+a.ID]
+		s, ok := segmentForAck(c, a)
 		if !ok || s.lost {
 			continue
 		}
@@ -1372,7 +1372,7 @@ func (co *Coordinator) NackSession(name, opName, podName, incarnation string, ac
 	}
 	owned := deliveryKey(podName, incarnation)
 	for _, a := range acks {
-		s := c.all[a.Holder+"/"+a.ID]
+		s, _ := segmentForAck(c, a)
 		if s == nil || !s.delivered[owned] {
 			continue
 		}
@@ -1397,6 +1397,15 @@ func (co *Coordinator) NackSession(name, opName, podName, incarnation string, ac
 	}
 	co.settle()
 	return co.commitLocked()
+}
+
+func segmentForAck(c *channel, ack SegmentAck) (*segment, bool) {
+	if ack.AppendID != "" {
+		s := c.appendIDs[ack.AppendID]
+		return s, s != nil && s.id == ack.ID
+	}
+	s, ok := c.all[ack.Holder+"/"+ack.ID]
+	return s, ok
 }
 
 func containsSegment(list []*segment, want *segment) bool {

@@ -14,6 +14,14 @@ import (
 	"github.com/pedapudi/stark8s/pkg/storage"
 )
 
+func TestCheckpointCoverageReadsLegacyHolderIdentity(t *testing.T) {
+	checkpoint := &checkpointSession{covered: map[string]bool{inputKey("input", coordinator.SegmentAck{ID: "one", Holder: "holder:8090"}): true}}
+	segment := coordinator.SegmentRef{ID: "one", AppendID: "stable/one", Holder: "holder:8090"}
+	if !checkpoint.covers("input", segment) {
+		t.Fatal("legacy checkpoint input was not recognized")
+	}
+}
+
 func TestCheckpointRecognizesCoordinatorInputAfterAddressChange(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

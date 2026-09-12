@@ -233,6 +233,7 @@ func TestCoordinatorHeldSegmentUsesReplacementAddress(t *testing.T) {
 	if err != nil || len(response.Work) != 1 {
 		t.Fatalf("initial delivery=%+v err=%v", response, err)
 	}
+	ref := response.Work[0].Segments[0]
 	restored, err := NewDurable(ctx, "replacement:8090", store, "state", "writer-2")
 	if err != nil {
 		t.Fatal(err)
@@ -241,12 +242,56 @@ func TestCoordinatorHeldSegmentUsesReplacementAddress(t *testing.T) {
 	if !ok || len(records) != 1 || records[0].Key != "a" {
 		t.Fatalf("replacement segment records=%+v ok=%v", records, ok)
 	}
-	if err := restored.Ack("input", []SegmentAck{{ID: "ext-1", Holder: "replacement:8090", Pod: "sink-0"}}); err != nil {
+	if err := restored.Ack("input", []SegmentAck{{ID: "different", AppendID: ref.AppendID, Holder: ref.Holder, Pod: "sink-0"}}); err != nil {
+		t.Fatal(err)
+	}
+	if metrics := channelMetrics(restored, "input"); metrics.InFlight != 1 || metrics.Acknowledged != 0 {
+		t.Fatalf("mismatched segment ID acknowledged: %+v", metrics)
+	}
+	if err := restored.Ack("input", []SegmentAck{{ID: ref.ID, AppendID: ref.AppendID, Holder: ref.Holder, Pod: "sink-0"}}); err != nil {
 		t.Fatal(err)
 	}
 	metrics := channelMetrics(restored, "input")
 	if metrics.InFlight != 0 || metrics.Pending != 0 || metrics.Acknowledged != 1 {
 		t.Fatalf("replacement acknowledgement: %+v", metrics)
+	}
+}
+
+func TestCoordinatorHeldSegmentNackUsesStableIdentityAfterReplacement(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	co, err := NewDurable(ctx, "first:8090", store, "state", "writer-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := co.Configure([]graph.Channel{{Name: "input", To: "sink", Partitioning: graph.Partitioning{Partitions: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.Register(PodRegistration{Operation: "sink", Pod: "sink-0", Incarnation: "first", Slots: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.Produce("input", "", []Record{{Key: "a", Value: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := co.ConsumeSession("input", "sink", "sink-0", "first", 1)
+	if err != nil || len(response.Work) != 1 || len(response.Work[0].Segments) != 1 {
+		t.Fatalf("initial delivery=%+v err=%v", response, err)
+	}
+	ref := response.Work[0].Segments[0]
+	restored, err := NewDurable(ctx, "replacement:8090", store, "state", "writer-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack := SegmentAck{ID: ref.ID, AppendID: ref.AppendID, Holder: ref.Holder, Pod: "sink-0"}
+	if err := restored.NackSession("input", "sink", "sink-0", "first", []SegmentAck{ack}); err != nil {
+		t.Fatal(err)
+	}
+	response, err = restored.ConsumeSession("input", "sink", "sink-0", "first", 1)
+	if err != nil || len(response.Work) != 1 || response.Work[0].Segments[0].Holder != "replacement:8090" {
+		t.Fatalf("redelivery=%+v err=%v", response, err)
 	}
 }
 
