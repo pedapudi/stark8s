@@ -60,6 +60,30 @@ const (
 	DurabilityRetained Durability = "Retained"
 )
 
+// CombineMode names an associative, commutative function that a producer
+// applies to records sharing a key before they are put on the wire.
+type CombineMode string
+
+const (
+	// CombineSum adds the values. Records must be numbers.
+	CombineSum CombineMode = "Sum"
+	// CombineMin keeps the smallest value. Records must be numbers.
+	CombineMin CombineMode = "Min"
+	// CombineMax keeps the largest value. Records must be numbers.
+	CombineMax CombineMode = "Max"
+	// CombineCount replaces the values with how many were emitted for the
+	// key, so the emitted value is ignored and may be null.
+	CombineCount CombineMode = "Count"
+)
+
+// Idempotent reports whether applying a combined record more than once yields
+// the same result. Delivery is at-least-once, so a consumer that applies the
+// channel's own function to an idempotent mode needs no deduplication; Sum and
+// Count are not idempotent and a redelivered record double-counts.
+func (c CombineMode) Idempotent() bool {
+	return c == CombineMin || c == CombineMax
+}
+
 // Partitioning describes how a channel splits records across consumers.
 type Partitioning struct {
 	// +kubebuilder:default=RoundRobin
@@ -123,6 +147,16 @@ type Channel struct {
 	// +kubebuilder:default=Ephemeral
 	// +kubebuilder:validation:Enum=Ephemeral;Retained
 	Durability Durability `json:"durability,omitempty"`
+	// Combine names a function the producer applies to records sharing a key
+	// before they are put on the wire, so a stage that emits one record per
+	// fact ships one record per key instead. It is the map-side half of a
+	// reduce-by-key: the consumer still aggregates across producers.
+	//
+	// The function must be associative and commutative, because the producer
+	// applies it to whatever subset of a key's records happen to be buffered
+	// together. Empty means no combining.
+	// +kubebuilder:validation:Enum=Sum;Min;Max;Count
+	Combine CombineMode `json:"combine,omitempty"`
 	// Feedback is set on the channel that closes a cycle.
 	Feedback *Feedback `json:"feedback,omitempty"`
 }

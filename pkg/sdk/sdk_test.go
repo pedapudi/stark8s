@@ -312,3 +312,125 @@ func TestSegmentDirFallsBackWhenNotWritable(t *testing.T) {
 	}
 	s.remove(id)
 }
+
+// combineOutput drains a Retained channel through the coordinator and returns
+// the surviving records keyed by their record key.
+func combineOutput(t *testing.T, h *harness, channel string) map[string]float64 {
+	t.Helper()
+	recs, _, err := h.co.Records(channel, "", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]float64{}
+	for _, r := range recs {
+		n, ok := r.Value.(float64)
+		if !ok {
+			t.Fatalf("record %q value %v is not a number", r.Key, r.Value)
+		}
+		out[r.Key] = n
+	}
+	return out
+}
+
+// A channel that declares Combine folds records sharing a key before they go
+// on the wire, so the segment carries one record per key instead of one per
+// emitted fact. This is the map-side half of a reduce-by-key.
+func TestCombineFoldsRecordsBeforeTheWire(t *testing.T) {
+	for _, tc := range []struct {
+		mode v1alpha1.CombineMode
+		want map[string]float64
+	}{
+		{v1alpha1.CombineSum, map[string]float64{"a": 6, "b": 40}},
+		{v1alpha1.CombineMin, map[string]float64{"a": 1, "b": 10}},
+		{v1alpha1.CombineMax, map[string]float64{"a": 3, "b": 30}},
+		{v1alpha1.CombineCount, map[string]float64{"a": 3, "b": 2}},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			h, done := newHarness(t, []v1alpha1.Channel{{
+				Name: "out", From: "src", Durability: v1alpha1.DurabilityRetained,
+				Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 1},
+				Combine:      tc.mode,
+			}})
+			defer done()
+			w := h.worker("src", "src-0", nil, []string{"out"})
+			h.run(w, Handlers{Source: func(ctx context.Context, w *Worker) error {
+				for _, e := range []struct {
+					k string
+					v int
+				}{{"a", 1}, {"b", 10}, {"a", 2}, {"b", 30}, {"a", 3}} {
+					if err := w.Emit("out", e.k, e.v); err != nil {
+						return err
+					}
+				}
+				return nil
+			}})
+			h.waitComplete("src")
+
+			got := combineOutput(t, h, "out")
+			if len(got) != len(tc.want) {
+				t.Fatalf("%s emitted %d records, want %d (one per key): %v", tc.mode, len(got), len(tc.want), got)
+			}
+			for k, want := range tc.want {
+				if got[k] != want {
+					t.Fatalf("%s key %q = %v, want %v", tc.mode, k, got[k], want)
+				}
+			}
+			// Five facts went in; the combined channel must carry two records.
+			if m := h.co.Metrics().Channels[0]; m.Produced != 2 {
+				t.Fatalf("%s put %d records on the wire, want 2 from 5 facts", tc.mode, m.Produced)
+			}
+		})
+	}
+}
+
+// Without Combine the same program ships every fact, which is the behaviour
+// the feature exists to avoid and the regression guard for the default path.
+func TestWithoutCombineEveryFactGoesOnTheWire(t *testing.T) {
+	h, done := newHarness(t, []v1alpha1.Channel{{
+		Name: "out", From: "src", Durability: v1alpha1.DurabilityRetained,
+		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 1},
+	}})
+	defer done()
+	w := h.worker("src", "src-0", nil, []string{"out"})
+	h.run(w, Handlers{Source: func(ctx context.Context, w *Worker) error {
+		for i := 0; i < 5; i++ {
+			if err := w.Emit("out", "a", 1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}})
+	h.waitComplete("src")
+	if m := h.co.Metrics().Channels[0]; m.Produced != 5 {
+		t.Fatalf("uncombined channel produced %d records, want 5", m.Produced)
+	}
+}
+
+// A non-numeric record on an arithmetic combine channel is a programming
+// error and must be reported at the Emit that caused it, not silently dropped
+// or deferred to a decode failure in the consumer.
+func TestCombineRejectsNonNumericValues(t *testing.T) {
+	h, done := newHarness(t, []v1alpha1.Channel{{
+		Name: "out", From: "src", Durability: v1alpha1.DurabilityRetained,
+		Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 1},
+		Combine:      v1alpha1.CombineSum,
+	}})
+	defer done()
+	w := h.worker("src", "src-0", nil, []string{"out"})
+	if err := w.Emit("out", "a", "not a number"); err == nil {
+		t.Fatal("Emit accepted a string on a Sum channel")
+	} else if !strings.Contains(err.Error(), "must be a number") {
+		t.Fatalf("unhelpful error: %v", err)
+	}
+}
+
+func TestCombineModeIdempotence(t *testing.T) {
+	for mode, want := range map[v1alpha1.CombineMode]bool{
+		v1alpha1.CombineMin: true, v1alpha1.CombineMax: true,
+		v1alpha1.CombineSum: false, v1alpha1.CombineCount: false,
+	} {
+		if got := mode.Idempotent(); got != want {
+			t.Fatalf("%s.Idempotent() = %v, want %v", mode, got, want)
+		}
+	}
+}

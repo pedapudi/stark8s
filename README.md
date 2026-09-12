@@ -41,9 +41,15 @@ spec:
       template: {spec: {containers: [{name: main, image: stark8s:dev, command: ["/wordcount", "reduce"]}]}}
   channels:
     - {name: lines,   from: read,   to: map,    partitioning: {mode: RoundRobin, partitions: 8}, delivery: Pipelined}
-    - {name: shuffle, from: map,    to: reduce, partitioning: {mode: Hash, partitions: 6},       delivery: Materialized}
+    - {name: shuffle, from: map,    to: reduce, partitioning: {mode: Hash, partitions: 6},       delivery: Materialized, combine: Sum}
     - {name: totals,  from: reduce}                # no consumer: read from outside
 ```
+
+`shuffle` declares `combine: Sum`, so `map` folds the counts for a word as it
+buffers and puts one record per distinct word on the wire rather than one per
+occurrence — the map-side half of a reduce-by-key. `Sum`, `Min`, `Max` and
+`Count` are available; `Min` and `Max` are idempotent, so a consumer applying
+them needs no deduplication despite at-least-once delivery.
 
 `map` starts as soon as `read` produces lines and scales on the backlog of
 `lines`. `reduce` is not started until `map` has completed, because

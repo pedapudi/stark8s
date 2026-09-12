@@ -105,11 +105,14 @@ type Worker struct {
 	client *http.Client
 	specs  map[string]v1alpha1.Channel
 
-	buffers     map[bufKey][]wireRecord
-	order       []bufKey
-	rr          map[string]uint64
-	unannounced map[string][]coordinator.SegmentAnnouncement
-	overflowed  map[string]int64
+	buffers map[bufKey][]wireRecord
+	// combineIndex maps a buffered record key to its slot in buffers, for
+	// channels that declare a Combine function.
+	combineIndex map[bufKey]map[string]int
+	order        []bufKey
+	rr           map[string]uint64
+	unannounced  map[string][]coordinator.SegmentAnnouncement
+	overflowed   map[string]int64
 
 	epoch    int32
 	maxEpoch int32
@@ -336,10 +339,94 @@ func (w *Worker) buffer(channel, key string, value json.RawMessage, epoch int32)
 	if _, ok := w.buffers[k]; !ok {
 		w.order = append(w.order, k)
 	}
+	if spec.Combine != "" {
+		if err := w.combine(k, spec.Combine, key, value, epoch); err != nil {
+			return err
+		}
+		// The buffer now holds one record per distinct key, so the flush
+		// threshold bounds distinct keys rather than facts. That is the point:
+		// a stage emitting many records per key ships far fewer.
+		if len(w.buffers[k]) >= 500 {
+			return w.flushBuffer(k)
+		}
+		return nil
+	}
 	w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: value, Epoch: epoch})
 	if len(w.buffers[k]) >= 500 {
 		return w.flushBuffer(k)
 	}
+	return nil
+}
+
+// combine folds a record into the buffered record for the same key, applying
+// the channel's function. The buffered slice stays the source of truth so that
+// flushBuffer, the byte accounting and the ordering guarantees all keep
+// working unchanged; combineIndex only says where in it each key lives.
+func (w *Worker) combine(k bufKey, mode v1alpha1.CombineMode, key string, value json.RawMessage, epoch int32) error {
+	if w.combineIndex == nil {
+		w.combineIndex = map[bufKey]map[string]int{}
+	}
+	idx, ok := w.combineIndex[k]
+	if !ok {
+		idx = map[string]int{}
+		w.combineIndex[k] = idx
+	}
+
+	if mode == v1alpha1.CombineCount {
+		// Count ignores the emitted value, so it is the one mode that accepts
+		// a null and the one that cannot fail on a non-numeric record.
+		if at, seen := idx[key]; seen {
+			var n float64
+			if err := json.Unmarshal(w.buffers[k][at].Value, &n); err != nil {
+				return fmt.Errorf("combine Count on channel %q key %q: %w", k.channel, key, err)
+			}
+			return w.setCombined(k, at, n+1)
+		}
+		idx[key] = len(w.buffers[k])
+		b, _ := json.Marshal(1)
+		w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: b, Epoch: epoch})
+		return nil
+	}
+
+	var incoming float64
+	if err := json.Unmarshal(value, &incoming); err != nil {
+		return fmt.Errorf("combine %s on channel %q key %q: value must be a number: %w", mode, k.channel, key, err)
+	}
+	at, seen := idx[key]
+	if !seen {
+		idx[key] = len(w.buffers[k])
+		w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: value, Epoch: epoch})
+		return nil
+	}
+	var held float64
+	if err := json.Unmarshal(w.buffers[k][at].Value, &held); err != nil {
+		return fmt.Errorf("combine %s on channel %q key %q: %w", mode, k.channel, key, err)
+	}
+	switch mode {
+	case v1alpha1.CombineSum:
+		held += incoming
+	case v1alpha1.CombineMin:
+		if incoming < held {
+			held = incoming
+		}
+	case v1alpha1.CombineMax:
+		if incoming > held {
+			held = incoming
+		}
+	default:
+		return fmt.Errorf("channel %q: unknown combine mode %q", k.channel, mode)
+	}
+	return w.setCombined(k, at, held)
+}
+
+// setCombined rewrites a buffered record in place, keeping the byte accounting
+// consistent with the new encoding.
+func (w *Worker) setCombined(k bufKey, at int, v float64) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	w.buffers[k][at].Value = b
 	return nil
 }
 
@@ -379,6 +466,7 @@ func (w *Worker) flushBuffer(k bufKey) error {
 	recs := w.buffers[k]
 	if len(recs) == 0 {
 		delete(w.buffers, k)
+		delete(w.combineIndex, k)
 		return nil
 	}
 	spec, err := w.spec(k.channel)
@@ -391,6 +479,7 @@ func (w *Worker) flushBuffer(k bufKey) error {
 			return err
 		}
 		delete(w.buffers, k)
+		delete(w.combineIndex, k)
 		return nil
 	}
 	if w.store == nil {
@@ -403,6 +492,7 @@ func (w *Worker) flushBuffer(k bufKey) error {
 		return err
 	}
 	delete(w.buffers, k)
+	delete(w.combineIndex, k)
 	w.unannounced[k.channel] = append(w.unannounced[k.channel], coordinator.SegmentAnnouncement{
 		ID: id, Channel: k.channel, Partition: k.partition, Epoch: k.epoch,
 		Records: int64(len(recs)), Bytes: size, Holder: w.addr, Producer: w.Instance, Task: w.task,
