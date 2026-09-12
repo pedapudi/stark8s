@@ -120,7 +120,8 @@ at the bound after exactly `maxEpochs` updates, that every step reported a
 metric, that the mean reward rose, and that the learned policy puts its mass
 on the right token at every position of every task.
 
-A recent run: mean reward `0.302 -> 0.906` over 24 steps.
+The deterministic test run raises mean reward from `0.302` to `0.906` over 24
+steps.
 
 On a cluster, watch it while it runs:
 
@@ -133,11 +134,12 @@ curl -s 'http://127.0.0.1:18080/channels/metrics/records?after=0'
 `checkpoints` carries theta. Both are `Retained`, so they are readable from
 outside while training is still in flight.
 
-## Swapping in a real model
+## Scope
 
-The graph does not change. `rollout` gets a GPU request and generates with a
-language model instead of a table; `reward` keeps a verifiable scorer or calls
-a reward model; `learner` runs an optimizer step. What stays fixed is the part
-this example exists to show: the group is a Hash partition on the prompt, the
-policy is a Broadcast feedback edge, and the barriers are counts in
-application code.
+The table policy validates the graph mechanics on a CPU. It does not qualify
+model training, accelerator scheduling, checkpoint storage, or a cluster
+deployment. It trains and evaluates the same fixed tasks, so its reward change
+does not measure generalization to held-out tasks. A model-backed worker can
+retain the same channel layout while its
+rollout and learner operations call the protocol in
+[`examples/local-model-sidecar`](../local-model-sidecar/).

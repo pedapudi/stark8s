@@ -1,32 +1,7 @@
 // Command grpo runs Group Relative Policy Optimization as a cyclic workload.
-//
-//	prompts    (source) emits one record per task, Hash-partitioned so each
-//	                    rollout replica owns a disjoint set of them.
-//	rollout             holds the current policy and the tasks it owns. For
-//	                    each task it draws a group of G completions and emits
-//	                    them. It redraws every time new weights arrive.
-//	reward              scores one completion. The reward is verifiable, so
-//	                    there is no reward model and no judge in the graph.
-//	advantage           gathers the G scores of one task and centres them:
-//	                    (r - mean) / std. That group statistic is GRPO's
-//	                    baseline, which is why no critic appears anywhere.
-//	learner             the one owner of theta. It gathers a group from every
-//	                    task, applies the update, and broadcasts the new
-//	                    weights back to every rollout replica.
-//
-// Two barriers matter and neither is a channel attribute. `advantage` holds a
-// group open until it has all G rewards for one task; `learner` holds a step
-// open until it has a group from every task. Materialized delivery cannot do
-// this job, because it seals when the producing operation completes and in a
-// training loop no operation ever completes. Both counts are constants — the
-// group size and the task set are hyperparameters — which is exactly why this
-// graph is expressible at all.
-//
-// The epoch is the step number. It enters the cycle on a weights record and
-// every downstream emit inherits it, so a completion, its score and its
-// advantage all carry the step they belong to. The engine ends the run: the
-// weights record produced by the last update is stamped past maxEpochs and
-// dropped.
+// Prompts flow through rollout, reward, advantage, and learner operations.
+// The learner broadcasts updated weights to the rollout replicas. Application
+// handlers assemble each fixed-size sample group and training batch.
 package main
 
 import (

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pedapudi/stark8s/api/v1alpha1"
+	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
 	"github.com/pedapudi/stark8s/pkg/sdk"
 )
@@ -23,19 +23,19 @@ const (
 	testSteps = 24 // = maxEpochs on the weights channel
 )
 
-func specs() []v1alpha1.Channel {
-	return []v1alpha1.Channel{
+func specs() []graph.Channel {
+	return []graph.Channel{
 		{Name: "batch", From: "prompts", To: "rollout",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 8}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 8}},
 		{Name: "completions", From: "rollout", To: "reward",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionRoundRobin, Partitions: 8}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionRoundRobin, Partitions: 8}},
 		{Name: "scored", From: "reward", To: "advantage",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 8}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 8}},
 		{Name: "advantages", From: "advantage", To: "learner",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionHash, Partitions: 1}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 1}},
 		{Name: "weights", From: "learner", To: "rollout",
-			Partitioning: v1alpha1.Partitioning{Mode: v1alpha1.PartitionBroadcast, Partitions: 1},
-			Feedback:     &v1alpha1.Feedback{Mode: v1alpha1.FeedbackAsynchronous, MaxEpochs: testSteps}},
+			Partitioning: graph.Partitioning{Mode: graph.PartitionBroadcast, Partitions: 1},
+			Feedback:     &graph.Feedback{Mode: graph.FeedbackAsynchronous, MaxEpochs: testSteps}},
 		{Name: "metrics", From: "learner"},
 		{Name: "checkpoints", From: "learner"},
 	}

@@ -220,7 +220,7 @@ func (p *policy) step(batch []sampleRec, ref *policy, lr, eps, beta float64) (ob
 }
 
 // advantages centres the rewards of one group and scales them by their spread.
-// This is the whole of GRPO's baseline: the group mean stands in for a value
+// The group mean is GRPO's baseline: it stands in for a value
 // network, which is why there is no critic anywhere in the graph.
 func advantages(rewards []float64) []float64 {
 	n := float64(len(rewards))
