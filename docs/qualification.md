@@ -42,6 +42,19 @@ separately before making a cluster memory or tail-latency claim.
 checks that all records arrive, acknowledgement leaves no pending or in-flight
 records, no record is lost, and completion includes the full handler delay.
 
+The same one-shot emission cases at `a7f7f2d`, after worker bounds and durable
+recovery changes, produced these measurements on the same host:
+
+| Case | records/s | payload MiB/s | disk MiB | HTTP requests | allocated MiB |
+|---|---:|---:|---:|---:|---:|
+| Small records | 1,148,350 | 109.5 | 10.95 | 3 | 94.86 |
+| Large payloads | 4,018 | 383.2 | 7.918 | 3 | 67.33 |
+| 1,024 partitions | 460,233 | 43.89 | 1.297 | 3 | 12.73 |
+
+These samples show additional request and allocation cost. Repetitions and
+complete processing measurements are required before choosing an optimization
+or making a throughput claim.
+
 ## Local-cluster qualification
 
 Create an isolated kind cluster and kubeconfig, then pass both to the script.
@@ -77,3 +90,42 @@ The map-worker deletion does not qualify stateful recovery. The controller
 restart occurs after workload completion and does not qualify coordinator
 recovery. Qualify checkpoint restoration and coordinator replacement with a
 configured object store and an exact-output application check.
+
+## Durable ETL recovery
+
+The durable recovery check requires an existing cluster, an object store that
+is reachable from workload pods, a namespaced Secret with `accessKey` and
+`secretKey` entries, and a shared volume claim mounted at `/data`. Supply the
+object-store endpoint, region, Secret name, volume claim, image tag, namespace,
+and run ID through the generated test manifest. Do not put credentials in the
+manifest or qualification artifacts.
+
+Populate the shared volume with `inputs/manifest.json` and 20 immutable JSON
+Lines files. Each file contains 10,000 copies of these records:
+
+```json
+{"region":"north","amount":3,"status":"settled"}
+{"region":"south","amount":2,"status":"settled"}
+```
+
+The manifest records each `inputs/part-N.jsonl` key and the SHA-256 version of
+its exact bytes. Use the four-operation manifest in
+`examples/etl/workload.json`, enable its object store, give every operation the
+same run ID and volume claim, and constrain `transform` and `aggregate` to one
+replica. A small CPU limit makes both fault boundaries observable without
+changing their results.
+
+After `splits.acknowledged` is greater than zero and less than 20, save the
+coordinator metrics and transform Pod manifest, then delete that transform
+Pod. Wait for a replacement transform Pod with a different name. While
+unacknowledged splits remain, save the metrics and coordinator Pod manifest,
+then delete the workload coordinator Pod. Wait for the Workload phase to become
+`Succeeded`.
+
+Read only `datasets/regional-sales/complete.json` and the two files it names.
+The complete result is exactly `north = 600000` and `south = 400000`, with no
+other keys. The final coordinator metrics must report zero lost records on
+every channel, 20 produced and acknowledged splits, one completed record, and
+two output-file records. Keep the namespace and captured artifacts when the
+check fails so the pre-fault ownership, replacement identities, and restored
+metrics remain inspectable.

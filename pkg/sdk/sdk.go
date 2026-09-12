@@ -85,13 +85,12 @@ type Handlers struct {
 	Source func(ctx context.Context, w *Worker) error
 	// OnRecord is called for each consumed record.
 	OnRecord func(ctx context.Context, w *Worker, r Record) error
-	// OnEpochEnd is called when every inbound Synchronous feedback channel
-	// is quiescent at the given epoch, before the barrier advances. Emit
-	// next-epoch records here. It is called at most once per epoch.
+	// OnEpochEnd runs after required input for the current finite epoch closes
+	// and drains for this worker, before the worker reports epoch completion.
+	// It runs at most once per epoch within a worker attempt.
 	OnEpochEnd func(ctx context.Context, w *Worker, epoch int32) error
-	// OnDrain is called once when every inbound channel that has a producing
-	// operation is drained. Emit final results here; the worker then reports
-	// done and idles.
+	// OnDrain runs when every inbound channel is sealed and drained. Emit
+	// final results here; the worker then reports completion.
 	OnDrain func(ctx context.Context, w *Worker) error
 	// Tick is called on an interval, for operations that have work to do on a
 	// clock as well as on their input: polling a feed, a queue or an API,
@@ -1126,12 +1125,8 @@ const (
 	barrierPollCeiling = 250 * time.Millisecond
 )
 
-// Fetching a segment from its holder. The coordinator has no way to hand a
-// delivered segment back to the pending queue on request, so a consumer that
-// cannot fetch one has only two options: retry, or stop. It retries this
-// many times, doubling the wait from fetchRetryFloor to fetchRetryCeiling --
-// about 5s in total, enough to ride out a holder restart or a network blip
-// -- and then fails.
+// A consumer retries a segment fetch within this budget. If the budget expires,
+// Run returns the unfinished delivery to the coordinator with a retry delay.
 const (
 	fetchAttempts     = 6
 	fetchRetryFloor   = 200 * time.Millisecond

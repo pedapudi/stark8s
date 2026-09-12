@@ -341,8 +341,9 @@ spec:
                       type: object
                     slots:
                       default: 1
-                      description: Slots is how many partitions one replica processes
-                        concurrently.
+                      description: |-
+                        Slots is a capacity hint reported with the worker. Application callbacks
+                        remain serial within each worker.
                       format: int32
                       minimum: 1
                       type: integer

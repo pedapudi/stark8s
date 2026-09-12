@@ -144,7 +144,8 @@ type Operation struct {
 	Template corev1.PodTemplateSpec `json:"template"`
 	// +kubebuilder:default={horizontal:{min:1,max:1}}
 	Scaling Scaling `json:"scaling,omitempty"`
-	// Slots is how many partitions one replica processes concurrently.
+	// Slots is a capacity hint reported with the worker. Application callbacks
+	// remain serial within each worker.
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
 	Slots      int32           `json:"slots,omitempty"`
