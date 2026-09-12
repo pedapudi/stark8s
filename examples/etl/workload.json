@@ -1,0 +1,72 @@
+{
+  "apiVersion": "stark8s.io/v1alpha1",
+  "kind": "Workload",
+  "metadata": {"name": "file-etl"},
+  "spec": {
+    "coordinator": {"objectStore": {
+      "endpoint": "http://replace-with-object-store/bucket",
+      "region": "local",
+      "credentialsSecret": "replace-with-object-store-credentials"
+    }},
+    "operations": [
+      {
+        "name": "read", "completion": "Drain", "slots": 1,
+        "scaling": {"horizontal": {"min": 1, "max": 1}},
+        "template": {"spec": {
+          "containers": [{
+            "name": "main", "image": "stark8s:dev", "command": ["/etl", "read"],
+            "env": [{"name": "ETL_STORE_DIR", "value": "/data"}, {"name": "ETL_ATTEMPT", "value": "replace-with-run-id"}],
+            "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}},
+            "volumeMounts": [{"name": "data", "mountPath": "/data"}]
+          }],
+          "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": "replace-with-shared-files"}}]
+        }}
+      },
+      {
+        "name": "transform", "checkpoint": true, "completion": "Drain", "slots": 1,
+        "scaling": {"horizontal": {"min": 1, "max": 1}},
+        "template": {"spec": {
+          "containers": [{
+            "name": "main", "image": "stark8s:dev", "command": ["/etl", "transform"],
+            "env": [{"name": "ETL_STORE_DIR", "value": "/data"}, {"name": "ETL_ATTEMPT", "value": "replace-with-run-id"}],
+            "resources": {"requests": {"cpu": "500m", "memory": "256Mi"}},
+            "volumeMounts": [{"name": "data", "mountPath": "/data"}]
+          }],
+          "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": "replace-with-shared-files"}}]
+        }}
+      },
+      {
+        "name": "aggregate", "checkpoint": true, "completion": "Drain", "slots": 1,
+        "scaling": {"horizontal": {"min": 1, "max": 1}},
+        "template": {"spec": {
+          "containers": [{
+            "name": "main", "image": "stark8s:dev", "command": ["/etl", "aggregate"],
+            "env": [{"name": "ETL_STORE_DIR", "value": "/data"}, {"name": "ETL_ATTEMPT", "value": "replace-with-run-id"}],
+            "resources": {"requests": {"cpu": "500m", "memory": "256Mi"}},
+            "volumeMounts": [{"name": "data", "mountPath": "/data"}]
+          }],
+          "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": "replace-with-shared-files"}}]
+        }}
+      },
+      {
+        "name": "publish", "completion": "Drain", "slots": 1,
+        "scaling": {"horizontal": {"min": 1, "max": 1}},
+        "template": {"spec": {
+          "containers": [{
+            "name": "main", "image": "stark8s:dev", "command": ["/etl", "publish"],
+            "env": [{"name": "ETL_STORE_DIR", "value": "/data"}, {"name": "ETL_ATTEMPT", "value": "replace-with-run-id"}],
+            "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}},
+            "volumeMounts": [{"name": "data", "mountPath": "/data"}]
+          }],
+          "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": "replace-with-shared-files"}}]
+        }}
+      }
+    ],
+    "channels": [
+      {"name": "splits", "from": "read", "to": "transform", "delivery": "Materialized", "partitioning": {"mode": "Hash", "partitions": 4}},
+      {"name": "values", "from": "transform", "to": "aggregate", "delivery": "Materialized", "partitioning": {"mode": "Hash", "partitions": 2}, "combine": "Sum"},
+      {"name": "output-files", "from": "aggregate", "to": "publish", "delivery": "Materialized", "partitioning": {"mode": "Hash", "partitions": 1}},
+      {"name": "completed", "from": "publish", "durability": "Retained"}
+    ]
+  }
+}

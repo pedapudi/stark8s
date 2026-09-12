@@ -29,8 +29,7 @@ func HandlerForGraph(co *Coordinator, graphName string) http.Handler {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		co.Configure(specs)
-		w.WriteHeader(204)
+		fail(w, co.Configure(specs))
 	})
 	mux.HandleFunc("GET "+PathTopology, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, co.Topology())
@@ -93,6 +92,68 @@ func HandlerForGraph(co *Coordinator, graphName string) http.Handler {
 		writeJSON(w, out)
 	})
 	ch := PathChannels + "/{c}"
+	mux.HandleFunc("POST "+ch+SuffixAppends, func(w http.ResponseWriter, r *http.Request) {
+		var batch AppendBatch
+		decoder := json.NewDecoder(r.Body)
+		decoder.UseNumber()
+		if err := decoder.Decode(&batch); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		operation, podName := r.Header.Get(OperationHeader), r.URL.Query().Get("pod")
+		if operation != "" && podName == "" {
+			http.Error(w, "pod is required for an operation writer", 400)
+			return
+		}
+		offset, err := co.AppendSession(r.PathValue("c"), operation, podName, r.Header.Get(IncarnationHeader), batch)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		writeJSON(w, PartitionPosition{Partition: batch.Partition, Offset: offset})
+	})
+	sub := ch + SuffixSubscriptions + "/{s}"
+	mux.HandleFunc("PUT "+sub, func(w http.ResponseWriter, r *http.Request) {
+		var spec SubscriptionSpec
+		if err := json.NewDecoder(r.Body).Decode(&spec); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		fail(w, co.SetSubscription(r.PathValue("c"), r.PathValue("s"), spec))
+	})
+	mux.HandleFunc("GET "+sub+SuffixConsume, func(w http.ResponseWriter, r *http.Request) {
+		max, _ := strconv.Atoi(r.URL.Query().Get("max"))
+		resp, err := co.ConsumeSubscription(r.PathValue("c"), r.PathValue("s"), r.URL.Query().Get("pod"), r.Header.Get(IncarnationHeader), max)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		writeJSON(w, resp)
+	})
+	mux.HandleFunc("POST "+sub+SuffixAck, func(w http.ResponseWriter, r *http.Request) {
+		var acks []SubscriptionAck
+		if err := json.NewDecoder(r.Body).Decode(&acks); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		fail(w, co.AckSubscription(r.PathValue("c"), r.PathValue("s"), r.URL.Query().Get("pod"), r.Header.Get(IncarnationHeader), acks))
+	})
+	mux.HandleFunc("POST "+sub+"/replay", func(w http.ResponseWriter, r *http.Request) {
+		var positions []PartitionPosition
+		if err := json.NewDecoder(r.Body).Decode(&positions); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		fail(w, co.ReplaySubscription(r.PathValue("c"), r.PathValue("s"), positions))
+	})
+	mux.HandleFunc("POST "+ch+SuffixRetention, func(w http.ResponseWriter, r *http.Request) {
+		var positions []PartitionPosition
+		if err := json.NewDecoder(r.Body).Decode(&positions); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		fail(w, co.DeleteRetainedBefore(r.PathValue("c"), positions))
+	})
 	mux.HandleFunc("POST "+ch+SuffixSegments, func(w http.ResponseWriter, r *http.Request) {
 		var anns []SegmentAnnouncement
 		if err := json.NewDecoder(r.Body).Decode(&anns); err != nil {
@@ -138,7 +199,9 @@ func HandlerForGraph(co *Coordinator, graphName string) http.Handler {
 	})
 	mux.HandleFunc("POST "+ch+SuffixRecords, func(w http.ResponseWriter, r *http.Request) {
 		var recs []Record
-		if err := json.NewDecoder(r.Body).Decode(&recs); err != nil {
+		decoder := json.NewDecoder(r.Body)
+		decoder.UseNumber()
+		if err := decoder.Decode(&recs); err != nil {
 			http.Error(w, err.Error(), 400)
 			return
 		}
@@ -159,7 +222,13 @@ func HandlerForGraph(co *Coordinator, graphName string) http.Handler {
 		w.Header().Set(RecordsNextHeader, strconv.Itoa(next))
 		writeJSON(w, recs)
 	})
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := co.failure(); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 func writePrometheus(w http.ResponseWriter, graph string, metrics Metrics) {
@@ -215,7 +284,13 @@ func SegmentHandler(co *Coordinator) http.Handler {
 		}
 		writeJSON(w, recs)
 	})
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := co.failure(); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

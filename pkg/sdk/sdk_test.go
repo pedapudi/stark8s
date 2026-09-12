@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
+	"github.com/pedapudi/stark8s/pkg/storage"
 )
 
 // harness runs a coordinator in-process and builds workers against it.
@@ -23,6 +25,151 @@ type harness struct {
 	srv *httptest.Server
 	ctx context.Context
 	wg  sync.WaitGroup
+}
+
+func TestDurableSegmentSurvivesProducerAndCoordinatorReplacement(t *testing.T) {
+	ctx := context.Background()
+	blobs, err := storage.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		obj, err := blobs.Get(r.Context(), strings.TrimPrefix(r.URL.Path, "/"))
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(obj.Bytes)
+	}))
+	defer blobServer.Close()
+	metadata, err := storage.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	co, err := coordinator.NewDurable(ctx, "coordinator:8090", metadata, "state", "writer-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := co.Configure([]graph.Channel{{Name: "data", From: "source", To: "sink", Durability: graph.DurabilityRetained, Partitioning: graph.Partitioning{Partitions: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	control := httptest.NewServer(coordinator.Handler(co))
+	producer := &Worker{Coordinator: control.URL, Operation: "source", Instance: "source-0", Outbound: []string{"data"}, DurableSegments: blobs, SegmentBaseURL: blobServer.URL, SegmentPrefix: "workload"}
+	producer.init()
+	if err := co.Register(producer.registration()); err != nil {
+		t.Fatal(err)
+	}
+	if err := producer.Emit("data", "key", map[string]int{"value": 7}); err != nil {
+		t.Fatal(err)
+	}
+	if err := producer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	control.Close()
+	restored, err := coordinator.NewDurable(ctx, "replacement:8090", metadata, "state", "writer-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.Register(coordinator.PodRegistration{Operation: "sink", Pod: "sink-0", Slots: 1}); err != nil {
+		t.Fatal(err)
+	}
+	work, err := restored.Consume("data", "sink", "sink-0", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(work.Work) != 1 || len(work.Work[0].Segments) != 1 {
+		t.Fatalf("restored work: %+v", work)
+	}
+	consumer := &Worker{DurableSegments: blobs, SegmentBaseURL: blobServer.URL, SegmentPrefix: "workload"}
+	consumer.init()
+	records, err := consumer.fetch(ctx, work.Work[0].Segments[0])
+	if err != nil || len(records) != 1 || records[0].Key != "key" {
+		t.Fatalf("records=%+v err=%v", records, err)
+	}
+}
+
+func TestOnlyRankZeroCanEmitGraphRecords(t *testing.T) {
+	w := &Worker{CollectiveSize: 2, CollectiveRank: 1}
+	if err := w.Emit("output", "key", 1); err == nil {
+		t.Fatal("nonzero rank emitted a graph record")
+	}
+	if !(&Worker{CollectiveSize: 2, CollectiveRank: 0}).CollectiveIOEnabled() {
+		t.Fatal("rank zero cannot use graph I/O")
+	}
+}
+
+func TestCollectiveRanksExitAndOnlyRankZeroRegisters(t *testing.T) {
+	h, stop := newHarness(t, nil)
+	defer stop()
+	rankOne := h.worker("train", "train-1", nil, nil)
+	rankOne.CollectiveSize, rankOne.CollectiveRank = 2, 1
+	if err := rankOne.Run(context.Background(), Handlers{Source: func(context.Context, *Worker) error { return nil }}); err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range h.co.Metrics().Operations {
+		if operation.Name == "train" && operation.LivePods != 0 {
+			t.Fatalf("nonzero rank registered as graph worker: %+v", operation)
+		}
+	}
+
+	rankZero := h.worker("train", "train-0", nil, nil)
+	rankZero.CollectiveSize, rankZero.CollectiveRank = 2, 0
+	if err := rankZero.Run(context.Background(), Handlers{Source: func(context.Context, *Worker) error { return nil }}); err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range h.co.Metrics().Operations {
+		if operation.Name == "train" && operation.LivePods != 1 {
+			t.Fatalf("rank zero registration missing: %+v", operation)
+		}
+	}
+}
+
+func TestDurableFetchUsesAuthenticatedStoreClient(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer read-token" {
+			http.Error(w, "missing credentials", http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`[{"key":"key","value":7,"epoch":0}]`))
+	}))
+	defer server.Close()
+	client := server.Client()
+	client.Transport = bearerRoundTripper{base: client.Transport}
+	store, err := storage.NewHTTP(server.URL+"/bucket", client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := &Worker{DurableSegments: store, SegmentBaseURL: server.URL + "/bucket", SegmentPrefix: "workload-a"}
+	worker.init()
+	records, err := worker.fetch(context.Background(), coordinator.SegmentRef{ID: "segment-1", Holder: server.URL + "/bucket"})
+	if err != nil || len(records) != 1 || records[0].Key != "key" {
+		t.Fatalf("records=%+v err=%v", records, err)
+	}
+}
+
+func TestDurableFetchBoundsBodyBeforeDecode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `[{"key":"key","value":"`+strings.Repeat("x", 256)+`","epoch":0}]`)
+	}))
+	defer server.Close()
+	store, err := storage.NewHTTP(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := &Worker{DurableSegments: store, MaxFetchedBytes: 64, MaxFetchedRecords: 10}
+	worker.init()
+	_, err = worker.fetch(context.Background(), coordinator.SegmentRef{ID: "oversized"})
+	if err == nil || !errors.Is(err, storage.ErrObjectTooLarge) {
+		t.Fatalf("durable oversized fetch error = %v", err)
+	}
+}
+
+type bearerRoundTripper struct{ base http.RoundTripper }
+
+func (t bearerRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	copy := request.Clone(request.Context())
+	copy.Header.Set("Authorization", "Bearer read-token")
+	return t.base.RoundTrip(copy)
 }
 
 func newHarness(t *testing.T, specs []graph.Channel) (*harness, context.CancelFunc) {
@@ -140,7 +287,7 @@ func TestWorkersExchangeSegmentsDirectly(t *testing.T) {
 	}
 	total := 0
 	for _, r := range recs {
-		total += int(r.Value.(float64))
+		total += int(numberValue(t, r.Value))
 	}
 	if len(recs) != 7 || total != lines {
 		t.Fatalf("totals: %d records summing to %d: %+v", len(recs), total, recs)
@@ -241,7 +388,7 @@ func TestSynchronousLoopRunsSupersteps(t *testing.T) {
 	// Each vertex receives one contribution per epoch after the first
 	// (epochs 1..3); contributions emitted at epoch 3 fall beyond the bound.
 	for _, r := range recs {
-		if r.Value.(float64) != 4 || received[r.Key] != 3 {
+		if numberValue(t, r.Value) != 4 || received[r.Key] != 3 {
 			t.Fatalf("vertex %s: value %v received %d", r.Key, r.Value, received[r.Key])
 		}
 	}
@@ -326,13 +473,26 @@ func combineOutput(t *testing.T, h *harness, channel string) map[string]float64 
 	}
 	out := map[string]float64{}
 	for _, r := range recs {
-		n, ok := r.Value.(float64)
-		if !ok {
-			t.Fatalf("record %q value %v is not a number", r.Key, r.Value)
-		}
-		out[r.Key] = n
+		out[r.Key] = numberValue(t, r.Value)
 	}
 	return out
+}
+
+func numberValue(t *testing.T, value any) float64 {
+	t.Helper()
+	switch number := value.(type) {
+	case float64:
+		return number
+	case json.Number:
+		result, err := number.Float64()
+		if err != nil {
+			t.Fatalf("value %q is not a number: %v", number, err)
+		}
+		return result
+	default:
+		t.Fatalf("value %v is not a number", value)
+		return 0
+	}
 }
 
 // A channel that declares Combine folds records sharing a key before they go
@@ -633,4 +793,161 @@ func TestExternalInputMustBeSealedBeforeCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.waitComplete("sink")
+}
+
+func TestAggregateBufferLimitAcrossPartitions(t *testing.T) {
+	h, stop := newHarness(t, []graph.Channel{{
+		Name: "out", From: "source", To: "sink",
+		Partitioning: graph.Partitioning{Mode: graph.PartitionHash, Partitions: 128},
+	}})
+	defer stop()
+	w := h.worker("source", "source-0", nil, []string{"out"})
+	w.MaxBufferedBytes = 1024
+	for i := 0; i < 200; i++ {
+		if err := w.Emit("out", fmt.Sprintf("key-%d", i), strings.Repeat("x", 100)); err != nil {
+			t.Fatal(err)
+		}
+		if w.bufferedBytes > w.MaxBufferedBytes {
+			t.Fatalf("buffered %d bytes, limit %d", w.bufferedBytes, w.MaxBufferedBytes)
+		}
+	}
+	if len(w.unannounced["out"]) == 0 {
+		t.Fatal("aggregate pressure did not flush any buffers")
+	}
+}
+
+func TestOversizedRecordSuggestsBlob(t *testing.T) {
+	h, stop := newHarness(t, []graph.Channel{{Name: "out", From: "source", To: "sink"}})
+	defer stop()
+	w := h.worker("source", "source-0", nil, []string{"out"})
+	w.MaxRecordBytes = 32
+	err := w.Emit("out", "key", strings.Repeat("x", 64))
+	if err == nil || !strings.Contains(err.Error(), "EmitBlob") || !strings.Contains(err.Error(), "32") {
+		t.Fatalf("oversized record error = %v", err)
+	}
+}
+
+func TestFetchedSegmentLimits(t *testing.T) {
+	w := &Worker{MaxFetchedBytes: 64, MaxFetchedRecords: 2}
+	w.init()
+	if _, err := w.fetch(context.Background(), coordinator.SegmentRef{ID: "large", Bytes: 65}); err == nil || !strings.Contains(err.Error(), "65") {
+		t.Fatalf("declared byte limit error = %v", err)
+	}
+	if _, err := w.fetch(context.Background(), coordinator.SegmentRef{ID: "many", Records: 3}); err == nil || !strings.Contains(err.Error(), "3") {
+		t.Fatalf("declared record limit error = %v", err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(rw).Encode([]wireRecord{{Key: "k", Value: json.RawMessage(`"` + strings.Repeat("x", 100) + `"`)}})
+	}))
+	defer srv.Close()
+	_, err := w.fetch(context.Background(), coordinator.SegmentRef{ID: "actual-large", Holder: strings.TrimPrefix(srv.URL, "http://")})
+	if err == nil || !strings.Contains(err.Error(), "64") {
+		t.Fatalf("actual byte limit error = %v", err)
+	}
+}
+
+func TestFetchedSegmentLimitConsumesTheWholeBody(t *testing.T) {
+	w := &Worker{MaxFetchedBytes: 64, MaxFetchedRecords: 2}
+	w.init()
+	w.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		body := io.MultiReader(strings.NewReader("[]"), strings.NewReader(strings.Repeat(" ", 100)))
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(body), Header: make(http.Header)}, nil
+	})}
+	_, err := w.fetch(context.Background(), coordinator.SegmentRef{ID: "trailing"})
+	if err == nil || !strings.Contains(err.Error(), "64") {
+		t.Fatalf("trailing-byte limit error = %v", err)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	if len(p) > 16 {
+		p = p[:16]
+	}
+	n, err := r.r.Read(p)
+	r.n += n
+	return n, err
+}
+
+func TestDecodeSegmentStopsAtRecordLimit(t *testing.T) {
+	body := "[" + strings.Repeat(`{"key":"k","value":1},`, 1000) + `{"key":"k","value":1}]`
+	reader := &countingReader{r: strings.NewReader(body)}
+	_, err := decodeSegment(reader, "many", 2)
+	if err == nil || !strings.Contains(err.Error(), "limit 2") {
+		t.Fatalf("record limit error = %v", err)
+	}
+	if reader.n >= len(body)/2 {
+		t.Fatalf("decoder read %d of %d bytes before enforcing record limit", reader.n, len(body))
+	}
+}
+
+func TestRuntimeLimitsFromEnvironment(t *testing.T) {
+	t.Setenv(coordinator.EnvCoordinator, "http://coordinator")
+	t.Setenv(coordinator.EnvOperation, "worker")
+	t.Setenv(coordinator.EnvMaxBufferedBytes, "1234")
+	t.Setenv(coordinator.EnvMaxFetchedRecords, "17")
+	w, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.MaxBufferedBytes != 1234 || w.MaxFetchedRecords != 17 {
+		t.Fatalf("limits = %d bytes and %d records", w.MaxBufferedBytes, w.MaxFetchedRecords)
+	}
+}
+
+func TestSegmentStorePressureFailsWithoutWaiting(t *testing.T) {
+	h, stop := newHarness(t, []graph.Channel{{Name: "out", From: "source", To: "sink"}})
+	defer stop()
+	w := h.worker("source", "source-0", nil, []string{"out"})
+	h.co.SetOperations([]coordinator.OperationSpec{{Name: "source", Replicas: 1}, {Name: "sink", Replicas: 1}})
+	w.init()
+	if err := h.co.Register(w.registration()); err != nil {
+		t.Fatal(err)
+	}
+	w.MaxBufferedBytes = 256
+	w.MaxRecordBytes = 256
+	w.MaxSegmentStoreBytes = 350
+	if err := w.Emit("out", "first", strings.Repeat("x", 180)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := w.Emit("out", "second", strings.Repeat("y", 180)); err != nil {
+		t.Fatal(err)
+	}
+	err := w.Flush()
+	if err == nil || !errors.Is(err, errStorageCapacity) {
+		t.Fatalf("storage pressure error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("storage pressure took %v to fail", elapsed)
+	}
+}
+
+func TestDurableSegmentsRejectPodLocalBlobHandles(t *testing.T) {
+	store, err := storage.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &Worker{DurableSegments: store, specs: map[string]graph.Channel{"out": {Name: "out", From: "source", To: "sink", Partitioning: graph.Partitioning{Partitions: 1}}}}
+	if err := w.EmitBlob("out", "key", strings.NewReader("payload")); err == nil || !strings.Contains(err.Error(), "pod-local") {
+		t.Fatalf("EmitBlob error = %v", err)
+	}
+	handle := BlobHandle{Blob: "local", Holder: "pod:8090", Size: 7}
+	if err := w.Emit("out", "key", handle); err == nil || !strings.Contains(err.Error(), "pod-local") {
+		t.Fatalf("reserved blob handle error = %v", err)
+	}
+	if err := w.Emit("out", "key", map[string]string{"object": "durable/model"}); err != nil {
+		t.Fatalf("application-owned durable reference rejected: %v", err)
+	}
 }

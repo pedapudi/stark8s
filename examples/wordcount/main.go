@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/pedapudi/stark8s/pkg/sdk"
@@ -39,6 +40,13 @@ func main() {
 	switch os.Args[1] {
 	case "read":
 		repeat := 200
+		if configured := os.Getenv("STARK8S_WORDCOUNT_REPEAT"); configured != "" {
+			value, err := strconv.Atoi(configured)
+			if err != nil || value < 1 {
+				log.Fatalf("STARK8S_WORDCOUNT_REPEAT must be a positive integer, got %q", configured)
+			}
+			repeat = value
+		}
 		h.Source = func(ctx context.Context, w *sdk.Worker) error {
 			n := 0
 			for i := 0; i < repeat; i++ {

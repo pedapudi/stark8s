@@ -48,6 +48,7 @@ import (
 
 	"github.com/pedapudi/stark8s/api/graph"
 	"github.com/pedapudi/stark8s/pkg/coordinator"
+	"github.com/pedapudi/stark8s/pkg/storage"
 )
 
 // Record is a consumed record with its source channel.
@@ -72,6 +73,12 @@ type wireRecord struct {
 
 // Handlers are the application callbacks. All are optional.
 type Handlers struct {
+	// Snapshot returns all application state needed to resume after the
+	// current input segment. Restore installs bytes from the last committed
+	// checkpoint before record processing starts. They must be supplied
+	// together.
+	Snapshot func(context.Context) ([]byte, error)
+	Restore  func(context.Context, []byte) error
 	// Source runs once for operations with no inbound channels. It should
 	// emit everything and return; the worker then reports source-done and
 	// idles.
@@ -128,7 +135,12 @@ const (
 	// few dozen live buffers stays well inside a normal container limit, and
 	// large enough that it never fires for records under ~8 KiB, which
 	// leaves the record threshold in charge of the common case.
-	flushBytes = 4 << 20
+	flushBytes                  = 4 << 20
+	defaultMaxRecordBytes       = 8 << 20
+	defaultMaxBufferedBytes     = 64 << 20
+	defaultMaxFetchedBytes      = 64 << 20
+	defaultMaxFetchedRecords    = 64 * flushRecords
+	defaultMaxSegmentStoreBytes = 1 << 30
 )
 
 // Worker is one pod of an operation.
@@ -152,8 +164,28 @@ type Worker struct {
 	SegmentListen string
 	// TickInterval is how often Handlers.Tick is called. Zero leaves the
 	// operation driven entirely by its records.
-	TickInterval time.Duration
-	runContext   context.Context
+	TickInterval         time.Duration
+	MaxRecordBytes       int64
+	MaxBufferedBytes     int64
+	MaxFetchedBytes      int64
+	MaxFetchedRecords    int
+	MaxSegmentStoreBytes int64
+	runContext           context.Context
+	// DurableSegments stores immutable JSON segments outside the producer
+	// pod. SegmentBaseURL is the HTTP location from which consumers read the
+	// same keys. SegmentPrefix scopes keys for this workload.
+	DurableSegments storage.Store
+	SegmentBaseURL  string
+	SegmentPrefix   string
+	// CheckpointStore enables atomic state, input-position, and output-manifest
+	// checkpoints. It is initially supported for fixed-ownership finite work.
+	CheckpointStore      storage.Store
+	CheckpointPrefix     string
+	CollectiveRank       int
+	CollectiveSize       int
+	CollectiveAttempt    string
+	CollectiveRendezvous string
+	CollectiveCheckpoint string
 
 	feedback    map[string]bool
 	feedbackOut map[string]bool
@@ -167,12 +199,13 @@ type Worker struct {
 	buffers map[bufKey][]wireRecord
 	// combineIndex maps a buffered record key to its slot in buffers, for
 	// channels that declare a Combine function.
-	combineIndex map[bufKey]map[string]int
-	bufBytes     map[bufKey]int
-	order        []bufKey
-	rr           map[string]uint64
-	unannounced  map[string][]coordinator.SegmentAnnouncement
-	overflowed   map[string]int64
+	combineIndex  map[bufKey]map[string]int
+	bufBytes      map[bufKey]int
+	bufferedBytes int64
+	order         []bufKey
+	rr            map[string]uint64
+	unannounced   map[string][]coordinator.SegmentAnnouncement
+	overflowed    map[string]int64
 
 	epoch    int32
 	maxEpoch int32
@@ -183,25 +216,65 @@ type Worker struct {
 	// task is the unit of work being processed; announced segments carry it.
 	task coordinator.TaskID
 
-	addr  string
-	store *segmentStore
+	addr                  string
+	store                 *segmentStore
+	segmentSeq            uint64
+	checkpoint            *checkpointSession
+	checkpointAfterCommit func() error
+	checkpointAfterAck    func() error
 }
 
 // FromEnv builds a Worker from the injected environment.
 func FromEnv() (*Worker, error) {
 	slots, _ := strconv.Atoi(os.Getenv(coordinator.EnvSlots))
+	rank, _ := strconv.Atoi(os.Getenv(coordinator.EnvCollectiveRank))
+	groupSize, _ := strconv.Atoi(os.Getenv(coordinator.EnvCollectiveSize))
 	w := &Worker{
-		Coordinator: os.Getenv(coordinator.EnvCoordinator),
-		Workload:    os.Getenv(coordinator.EnvWorkload),
-		Operation:   os.Getenv(coordinator.EnvOperation),
-		Instance:    os.Getenv(coordinator.EnvInstance),
-		PodIP:       os.Getenv(coordinator.EnvPodIP),
-		Slots:       int32(slots),
-		Inbound:     split(os.Getenv(coordinator.EnvInbound)),
-		Outbound:    split(os.Getenv(coordinator.EnvOutbound)),
-		SegmentDir:  os.Getenv(coordinator.EnvSegmentDir),
+		Coordinator:    os.Getenv(coordinator.EnvCoordinator),
+		Workload:       os.Getenv(coordinator.EnvWorkload),
+		Operation:      os.Getenv(coordinator.EnvOperation),
+		Instance:       os.Getenv(coordinator.EnvInstance),
+		PodIP:          os.Getenv(coordinator.EnvPodIP),
+		Slots:          int32(slots),
+		Inbound:        split(os.Getenv(coordinator.EnvInbound)),
+		Outbound:       split(os.Getenv(coordinator.EnvOutbound)),
+		SegmentDir:     os.Getenv(coordinator.EnvSegmentDir),
+		SegmentBaseURL: os.Getenv(coordinator.EnvObjectEndpoint),
+		SegmentPrefix:  os.Getenv(coordinator.EnvObjectPrefix),
+		CollectiveRank: rank, CollectiveSize: groupSize,
+		CollectiveAttempt: os.Getenv(coordinator.EnvCollectiveAttempt), CollectiveRendezvous: os.Getenv(coordinator.EnvCollectiveRendezvous),
+		CollectiveCheckpoint: os.Getenv(coordinator.EnvCollectiveCheckpoint),
+	}
+	if w.SegmentBaseURL != "" {
+		store, err := storage.NewS3(w.SegmentBaseURL, storage.S3Credentials{AccessKey: os.Getenv(coordinator.EnvObjectAccessKey), SecretKey: os.Getenv(coordinator.EnvObjectSecretKey), SessionToken: os.Getenv(coordinator.EnvObjectSessionToken), Region: os.Getenv(coordinator.EnvObjectRegion)}, nil)
+		if err != nil {
+			return nil, err
+		}
+		w.DurableSegments = store
+		if enabled, _ := strconv.ParseBool(os.Getenv(coordinator.EnvCheckpoint)); enabled {
+			w.CheckpointStore = store
+			w.CheckpointPrefix = w.SegmentPrefix
+		}
 	}
 	w.init()
+	var err error
+	if w.MaxRecordBytes, err = byteLimitFromEnv(coordinator.EnvMaxRecordBytes, w.MaxRecordBytes); err != nil {
+		return nil, err
+	}
+	if w.MaxBufferedBytes, err = byteLimitFromEnv(coordinator.EnvMaxBufferedBytes, w.MaxBufferedBytes); err != nil {
+		return nil, err
+	}
+	if w.MaxFetchedBytes, err = byteLimitFromEnv(coordinator.EnvMaxFetchedBytes, w.MaxFetchedBytes); err != nil {
+		return nil, err
+	}
+	if n, parseErr := byteLimitFromEnv(coordinator.EnvMaxFetchedRecords, int64(w.MaxFetchedRecords)); parseErr != nil {
+		return nil, parseErr
+	} else {
+		w.MaxFetchedRecords = int(n)
+	}
+	if w.MaxSegmentStoreBytes, err = byteLimitFromEnv(coordinator.EnvMaxSegmentStoreBytes, w.MaxSegmentStoreBytes); err != nil {
+		return nil, err
+	}
 	for _, f := range split(os.Getenv(coordinator.EnvFeedback)) {
 		w.feedback[f] = true
 	}
@@ -227,6 +300,22 @@ func FromEnv() (*Worker, error) {
 	return w, nil
 }
 
+// CollectiveIOEnabled reports whether this process may use graph input and
+// output. Fixed collectives assign graph I/O to rank zero.
+func (w *Worker) CollectiveIOEnabled() bool { return w.CollectiveSize == 0 || w.CollectiveRank == 0 }
+
+func byteLimitFromEnv(name string, fallback int64) (int64, error) {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s=%q: must be a positive integer", name, v)
+	}
+	return n, nil
+}
+
 // init fills defaults so a Worker built by hand (tests) works like one from
 // FromEnv.
 func (w *Worker) init() {
@@ -236,6 +325,21 @@ func (w *Worker) init() {
 			panic(fmt.Sprintf("generate worker incarnation: %v", err))
 		}
 		w.Incarnation = hex.EncodeToString(value[:])
+	}
+	if w.MaxRecordBytes <= 0 {
+		w.MaxRecordBytes = defaultMaxRecordBytes
+	}
+	if w.MaxBufferedBytes <= 0 {
+		w.MaxBufferedBytes = defaultMaxBufferedBytes
+	}
+	if w.MaxFetchedBytes <= 0 {
+		w.MaxFetchedBytes = defaultMaxFetchedBytes
+	}
+	if w.MaxFetchedRecords <= 0 {
+		w.MaxFetchedRecords = defaultMaxFetchedRecords
+	}
+	if w.MaxSegmentStoreBytes <= 0 {
+		w.MaxSegmentStoreBytes = defaultMaxSegmentStoreBytes
 	}
 	if w.feedback == nil {
 		w.feedback = map[string]bool{}
@@ -306,15 +410,19 @@ func (w *Worker) MaxEpochs() int32 { return w.maxEpoch }
 // segmentStore keeps this pod's segments as JSON files, one per segment, and
 // the blobs those segments refer to as files of their own.
 type segmentStore struct {
-	dir string
-	mu  sync.Mutex
-	seq uint64
+	dir       string
+	mu        sync.Mutex
+	seq       uint64
+	maxBytes  int64
+	usedBytes int64
 	// blobs maps a blob id to the segments that still reference it, and
 	// segBlobs is the reverse index. Both are producer-local; see blob.go for
 	// the lifetime rule they implement.
 	blobs    map[string]*blobRef
 	segBlobs map[string][]string
 }
+
+var errStorageCapacity = errors.New("segment store capacity exceeded")
 
 func openStore(dir, instance string) (*segmentStore, error) {
 	if err := os.MkdirAll(dir, 0o755); err == nil {
@@ -344,13 +452,24 @@ func (s *segmentStore) write(instance string, recs []wireRecord) (string, int64,
 	if err != nil {
 		return "", 0, err
 	}
+	s.mu.Lock()
+	if s.maxBytes > 0 && s.usedBytes+int64(len(body)) > s.maxBytes {
+		used := s.usedBytes
+		s.mu.Unlock()
+		return "", 0, fmt.Errorf("%w: writing %d bytes at %d of %d bytes", errStorageCapacity, len(body), used, s.maxBytes)
+	}
+	s.mu.Unlock()
 	tmp := s.path(id) + ".tmp"
 	if err := os.WriteFile(tmp, body, 0o644); err != nil {
 		return "", 0, err
 	}
 	if err := os.Rename(tmp, s.path(id)); err != nil {
+		_ = os.Remove(tmp)
 		return "", 0, err
 	}
+	s.mu.Lock()
+	s.usedBytes += int64(len(body))
+	s.mu.Unlock()
 	return id, int64(len(body)), nil
 }
 
@@ -373,7 +492,14 @@ func (s *segmentStore) serve(rw http.ResponseWriter, r *http.Request) {
 // remove deletes a released segment and, with it, the blobs no other segment
 // of this pod still refers to.
 func (s *segmentStore) remove(id string) {
-	_ = os.Remove(s.path(id))
+	path := s.path(id)
+	if info, err := os.Stat(path); err == nil {
+		if os.Remove(path) == nil {
+			s.mu.Lock()
+			s.usedBytes -= info.Size()
+			s.mu.Unlock()
+		}
+	}
 	s.releaseBlobs(id)
 }
 
@@ -389,7 +515,33 @@ func (s *segmentStore) remove(id string) {
 // loop's Overflow channel, or dropped and counted when none is declared.
 // Full buffers are flushed as segments; Flush sends the rest.
 func (w *Worker) Emit(channel, key string, value any) error {
+	if !w.CollectiveIOEnabled() {
+		return fmt.Errorf("collective rank %d cannot emit graph records; rank zero owns graph I/O", w.CollectiveRank)
+	}
 	return w.emit(channel, key, value, "")
+}
+
+// ValidateEmit checks an output without changing buffers or counters. It lets
+// adapters validate a complete callback reply before emitting any of it.
+func (w *Worker) ValidateEmit(channel, key string, value any) error {
+	w.init()
+	if _, err := w.spec(channel); err != nil {
+		return err
+	}
+	body, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if int64(len(key)+len(body)) > w.MaxRecordBytes {
+		return fmt.Errorf("channel %q record is %d bytes; limit is %d: use EmitBlob for large payloads", channel, len(key)+len(body), w.MaxRecordBytes)
+	}
+	if w.DurableSegments != nil {
+		var handle BlobHandle
+		if len(body) > 0 && body[0] == '{' && json.Unmarshal(body, &handle) == nil && handle.Blob != "" {
+			return errors.New("blob handles cannot be written to durable segments because their payload is pod-local")
+		}
+	}
+	return nil
 }
 
 // emit is Emit with the id of the blob the value refers to, empty for an
@@ -397,6 +549,9 @@ func (w *Worker) Emit(channel, key string, value any) error {
 // can bind the blob to the segment it lands in.
 func (w *Worker) emit(channel, key string, value any, blob string) error {
 	w.init()
+	if err := w.ValidateEmit(channel, key, value); err != nil {
+		return err
+	}
 	spec, err := w.spec(channel)
 	if err != nil {
 		return err
@@ -427,6 +582,13 @@ func (w *Worker) emit(channel, key string, value any, blob string) error {
 func (w *Worker) buffer(channel, key string, value json.RawMessage, epoch int32, blob string) error {
 	spec, err := w.spec(channel)
 	if err != nil {
+		return err
+	}
+	recordBytes := len(key) + len(value)
+	if int64(recordBytes) > w.MaxRecordBytes {
+		return fmt.Errorf("channel %q record is %d bytes; limit is %d: use EmitBlob for large payloads", channel, recordBytes, w.MaxRecordBytes)
+	}
+	if err := w.reserveBufferBytes(int64(recordBytes)); err != nil {
 		return err
 	}
 	var p int32
@@ -460,8 +622,30 @@ func (w *Worker) buffer(channel, key string, value json.RawMessage, epoch int32,
 	}
 	w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: value, Epoch: epoch, blob: blob})
 	w.bufBytes[k] += len(key) + len(value)
+	w.bufferedBytes += int64(recordBytes)
 	if len(w.buffers[k]) >= flushRecords || w.bufBytes[k] >= flushBytes {
 		return w.flushBuffer(k)
+	}
+	return nil
+}
+
+func (w *Worker) reserveBufferBytes(n int64) error {
+	for w.bufferedBytes+n > w.MaxBufferedBytes {
+		var oldest bufKey
+		found := false
+		for len(w.order) > 0 {
+			oldest, w.order = w.order[0], w.order[1:]
+			if len(w.buffers[oldest]) > 0 {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("record needs %d buffered bytes; aggregate limit is %d", n, w.MaxBufferedBytes)
+		}
+		if err := w.flushBuffer(oldest); err != nil {
+			return fmt.Errorf("freeing buffered output at %d of %d bytes: %w", w.bufferedBytes, w.MaxBufferedBytes, err)
+		}
 	}
 	return nil
 }
@@ -494,6 +678,7 @@ func (w *Worker) combine(k bufKey, mode graph.CombineMode, key string, value jso
 		b, _ := json.Marshal(1)
 		w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: b, Epoch: epoch})
 		w.bufBytes[k] += len(key) + len(b)
+		w.bufferedBytes += int64(len(key) + len(b))
 		return nil
 	}
 
@@ -506,6 +691,7 @@ func (w *Worker) combine(k bufKey, mode graph.CombineMode, key string, value jso
 		idx[key] = len(w.buffers[k])
 		w.buffers[k] = append(w.buffers[k], wireRecord{Key: key, Value: value, Epoch: epoch})
 		w.bufBytes[k] += len(key) + len(value)
+		w.bufferedBytes += int64(len(key) + len(value))
 		return nil
 	}
 	var held float64
@@ -537,6 +723,7 @@ func (w *Worker) setCombined(k bufKey, at int, v float64) error {
 		return err
 	}
 	w.bufBytes[k] += len(b) - len(w.buffers[k][at].Value)
+	w.bufferedBytes += int64(len(b) - len(w.buffers[k][at].Value))
 	w.buffers[k][at].Value = b
 	return nil
 }
@@ -592,6 +779,9 @@ func (w *Worker) flushBuffer(k bufKey) error {
 		}
 	}
 	if spec.To == "" {
+		if w.checkpoint != nil {
+			return errors.New("checkpointed output to an external channel requires a transactional or idempotent sink")
+		}
 		body, _ := json.Marshal(recs)
 		if err := w.do("POST", coordinator.PathChannels+"/"+k.channel+coordinator.SuffixRecords, body, nil); err != nil {
 			return err
@@ -601,28 +791,51 @@ func (w *Worker) flushBuffer(k bufKey) error {
 		// live until the pod does, which is what an external reader of a
 		// retained record log needs.
 		delete(w.buffers, k)
+		w.bufferedBytes -= int64(w.bufBytes[k])
 		delete(w.combineIndex, k)
 		delete(w.bufBytes, k)
 		return nil
 	}
-	if w.store == nil {
+	if w.DurableSegments == nil && w.store == nil {
 		if err := w.serveSegments(); err != nil {
 			return err
 		}
 	}
-	id, size, err := w.store.write(w.Instance, recs)
-	if err != nil {
-		return err
+	var id string
+	var size int64
+	var holder string
+	if w.DurableSegments != nil {
+		w.segmentSeq++
+		id = fmt.Sprintf("%s-%d-%d", w.Instance, time.Now().UnixNano(), w.segmentSeq)
+		body, marshalErr := json.Marshal(recs)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		if err := storage.PutImmutable(context.Background(), w.DurableSegments, w.segmentKey(id), body); err != nil {
+			return err
+		}
+		size, holder = int64(len(body)), strings.TrimRight(w.SegmentBaseURL, "/")
+		if holder == "" {
+			return errors.New("SegmentBaseURL is required with DurableSegments")
+		}
+	} else {
+		var err error
+		id, size, err = w.store.write(w.Instance, recs)
+		if err != nil {
+			return err
+		}
+		holder = w.addr
 	}
 	// Bind before announcing: from the moment a consumer can learn of the
 	// segment, releasing it must also release its blobs.
 	w.store.bind(id, blobs)
 	delete(w.buffers, k)
+	w.bufferedBytes -= int64(w.bufBytes[k])
 	delete(w.combineIndex, k)
 	delete(w.bufBytes, k)
 	w.unannounced[k.channel] = append(w.unannounced[k.channel], coordinator.SegmentAnnouncement{
 		ID: id, Channel: k.channel, Partition: k.partition, Epoch: k.epoch,
-		Records: int64(len(recs)), Bytes: size, Holder: w.addr, Producer: w.Instance, Task: w.task,
+		Records: int64(len(recs)), Bytes: size, Holder: holder, Producer: w.Instance, Durable: w.DurableSegments != nil, Task: w.task,
 	})
 	return nil
 }
@@ -631,6 +844,16 @@ func (w *Worker) flushBuffer(k bufKey) error {
 // announced, together with the count of records dropped at a loop bound.
 // It is safe to retry: a failed announcement stays queued.
 func (w *Worker) Flush() error {
+	if err := w.materialize(); err != nil {
+		return err
+	}
+	if w.checkpoint != nil {
+		return nil
+	}
+	return w.publish()
+}
+
+func (w *Worker) materialize() error {
 	w.init()
 	var keys []bufKey
 	for _, k := range w.order {
@@ -651,6 +874,10 @@ func (w *Worker) Flush() error {
 			w.overflowed[ch] = 0
 		}
 	}
+	return nil
+}
+
+func (w *Worker) publish() error {
 	for ch, anns := range w.unannounced {
 		body, _ := json.Marshal(anns)
 		if err := w.do("POST", fmt.Sprintf("%s/%s%s?pod=%s", coordinator.PathChannels, ch, coordinator.SuffixSegments, w.Instance), body, nil); err != nil {
@@ -726,7 +953,23 @@ func (w *Worker) nack(ch string, deliveries []coordinator.SegmentAck) error {
 
 // fetch reads a segment from its holder.
 func (w *Worker) fetch(ctx context.Context, ref coordinator.SegmentRef) ([]wireRecord, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+ref.Holder+"/segments/"+ref.ID, nil)
+	if ref.Bytes > w.MaxFetchedBytes {
+		return nil, fmt.Errorf("fetch segment %s: declared size %d exceeds fetched-byte limit %d", ref.ID, ref.Bytes, w.MaxFetchedBytes)
+	}
+	if ref.Records > int64(w.MaxFetchedRecords) {
+		return nil, fmt.Errorf("fetch segment %s: declared records %d exceeds fetched-record limit %d", ref.ID, ref.Records, w.MaxFetchedRecords)
+	}
+	if w.DurableSegments != nil {
+		return w.fetchDurable(ctx, ref)
+	}
+	holder := strings.TrimRight(ref.Holder, "/")
+	var segmentURL string
+	if strings.HasPrefix(holder, "http://") || strings.HasPrefix(holder, "https://") {
+		segmentURL = holder + "/" + w.segmentKey(ref.ID)
+	} else {
+		segmentURL = "http://" + holder + "/segments/" + ref.ID
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, segmentURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -738,16 +981,68 @@ func (w *Worker) fetch(ctx context.Context, ref coordinator.SegmentRef) ([]wireR
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("fetch %s from %s: %s", ref.ID, ref.Holder, resp.Status)
 	}
-	var recs []wireRecord
-	if err := json.NewDecoder(resp.Body).Decode(&recs); err != nil {
+	limited := &io.LimitedReader{R: resp.Body, N: w.MaxFetchedBytes + 1}
+	recs, err := decodeSegment(limited, ref.ID, w.MaxFetchedRecords)
+	if err != nil {
+		if limited.N <= 0 {
+			return nil, fmt.Errorf("fetch segment %s: encoded body exceeds fetched-byte limit %d", ref.ID, w.MaxFetchedBytes)
+		}
 		return nil, err
+	}
+	if limited.N <= 0 {
+		return nil, fmt.Errorf("fetch segment %s: encoded body exceeds fetched-byte limit %d", ref.ID, w.MaxFetchedBytes)
 	}
 	return recs, nil
 }
 
+func (w *Worker) fetchDurable(ctx context.Context, ref coordinator.SegmentRef) ([]wireRecord, error) {
+	getter, ok := w.DurableSegments.(storage.BoundedGetter)
+	if !ok {
+		return nil, fmt.Errorf("fetch segment %s: durable store does not support bounded reads", ref.ID)
+	}
+	object, err := getter.GetBounded(ctx, w.segmentKey(ref.ID), w.MaxFetchedBytes)
+	if err != nil {
+		return nil, fmt.Errorf("fetch %s from durable storage: %w", ref.ID, err)
+	}
+	return decodeSegment(bytes.NewReader(object.Bytes), ref.ID, w.MaxFetchedRecords)
+}
+
+func decodeSegment(r io.Reader, id string, maxRecords int) ([]wireRecord, error) {
+	decoder := json.NewDecoder(r)
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '[' {
+		return nil, fmt.Errorf("fetch segment %s: body must be a JSON array", id)
+	}
+	records := make([]wireRecord, 0, min(maxRecords, 256))
+	for decoder.More() {
+		if len(records) >= maxRecords {
+			return nil, fmt.Errorf("fetch segment %s: decoded records exceed limit %d", id, maxRecords)
+		}
+		var record wireRecord
+		if err := decoder.Decode(&record); err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("fetch segment %s: response contains more than one JSON value", id)
+		}
+		return nil, fmt.Errorf("fetch segment %s: trailing response data: %w", id, err)
+	}
+	return records, nil
+}
+
 // releaseSegments deletes the local segments the coordinator has released.
 func (w *Worker) releaseSegments() {
-	if w.store == nil {
+	if w.store == nil && w.DurableSegments == nil {
 		return
 	}
 	var ids []string
@@ -756,8 +1051,22 @@ func (w *Worker) releaseSegments() {
 		return
 	}
 	for _, id := range ids {
-		w.store.remove(id)
+		if w.DurableSegments != nil {
+			if err := w.DurableSegments.Delete(context.Background(), w.segmentKey(id)); err != nil {
+				log.Printf("delete released segment %s: %v", id, err)
+			}
+		} else {
+			w.store.remove(id)
+		}
 	}
+}
+
+func (w *Worker) segmentKey(id string) string {
+	prefix := strings.Trim(w.SegmentPrefix, "/")
+	if prefix == "" {
+		return "segments/" + id
+	}
+	return prefix + "/segments/" + id
 }
 
 // serveSegments opens the local store and starts the segment server.
@@ -769,6 +1078,7 @@ func (w *Worker) serveSegments() error {
 	if err != nil {
 		return err
 	}
+	store.maxBytes = w.MaxSegmentStoreBytes
 	ln, err := net.Listen("tcp", w.SegmentListen)
 	if err != nil {
 		return fmt.Errorf("segment server: %w", err)
@@ -836,6 +1146,15 @@ const (
 func (w *Worker) Run(ctx context.Context, h Handlers) error {
 	w.init()
 	w.runContext = ctx
+	if w.CheckpointStore != nil && h.Tick != nil {
+		return errors.New("checkpointed operations cannot use Tick because tick state and output are outside an input checkpoint boundary")
+	}
+	if !w.CollectiveIOEnabled() {
+		if h.Source == nil {
+			return fmt.Errorf("collective rank %d requires a Source handler", w.CollectiveRank)
+		}
+		return h.Source(ctx, w)
+	}
 	// A handler combination that can never fire is a programming mistake, so
 	// it is caught here, before the worker touches the network. Tick is
 	// driven by the loop that polls inbound channels, and an operation with
@@ -852,6 +1171,29 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 	if err := w.retry(ctx, w.register); err != nil {
 		return err
 	}
+	if err := w.startCheckpoint(ctx, h); err != nil {
+		return err
+	}
+	if w.checkpoint != nil && w.checkpoint.current.Complete {
+		if err := w.retry(ctx, w.reportDone); err != nil {
+			return err
+		}
+		if w.CollectiveSize > 0 {
+			return nil
+		}
+		return w.idle(ctx)
+	}
+	if w.checkpoint != nil && w.checkpoint.current.EpochCallbackComplete {
+		for ch := range w.feedback {
+			ch := ch
+			if err := w.retry(ctx, func() error {
+				return w.do("POST", fmt.Sprintf("%s/%s%s?pod=%s&epoch=%d", coordinator.PathChannels, ch, coordinator.SuffixEpochDone, w.Instance, w.epoch), nil, nil)
+			}); err != nil {
+				return err
+			}
+		}
+		w.lastDone = w.epoch
+	}
 	go w.heartbeat(ctx)
 
 	if len(w.Inbound) == 0 {
@@ -862,9 +1204,15 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 		if err := h.Source(ctx, w); err != nil {
 			return err
 		}
-		if err := w.retry(ctx, w.Flush); err != nil && !errors.Is(err, errSealed) {
-			return err
-		} else if err != nil {
+		var flushErr error
+		if w.checkpoint != nil {
+			flushErr = w.commitCheckpoint(ctx, h, "", nil, true, false)
+		} else {
+			flushErr = w.retry(ctx, w.Flush)
+		}
+		if flushErr != nil && !errors.Is(flushErr, errSealed) {
+			return flushErr
+		} else if flushErr != nil {
 			log.Printf("%s: output channel already sealed; source output was produced by an earlier pod", w.Instance)
 			w.buffers = map[bufKey][]wireRecord{}
 			w.bufBytes = map[bufKey]int{}
@@ -873,6 +1221,9 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			return err
 		}
 		log.Printf("%s: source complete", w.Instance)
+		if w.CollectiveSize > 0 {
+			return nil
+		}
 		return w.idle(ctx)
 	}
 
@@ -914,13 +1265,21 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 			}
 			for _, work := range resp.Work {
 				for _, seg := range work.Segments {
+					if w.checkpoint != nil && w.checkpoint.covers(ch, seg) {
+						acks := []coordinator.SegmentAck{{ID: seg.ID, AppendID: seg.AppendID, Holder: seg.Holder, Pod: w.Instance}}
+						if err := w.retry(ctx, func() error { return w.ack(ch, acks) }); err != nil {
+							return err
+						}
+						progressed = true
+						continue
+					}
 					recs, err := w.fetchRetry(ctx, seg)
 					if err != nil {
 						if ctx.Err() != nil {
 							return ctx.Err()
 						}
 						failure := fmt.Sprintf("fetch segment %s from %s: %v", seg.ID, seg.Holder, err)
-						delivery := []coordinator.SegmentAck{{ID: seg.ID, Holder: seg.Holder, Pod: w.Instance, Failure: failure, RetryAfterMillis: 500}}
+						delivery := []coordinator.SegmentAck{{ID: seg.ID, AppendID: seg.AppendID, Holder: seg.Holder, Pod: w.Instance, Failure: failure, RetryAfterMillis: 500}}
 						if nackErr := w.nack(ch, delivery); nackErr != nil {
 							return fmt.Errorf("%s; return delivery: %w", failure, nackErr)
 						}
@@ -941,10 +1300,16 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 							}
 						}
 					}
+					acks := []coordinator.SegmentAck{{ID: seg.ID, AppendID: seg.AppendID, Holder: seg.Holder, Pod: w.Instance}}
+					if w.checkpoint != nil {
+						if err := w.commitCheckpoint(ctx, h, ch, acks, false, false); err != nil {
+							return err
+						}
+						continue
+					}
 					if err := w.retry(ctx, w.Flush); err != nil {
 						return err
 					}
-					acks := []coordinator.SegmentAck{{ID: seg.ID, Holder: seg.Holder, Pod: w.Instance}}
 					if err := w.retry(ctx, func() error { return w.ack(ch, acks) }); err != nil {
 						return err
 					}
@@ -992,13 +1357,20 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 					return err
 				}
 			}
-			if err := w.retry(ctx, w.Flush); err != nil {
+			if w.checkpoint != nil {
+				if err := w.commitCheckpoint(ctx, h, "", nil, true, false); err != nil {
+					return err
+				}
+			} else if err := w.retry(ctx, w.Flush); err != nil {
 				return err
 			}
 			if err := w.retry(ctx, w.reportDone); err != nil {
 				return err
 			}
 			log.Printf("%s: drained", w.Instance)
+			if w.CollectiveSize > 0 {
+				return nil
+			}
 			return w.idle(ctx)
 		}
 		if w.syncLoop && allQuiet && w.lastDone < w.epoch {
@@ -1007,7 +1379,11 @@ func (w *Worker) Run(ctx context.Context, h Handlers) error {
 					return err
 				}
 			}
-			if err := w.retry(ctx, w.Flush); err != nil {
+			if w.checkpoint != nil {
+				if err := w.commitCheckpoint(ctx, h, "", nil, false, true); err != nil {
+					return err
+				}
+			} else if err := w.retry(ctx, w.Flush); err != nil {
 				return err
 			}
 			if err := w.retry(ctx, func() error {
@@ -1111,6 +1487,9 @@ func (w *Worker) retry(ctx context.Context, f func() error) error {
 	for i := 0; i < 30 && ctx.Err() == nil; i++ {
 		if err = f(); err == nil {
 			return nil
+		}
+		if errors.Is(err, errStorageCapacity) {
+			return err
 		}
 		if errors.Is(err, errSealed) {
 			return err

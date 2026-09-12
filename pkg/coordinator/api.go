@@ -70,7 +70,10 @@ const (
 	// log (filtered by key when given), long-polling up to `wait` for new
 	// records; the response header RecordsNextHeader carries the offset to
 	// pass as `after` on the next call.
-	SuffixRecords = "/records" // POST []Record (external producer); GET ?key=&after=&wait= (external consumer)
+	SuffixRecords       = "/records" // POST []Record (external producer); GET ?key=&after=&wait= (external consumer)
+	SuffixAppends       = "/appends" // POST AppendBatch -> PartitionPosition
+	SuffixSubscriptions = "/subscriptions"
+	SuffixRetention     = "/retention"
 	// PathOperations carries the replica count the controller wants for each
 	// operation. A Broadcast channel is finished with only once every replica
 	// of its consumer has acknowledged it, and the coordinator cannot count
@@ -123,6 +126,7 @@ type TaskID struct {
 type SegmentAnnouncement struct {
 	// ID is unique per holder pod; the coordinator qualifies it with Addr.
 	ID        string `json:"id"`
+	AppendID  string `json:"appendId,omitempty"`
 	Channel   string `json:"channel"`
 	Partition int32  `json:"partition"`
 	Epoch     int32  `json:"epoch"`
@@ -130,7 +134,9 @@ type SegmentAnnouncement struct {
 	Bytes     int64  `json:"bytes"`
 	Holder    string `json:"holder"` // host:port of the segment server
 	Producer  string `json:"producer"`
-	Task      TaskID `json:"task"`
+	// Durable reports that the segment bytes live independently of Producer.
+	Durable bool   `json:"durable,omitempty"`
+	Task    TaskID `json:"task"`
 	// Overflowed counts records the producer dropped at the loop bound of
 	// an Asynchronous feedback channel (no Overflow channel declared). An
 	// announcement with an empty ID and Overflowed > 0 reports drops only.
@@ -139,10 +145,39 @@ type SegmentAnnouncement struct {
 
 // SegmentRef is a segment a consumer should fetch.
 type SegmentRef struct {
-	ID      string `json:"id"`
-	Holder  string `json:"holder"`
-	Records int64  `json:"records"`
-	Epoch   int32  `json:"epoch"`
+	ID       string `json:"id"`
+	AppendID string `json:"appendId,omitempty"`
+	Holder   string `json:"holder"`
+	Records  int64  `json:"records"`
+	Bytes    int64  `json:"bytes"`
+	Epoch    int32  `json:"epoch"`
+	Offset   int64  `json:"offset,omitempty"`
+}
+
+// AppendBatch stores one idempotent batch from a coordinator writer.
+type AppendBatch struct {
+	AppendID  string   `json:"appendId"`
+	Partition int32    `json:"partition"`
+	Records   []Record `json:"records"`
+}
+
+// SubscriptionSpec binds a durable position to an operation. Operation is
+// empty for an external reader.
+type SubscriptionSpec struct {
+	Operation string `json:"operation,omitempty"`
+}
+
+// PartitionPosition is an absolute retained-history offset.
+type PartitionPosition struct {
+	Partition int32 `json:"partition"`
+	Offset    int64 `json:"offset"`
+}
+
+// SubscriptionAck commits one delivered append for a named subscription.
+type SubscriptionAck struct {
+	Partition int32  `json:"partition"`
+	Offset    int64  `json:"offset"`
+	AppendID  string `json:"appendId"`
 }
 
 // PartitionWork is the pending work for one partition owned by the caller.
@@ -174,9 +209,10 @@ type ConsumeResponse struct {
 
 // SegmentAck marks a fetched segment as processed by the calling pod.
 type SegmentAck struct {
-	ID     string `json:"id"`
-	Holder string `json:"holder"`
-	Pod    string `json:"pod"`
+	ID       string `json:"id"`
+	AppendID string `json:"appendId,omitempty"`
+	Holder   string `json:"holder"`
+	Pod      string `json:"pod"`
 	// Failure describes why an unfinished delivery was returned. Ack ignores
 	// it; Nack records it for operator diagnostics.
 	Failure string `json:"failure,omitempty"`
@@ -187,18 +223,18 @@ type SegmentAck struct {
 
 // ChannelMetrics reports one channel.
 type ChannelMetrics struct {
-	Name             string `json:"name"`
-	From             string `json:"from"`
-	To               string `json:"to"`
-	Sealed           bool   `json:"sealed"`
-	Pending          int64  `json:"pending"`  // records in unconsumed segments
-	InFlight         int64  `json:"inFlight"` // records in fetched, unacknowledged segments
-	Produced         int64  `json:"produced"`
-	Epoch            int32  `json:"epoch"`
-	Overflowed       int64  `json:"overflowed"`
+	Name       string `json:"name"`
+	From       string `json:"from"`
+	To         string `json:"to"`
+	Sealed     bool   `json:"sealed"`
+	Pending    int64  `json:"pending"`  // records in unconsumed segments
+	InFlight   int64  `json:"inFlight"` // records in fetched, unacknowledged segments
+	Produced   int64  `json:"produced"`
+	Epoch      int32  `json:"epoch"`
+	Overflowed int64  `json:"overflowed"`
 	// Lost counts records whose segment holder expired before consumption.
-	Lost             int64  `json:"lost"`
-	ProductionClosed bool   `json:"productionClosed"`
+	Lost             int64 `json:"lost"`
+	ProductionClosed bool  `json:"productionClosed"`
 	// Acknowledged counts records accepted from individual consumers. A
 	// Broadcast record contributes once for each intended replica.
 	Acknowledged          int64  `json:"acknowledged"`
@@ -233,6 +269,7 @@ type Metrics struct {
 // Environment variables injected into operation pods.
 const (
 	EnvCoordinator = "STARK8S_COORDINATOR" // http://<workload>-coordinator:8080
+	EnvSegmentAddr = "STARK8S_SEGMENT_ADDR"
 	EnvWorkload    = "STARK8S_WORKLOAD"
 	EnvOperation   = "STARK8S_OPERATION"
 	EnvInstance    = "STARK8S_INSTANCE" // pod name
@@ -245,5 +282,22 @@ const (
 	EnvSegmentDir  = "STARK8S_SEGMENT_DIR"  // local segment store; default /var/lib/stark8s/segments
 	// EnvTickInterval is a Go duration such as "30s". Absent or empty leaves
 	// the operation driven only by its records.
-	EnvTickInterval = "STARK8S_TICK_INTERVAL"
+	EnvTickInterval         = "STARK8S_TICK_INTERVAL"
+	EnvCheckpoint           = "STARK8S_CHECKPOINT" // true enables operation checkpoints
+	EnvCollectiveRank       = "STARK8S_COLLECTIVE_RANK"
+	EnvCollectiveSize       = "STARK8S_COLLECTIVE_SIZE"
+	EnvCollectiveAttempt    = "STARK8S_COLLECTIVE_ATTEMPT"
+	EnvCollectiveRendezvous = "STARK8S_COLLECTIVE_RENDEZVOUS"
+	EnvCollectiveCheckpoint = "STARK8S_COLLECTIVE_CHECKPOINT"
+	EnvObjectEndpoint       = "STARK8S_OBJECT_STORE_ENDPOINT"
+	EnvObjectRegion         = "STARK8S_OBJECT_STORE_REGION"
+	EnvObjectAccessKey      = "STARK8S_OBJECT_STORE_ACCESS_KEY"
+	EnvObjectSecretKey      = "STARK8S_OBJECT_STORE_SECRET_KEY"
+	EnvObjectSessionToken   = "STARK8S_OBJECT_STORE_SESSION_TOKEN"
+	EnvObjectPrefix         = "STARK8S_OBJECT_STORE_PREFIX"
+	EnvMaxRecordBytes       = "STARK8S_MAX_RECORD_BYTES"
+	EnvMaxBufferedBytes     = "STARK8S_MAX_BUFFERED_BYTES"
+	EnvMaxFetchedBytes      = "STARK8S_MAX_FETCHED_BYTES"
+	EnvMaxFetchedRecords    = "STARK8S_MAX_FETCHED_RECORDS"
+	EnvMaxSegmentStoreBytes = "STARK8S_MAX_SEGMENT_STORE_BYTES"
 )

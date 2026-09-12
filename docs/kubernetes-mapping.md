@@ -27,10 +27,10 @@ which serves them on the same segment API.
 | the workload as a whole | one Deployment (one replica, Recreate strategy) running the coordinator, plus a Service exposing the control port (8080) and the segment port (8090) | `<workload>-coordinator` |
 | each operation | Deployment | `<workload>-<operation>` |
 | each operation | ServiceAccount, set as the pod's `serviceAccountName` | `<workload>-<operation>` |
-| `scaling.vertical.mode: Initial` on a `Never` operation | VerticalPodAutoscaler, only when the `autoscaling.k8s.io` API is installed | `<workload>-<operation>` |
+| `scaling.horizontal.cpuUtilizationPercent` on a `Never` operation | HorizontalPodAutoscaler (autoscaling/v2) targeting the Deployment | `<workload>-<operation>` |
+| `scaling.vertical` on a `Never` operation | VerticalPodAutoscaler, only when the `autoscaling.k8s.io` API is installed | `<workload>-<operation>` |
 | each channel with both a producer and a consumer | NetworkPolicy | `<workload>-edge-<channel>` |
 | operation pods as a group | NetworkPolicy | `<workload>-operations` |
-| each operation that declares `egress` | NetworkPolicy | `<workload>-egress-<operation>` |
 | the coordinator | NetworkPolicy | `<workload>-coordinator` |
 
 Every resource carries an owner reference to the Workload, so deleting the
@@ -99,7 +99,7 @@ bound is reached. Channels with no producer are sealed by an external
 
 The controller injects the following into every pod of an operation.
 
-Environment variables, prepended to the worker container's `env`:
+Environment variables, prepended to every container's `env`:
 
 | variable | value |
 |---|---|
@@ -118,48 +118,11 @@ Environment variables, prepended to the worker container's `env`:
 Pod spec additions:
 
 - an `emptyDir` volume named `stark8s-segments`, mounted at
-  `/var/lib/stark8s/segments` in the worker container;
-- a `containerPort` of 8090 named `segments` on the worker container;
+  `/var/lib/stark8s/segments` in every container;
+- a `containerPort` of 8090 named `segments` on the first container;
 - `serviceAccountName` set to `<workload>-<operation>`;
 - the three `stark8s.io/*` labels.
 
-The worker container is a restartable init container named
-`stark8s-runtime` when the template contains one. The controller adds an
-HTTP startup probe for `/healthz` on port 8081 when that runtime has no
-startup probe. Without the named runtime, the first regular container is the
-worker. The controller leaves every other container unchanged.
-
-## Local dependencies start before the application
-
-A local dependency can run as a native sidecar in
-`template.spec.initContainers`. Set its container-level `restartPolicy` to
-`Always` and give it a `startupProbe` for the service the application uses:
-
-```yaml
-template:
-  spec:
-    initContainers:
-      - name: model-server
-        image: example/model-server:1
-        restartPolicy: Always
-        startupProbe:
-          tcpSocket:
-            port: 9000
-          periodSeconds: 2
-          failureThreshold: 60
-    containers:
-      - name: application
-        image: example/worker:1
-```
-
-Kubernetes starts the application only after the sidecar startup probe
-succeeds. The probe must test the dependency directly; probing the application
-would create a circular wait because the application has not started yet.
-A wrong port leaves the Pod in its initialization state, and the failed
-startup probe appears in the Pod status and events.
-[Sidecar containers](https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/)
-are stable in Kubernetes 1.33 and enabled by default from Kubernetes 1.29.
-Clusters older than 1.29 require the `SidecarContainers` feature gate.
 The worker library reads the environment and needs no further
 configuration. It generates a process incarnation at startup, includes it in
 registration, and sends it in the `X-Stark8s-Incarnation` header. A replacement
@@ -173,131 +136,66 @@ On every reconcile pass the controller sends the complete channel list to
 the coordinator (`PUT /topology`). Existing channels keep their state; new
 channels are created. This is what makes the graph editable while running.
 
-The same pass sends the replica count for each operation (`PUT /operations`).
-The coordinator uses this count to retain Broadcast segments until every
-intended replica has acknowledged them, including replicas that have not
-registered yet. A consumer gated behind a Materialized channel therefore has
-its segments retained while it waits for its Deployment to start.
+The same pass sends the replica count it is scaling each operation to
+(`PUT /operations`). The coordinator needs it for Broadcast channels: every
+replica of the consumer receives every record, and the coordinator sees only
+the pods that have registered, so it cannot otherwise tell a segment every
+replica has read from one that only the replicas started so far have read. An
+operation still gated behind a Materialized channel has no Deployment and is
+sent as zero, which holds its producers' segments rather than freeing them.
 
-## Sizing the segment volume
+## Retained channels support independent subscriptions
 
-An operation's pods keep the records they produce on local disk, so the
-segment volume has to be large enough to hold them. The size is **per pod**,
-not per operation: every replica gets a volume this large and requests this
-much disk, so an operation producing a total across N replicas needs about
-total/N, and the cluster is asked for the size times the replica count.
+A retained channel stores accepted appends in one committed order per fixed
+partition. Each writer supplies an append identifier. Retrying an accepted
+append with the same identifier returns its original offset; changing the
+records for that identifier returns a conflict.
 
-How much has to fit depends on the outbound channels.
+A named subscription stores one absolute offset per partition. Multiple pods
+of the subscription's operation share those offsets and divide the partitions.
+An external reader can use a subscription with no operation. Acknowledging an
+append advances only that subscription, so a completed reader cannot remove
+history that another reader has not consumed.
 
-On an **Ephemeral** channel a segment is deleted once every consumer has
-acknowledged it, so what has to fit is the peak unacknowledged output. On a
-Materialized channel that is the replica's whole output, since the consumer
-is not started until the channel seals, and the hold-until-consumed rule
-above keeps a completed operation's pods, and their segments, in place until
-the consumer has read them. The replica count stays fixed while the operation
-runs because an empty input queue does not prove that a pod holds no state.
+Replay moves a subscription to a retained absolute offset when it has no
+delivery in flight. The coordinator returns an unavailable-position error if
+explicit retention deletion has removed that offset. Persistent history is
+deleted only through the channel retention endpoint; ordinary acknowledgement
+and operation completion do not delete it.
 
-On a **Retained** channel with a consumer nothing is ever deleted.
-`Released` skips retained channels, so the coordinator never tells the
-producer it may drop a segment, and the volume has to hold everything the
-replica produces for as long as its pod runs. Such a producer must reserve
-room for all of its output.
-
-A channel with **no consumer** never reaches this volume at all. The
-coordinator forces `To: ""` channels to Retained, and the worker posts their
-records to the coordinator rather than writing a segment, so `segments.size`
-does nothing for an operation whose only output is a terminal channel — the
-records accumulate in the coordinator's memory instead.
-
-Sizing the volume is a scheduling statement, not a durability one. Segments
-live and die with the pod. A completed producer of retained internal segments
-therefore remains running. It can release those pods only after retained
-segments have durable backing storage.
-
-`spec.operations[].segments.size` declares how much room that needs:
-
-```yaml
-- name: map
-  slots: 4
-  segments:
-    size: 50Gi
-  template: {spec: {containers: [{name: main, image: stark8s:dev}]}}
-```
-
-The controller then sets, on that operation's pods:
-
-- `sizeLimit` on the `stark8s-segments` volume;
-- an `ephemeral-storage` **request** on the first container, raised to the
-  declared size if the template asks for less or asks for nothing. A larger
-  request already in the template is left alone. A template naming only a
-  limit counts as already asking for it, since Kubernetes defaults an absent
-  request to the container's limit.
-
-The request is what the scheduler reads when it chooses a node, so without
-it the pods are placed as though they need no disk, and the node-pressure
-eviction ranking — which sorts by usage over request — puts a pod holding
-tens of gigabytes against a request of zero near the front of the queue.
-
-No limit is set, deliberately. The volume's `sizeLimit` already caps the
-segments, and a pod's ephemeral-storage limit is charged that volume
-together with every container's writable layer and log output, so a limit
-equal to the declared size would evict the pod before the volume could
-reach it. A template that names its own limit keeps it; a pod budget that
-does not exceed `segments.size` is rejected rather than silently raised,
-since raising it could produce a pod a `LimitRange` then refuses.
-
-A request with no limit is, however, exactly the shape a `LimitRange`
-rewrites. One carrying `default` or `max` for `ephemeral-storage` injects a
-limit onto a container that has none, and if that limit lands below the
-injected request the kubelet's admission refuses every pod — while the
-Deployment itself is admitted, so the operation reports running with no pods.
-The controller cannot see a `LimitRange`, so on a namespace that has one,
-name a limit above `segments.size` in the template.
-
-The request goes on the **first container** only, matching where the segment
-port is injected. The scheduler reads the sum, so which container carries it
-does not affect placement — but Kubernetes refuses a container whose request
-exceeds its own limit, so that container's limit has to be able to carry the
-whole size, and validation checks it separately from the pod total.
-
-That pod total follows the kubelet's arithmetic: containers that run at the
-same time add up, and a container naming no limit contributes nothing rather
-than leaving the budget unbounded, so a single sidecar with a small
-`ephemeral-storage` limit caps the whole pod. Init containers marked
-restartable are sidecars and add; a plain init container has finished before
-the others start, so it counts as a floor rather than a summand.
-
-With `segments` unset the volume is a bare `emptyDir` and nothing requests
-ephemeral storage, which leaves the capacity to whatever the cluster's
-defaults allow — on a cluster that defaults ephemeral storage, a cap the
-workload never chose; on one that does not, no cap but no scheduling
-account of it either. A producer that outgrows the space it was given is
-evicted, and its unacknowledged segments are counted lost (see
-[Status](#status)); the producing task is not re-executed.
-
-A pod template may instead declare its own volume named `stark8s-segments`
-— with a different `sizeLimit`, `medium: Memory`, or a PersistentVolumeClaim
-— and the controller will mount that rather than creating one. Setting both
-that and `segments.size` is rejected, since only one of them would apply.
-Note that this route sizes the volume without requesting anything: the
-controller only touches `ephemeral-storage` under `segments.size`, so a pod
-template declaring its own segment volume is still scheduled as though it
-needed no disk, and should carry its own request.
 ## Scaling
 
-**Fixed membership during an attempt.** The controller creates each operation
-at `scaling.horizontal.max` replicas before it can receive work. The count
-stays fixed until a completed operation no longer holds unconsumed output.
-The controller then scales the operation to zero. This rule preserves local
-application state and output when the pending input count falls.
+**Horizontal, from runnable tasks.** On each pass (every three seconds while
+the workload runs) the controller reads `GET /metrics` from the coordinator.
+For each operation it computes
 
-`cpuUtilizationPercent` is retained for API compatibility, but the controller
-does not create a HorizontalPodAutoscaler. It removes an existing autoscaler
-for the operation and explains the disabled setting in workload status.
+    replicas = clamp(ceil(RunnableTasks / slots), min, max)
 
-`scaling.vertical.mode: Initial` remains supported for `Never` operations
-when the VerticalPodAutoscaler API is installed. The `Auto` mode is disabled
-and any existing object is removed because automatic updates evict pods.
+where `RunnableTasks` is the coordinator's count of the operation's
+partitions with pending input, `slots` is `spec.operations[].slots`, and
+`min` and `max` are `scaling.horizontal.min` and `scaling.horizontal.max`.
+When the coordinator has not yet reported the operation or reports zero
+runnable tasks, the count is `min`, raised to one for operations that must
+be present to make progress on their own: sources (no inbound channels) and
+consumers of at least one Pipelined channel. A consumer whose inbound
+channels are all Materialized may sit at zero replicas until work is
+pending.
+
+The same formula chooses the initial replica count when a gated operation
+is first created, so a stage consuming a sealed shuffle starts with
+parallelism proportional to the number of partitions that received records.
+
+**Horizontal, from CPU.** For `Never` operations with
+`cpuUtilizationPercent` set, the controller creates a
+HorizontalPodAutoscaler bounded by `min` (at least one) and `max` and leaves
+the replica count to it after the Deployment exists.
+
+**Vertical.** When `scaling.vertical.mode` is `Initial` or `Auto`, the
+operation's completion is `Never`, and the VerticalPodAutoscaler API is
+present, the controller creates a VerticalPodAutoscaler with that update
+mode targeting the operation's Deployment. `Drain` operations receive none,
+because the VPA updater evicts pods and the segments held by an evicted pod
+would be lost.
 
 **Partition count as an upper bound.** A hash-partitioned channel with
 `partitions: N` can usefully feed at most `ceil(N / slots)` consumer
@@ -306,10 +204,9 @@ consumer should be at most that value.
 
 ## Networking
 
-NetworkPolicy restricts which pods can open connections. Four kinds of
+NetworkPolicy restricts which pods can open connections. Three kinds of
 policy are created; together they permit exactly the connections the
-execution model requires, plus whatever reach outside the workload an
-operation has asked for.
+execution model requires.
 
 **`<workload>-edge-<channel>`**, one per channel that has both a producer
 and a consumer. It selects the producer operation's pods and permits
@@ -324,28 +221,6 @@ declares both policy types, and permits egress to the coordinator pods on
 ports 8080 and 8090, egress to any operation pod of the same workload on
 port 8090, and egress to DNS (port 53, UDP and TCP). It grants no ingress,
 so ingress to an operation pod is permitted only by an edge policy.
-
-**`<workload>-egress-<operation>`**, one per operation whose spec declares
-`egress`. It selects that operation's pods alone, declares only the egress
-policy type, and adds one rule per declared destination. Network policies are
-additive, so these rules widen that operation's reach and leave every other
-operation on the rules above. An operation that declares nothing gets no such
-policy.
-
-Two destinations exist. `Metadata` permits TCP port 80 to `169.254.169.254/32`,
-the link-local address the instance metadata server answers on, which is how a
-pod obtains an identity token. `Internet` permits TCP port 443 to `0.0.0.0/0`
-with the three RFC 1918 blocks and the link-local range in `except`. Those
-exceptions are what stop a grant to reach outside from also reaching every pod
-and service in the cluster, which would undo the per-edge isolation the other
-policies exist for. A cluster whose pod or service network falls outside the
-RFC 1918 blocks needs its own range added to `privateRanges` in the
-reconciler; nothing in the API can discover it.
-
-The declaration sits on the operation rather than on the workload, so one
-vertex of the graph may reach outside while its neighbours may not, and a
-reader can see which ones do. Removing the declaration deletes the policy;
-egress policies are found through the `stark8s.io/operation` label.
 
 **`<workload>-coordinator`** selects the coordinator pod and permits
 ingress on ports 8080 and 8090 from the workload's operation pods and from
@@ -371,34 +246,19 @@ The controller writes:
 
 - `status.phase`: `Pending` until the coordinator accepts the topology,
   then `Running`; `Succeeded` when every `Drain` operation is `Succeeded`
-  and the workload has no `Never` operation; `Failed` when validation,
-  required-record availability, or an operation fails. `status.reason`
-  gives a stable machine-readable reason and `status.message` gives details.
-  Once `Succeeded` or `Failed`, the workload is no longer reconciled and
-  the coordinator remains available for reading result channels;
-- `status.operations[]`: phase, reason, message, desired replicas, ready
-  pods, `runnableTasks`, and `holdsUnconsumed`. Reasons distinguish input
-  gating, dependency startup, recorded delivery failures, pod readiness,
-  processing, completion, and Deployment failure. A restartable init
-  sidecar whose startup probe has not succeeded reports `DependencyWaiting`;
+  and the workload has no `Never` operation; `Failed` when the graph is
+  invalid. Once `Succeeded` or `Failed`, the workload is no longer
+  reconciled and the coordinator remains available for reading result
+  channels;
+- `status.operations[]`: phase (`Waiting`, `Running`, `Succeeded`), desired
+  replicas, ready pods, `runnableTasks`, and `holdsUnconsumed`, the last
+  two copied from the coordinator's operation metrics. An operation is
+  `Succeeded` when the coordinator reports it complete and its Deployment
+  has zero desired and zero observed replicas;
 - `status.channels[]`: sealed flag, pending and in-flight record counts,
-  total produced and acknowledged records, the current epoch for Synchronous
-  feedback channels, the latest delivery failure, `overflowed` records, and
-  `lost` records whose holder pod expired before consumption.
-
-The controller emits an event only when a workload or operation reason
-changes. Persistent failures remain in status without producing an event on
-every reconciliation pass.
-
-The coordinator exposes the JSON report at `GET /metrics` and Prometheus
-text at `GET /metrics/prometheus`. Prometheus series use graph and operation
-or channel labels. They include produced, acknowledged, pending, in-flight,
-lost, and overflowed record counts; committed epochs; runnable tasks; and
-live pods. No record or segment identifier appears as a label.
-
-There is no general stall timer. An unchanged queue can mean a healthy idle
-stream or a handler that is still processing, so elapsed time alone does not
-establish failure.
+  total produced, the current epoch for Synchronous feedback channels,
+  `overflowed` (records diverted or dropped at the loop bound), and `lost`
+  (segments whose holder pod expired before consumption).
 
 `kubectl get workloads` shows the phase; `kubectl get workload <name> -o
 yaml` shows the rest.
@@ -413,12 +273,6 @@ The controller rejects a Workload, setting `Failed`, when:
 - `feedback.overflow` names an undeclared channel or the feedback channel
   itself;
 - `slots` is negative (zero is treated as one);
-- `segments.size` is zero, negative, or below 1Mi (a quantity with no unit
-  suffix is bytes, so `size: 50` asks for fifty of them); is set on an
-  operation whose pod template already declares a volume named
-  `stark8s-segments`; is not exceeded by the `ephemeral-storage` budget the
-  template's containers add up to; or exceeds the `ephemeral-storage` limit
-  on the container that carries the request;
 - the graph with feedback channels removed contains a cycle. A feedback
   channel of either mode, Synchronous or Asynchronous, closes a cycle.
 

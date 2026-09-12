@@ -13,6 +13,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -35,9 +36,10 @@ import (
 // fakeCoordinator serves canned metrics and records seal requests.
 type fakeCoordinator struct {
 	*httptest.Server
-	mu      sync.Mutex
-	metrics coordinator.Metrics
-	sealed  []string
+	mu         sync.Mutex
+	metrics    coordinator.Metrics
+	sealed     []string
+	operations []coordinator.OperationSpec
 }
 
 func newFakeCoordinator(t *testing.T) *fakeCoordinator {
@@ -52,6 +54,12 @@ func newFakeCoordinator(t *testing.T) *fakeCoordinator {
 		_ = json.NewEncoder(w).Encode(f.metrics)
 	})
 	mux.HandleFunc(coordinator.PathOperations, func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if err := json.NewDecoder(r.Body).Decode(&f.operations); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc(coordinator.PathChannels+"/", func(w http.ResponseWriter, r *http.Request) {
@@ -68,6 +76,12 @@ func newFakeCoordinator(t *testing.T) *fakeCoordinator {
 	f.Server = httptest.NewServer(mux)
 	t.Cleanup(f.Close)
 	return f
+}
+
+func (f *fakeCoordinator) operationSpecs() []coordinator.OperationSpec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]coordinator.OperationSpec(nil), f.operations...)
 }
 
 func (f *fakeCoordinator) set(m coordinator.Metrics) {
@@ -106,7 +120,7 @@ func newHarness(t *testing.T, wl *v1alpha1.Workload) *harness {
 	if wl.Namespace == "" {
 		wl.Namespace = "default"
 	}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&v1alpha1.Workload{}).WithObjects(wl).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&v1alpha1.Workload{}, &batchv1.Job{}).WithObjects(wl).Build()
 	co := newFakeCoordinator(t)
 	events := record.NewFakeRecorder(100)
 	r := &Reconciler{

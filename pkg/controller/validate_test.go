@@ -73,6 +73,34 @@ func TestValidateSlots(t *testing.T) {
 	}
 }
 
+func TestValidateObjectStore(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		secret   string
+	}{
+		{name: "empty endpoint", secret: "credentials"},
+		{name: "missing scheme", endpoint: "objects.example/bucket", secret: "credentials"},
+		{name: "unsupported scheme", endpoint: "file:///bucket", secret: "credentials"},
+		{name: "userinfo", endpoint: "https://key@objects.example/bucket", secret: "credentials"},
+		{name: "query", endpoint: "https://objects.example/bucket?token=value", secret: "credentials"},
+		{name: "fragment", endpoint: "https://objects.example/bucket#part", secret: "credentials"},
+		{name: "empty credentials secret", endpoint: "https://objects.example/bucket"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			spec := v1alpha1.WorkloadSpec{Coordinator: v1alpha1.CoordinatorSpec{ObjectStore: &v1alpha1.ObjectStoreSpec{Endpoint: test.endpoint, CredentialsSecret: test.secret}}}
+			if err := Validate(&spec); err == nil {
+				t.Fatal("invalid object store was accepted")
+			}
+		})
+	}
+	valid := v1alpha1.WorkloadSpec{Coordinator: v1alpha1.CoordinatorSpec{ObjectStore: &v1alpha1.ObjectStoreSpec{Endpoint: "https://objects.example/bucket", CredentialsSecret: "credentials"}}}
+	if err := Validate(&valid); err != nil {
+		t.Fatalf("valid object store rejected: %v", err)
+	}
+}
+
 func TestDesiredReplicas(t *testing.T) {
 	op := func(name string, slots, min, max int32) *v1alpha1.Operation {
 		return &v1alpha1.Operation{Name: name, Slots: slots, Scaling: v1alpha1.Scaling{Horizontal: v1alpha1.HorizontalScaling{Min: min, Max: max}}}

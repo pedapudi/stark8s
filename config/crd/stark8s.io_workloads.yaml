@@ -165,6 +165,25 @@ spec:
                     description: Image of the coordinator server. Defaults to the
                       controller's own image.
                     type: string
+                  objectStore:
+                    description: |-
+                      ObjectStore enables durable coordinator checkpoints and worker segments.
+                      Endpoint includes the bucket path. CredentialsSecret contains accessKey,
+                      secretKey, and optionally sessionToken.
+                    properties:
+                      credentialsSecret:
+                        minLength: 1
+                        type: string
+                      endpoint:
+                        minLength: 1
+                        type: string
+                      region:
+                        type: string
+                    required:
+                    - credentialsSecret
+                    - endpoint
+                    - region
+                    type: object
                 type: object
               operations:
                 items:
@@ -172,6 +191,38 @@ spec:
                     Operation is a vertex of the graph: one logical computation backed by its
                     own pool of pods.
                   properties:
+                    checkpoint:
+                      description: |-
+                        Checkpoint commits application state, consumed input positions, and
+                        durable output manifests together after each finite input segment.
+                      type: boolean
+                    collective:
+                      description: CollectiveSpec configures one fixed-size finite
+                        process group.
+                      properties:
+                        checkpoint:
+                          description: Checkpoint identifies a framework-managed checkpoint
+                            available to every rank.
+                          type: string
+                        maxAttempts:
+                          default: 1
+                          description: MaxAttempts includes the initial attempt.
+                          format: int32
+                          minimum: 1
+                          type: integer
+                        placement:
+                          default: Ordinary
+                          enum:
+                          - Ordinary
+                          - Gang
+                          type: string
+                        size:
+                          format: int32
+                          minimum: 2
+                          type: integer
+                      required:
+                      - size
+                      type: object
                     completion:
                       default: Drain
                       description: Completion says when an operation is finished.
