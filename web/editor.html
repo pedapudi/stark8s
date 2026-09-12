@@ -1835,8 +1835,8 @@ return { YAMLError, parseYAML, emitYAML, toYAML, fromYAML, blankWorkload, normal
 # started until map has completed, and each reduce replica owns a fixed set of
 # key partitions — the stage barrier and exchange of a Spark shuffle.
 #
-# Replica counts follow the coordinator's count of runnable partitions:
-# replicas = clamp(ceil(runnableTasks / slots), min, max).
+# Active operations run at their declared horizontal maximum. Slots remain a
+# serial worker capacity hint rather than callback concurrency.
 apiVersion: stark8s.io/v1alpha1
 kind: Workload
 metadata:
